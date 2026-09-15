@@ -2,6 +2,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from src.config import load_config
 from src.core.legacy_agent_migration import ensure_legacy_contexts_imported
 from src.tools.runtime_config import resolve_agent_tool_config
@@ -61,7 +63,10 @@ def test_fleet_overlay_contract(monkeypatch):
     _mock_freepbx(monkeypatch)
 
     root = Path(__file__).resolve().parents[1]
-    config = load_config(str(root / "config" / "ai-agent.yaml"))
+    config_path = root / "config" / "ai-agent.yaml"
+    if not config_path.is_file():
+        pytest.skip("private fleet configuration is intentionally absent")
+    config = load_config(str(config_path))
 
     assert config.audiosocket.host == ""
     assert config.audiosocket.advertise_host == "ava.bajaj.com"
@@ -99,7 +104,10 @@ def test_aimee_policy_survives_agent_migration_and_runtime_normalization(
     monkeypatch.setenv("FREEPBX_API_CLIENT_SECRET", "test-secret")
     _mock_freepbx(monkeypatch)
     root = Path(__file__).resolve().parents[1]
-    config = load_config(str(root / "config" / "ai-agent.yaml"))
+    config_path = root / "config" / "ai-agent.yaml"
+    if not config_path.is_file():
+        pytest.skip("private fleet configuration is intentionally absent")
+    config = load_config(str(config_path))
     contexts = config.contexts
     database = tmp_path / "agents.db"
     ensure_legacy_contexts_imported(contexts, db_path=str(database))

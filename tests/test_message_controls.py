@@ -427,7 +427,9 @@ class MessageControlTests(unittest.TestCase):
         after = methods((CANDIDATE / "src/engine.py").read_bytes())
         changed = {n for n in set(before) | set(after) if before.get(n) != after.get(n)}
         self.assertEqual(changed, {
-            "_pipeline_runner", "_maybe_speak_direct_pipeline_tool_result",
+            "_pipeline_runner",
+            "_maybe_prepare_pipeline_message_deposit",
+            "_maybe_speak_direct_pipeline_tool_result",
         })
 
 
