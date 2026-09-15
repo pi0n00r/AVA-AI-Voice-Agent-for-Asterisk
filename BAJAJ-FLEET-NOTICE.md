@@ -2,7 +2,7 @@
 AI-NOTICE:Schema-Version=0.1
 AI-NOTICE:License=AGPL-3.0-or-later
 AI-NOTICE:Project=Ava
-AI-NOTICE:Repository=https://github.com/pi0n00r/Ava
+AI-NOTICE:Repository=https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk
 AI-NOTICE:Scope=Fleet-authored changes; upstream MIT material retains its notices
 -->
 
@@ -21,14 +21,17 @@ affiliated with the upstream project or its authors. References and links to
 the upstream project are retained for factual attribution and do not imply an
 official relationship.
 
-The initial Git history was reconstructed from the exact supplied live-root
-capture because the corresponding upstream commit history was unavailable.
-Commit `7dcb5b1` records that boundary. Subsequent fleet commits are ordinary,
-reviewable source changes. Accepted work currently includes call capture and
+The earlier fleet Git history was reconstructed from the exact supplied
+live-root capture because its corresponding upstream commit was unavailable.
+Commit `7dcb5b1` records that boundary. The maintained branch now joins that
+exact lineage to the genuine upstream v7.5.4 commit with an explicit two-parent
+provenance bridge. This creates a real merge base for future upstream work
+without pretending that the reconstructed root was an upstream commit.
+Accepted work currently includes call capture and
 cancellation fixes, native greeting and wait-media behaviour, confirmed message
 deposit dispatch, prepared outbound speech, Unicode format-control handling,
 caller-end/gratitude behaviour, DTMF log redaction, and agent-configured HTTP
-tool advertisement. The root README/CHANGELOG version remains the upstream
+tool advertisement. The root README/CHANGELOG version remains the imported upstream
 application version; `FLEET-RELEASE.json` identifies the distinct maintained
 fork release and never implies an upstream provenance that has not been proved.
 

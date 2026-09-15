@@ -2,7 +2,7 @@
 AI-NOTICE:Schema-Version=0.1
 AI-NOTICE:License=AGPL-3.0-or-later
 AI-NOTICE:Project=Ava
-AI-NOTICE:Repository=https://github.com/pi0n00r/Ava
+AI-NOTICE:Repository=https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk
 AI-NOTICE:Scope=Fleet-authored fork notice; retained upstream documentation remains MIT
 -->
 
@@ -38,6 +38,11 @@ This repository is an independent Bajaj fleet fork derived from the upstream
 [AVA AI Voice Agent for Asterisk](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk)
 MIT-licensed source. It is not associated with, endorsed by, sponsored by, or
 officially affiliated with the upstream project or its authors.
+
+The maintained fleet branch has two explicit provenance parents: upstream
+v7.5.4 and the exact reconstructed Bajaj source lineage. This preserves the
+accepted fleet history while restoring a real upstream merge base. It does not
+claim that the earlier reconstructed root was itself an upstream commit.
 
 The upstream README is retained below for attribution and technical context.
 Its badges, community, issue, discussion, and sponsorship links refer to the

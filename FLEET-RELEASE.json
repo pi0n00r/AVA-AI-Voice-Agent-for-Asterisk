@@ -2,12 +2,14 @@
   "schemaVersion": 1,
   "project": "Ava",
   "release": "7.5.4-bajaj.20260914.6",
-  "sourceCommit": "fb7308f87e13e8321e24b3981c4b1f2527f5bf02",
-  "sourceTree": "95fb49a514af4495df108609d814432593abf1cc",
+  "sourceCommit": "92e848b2e6e364b0237a40790a91c7c3af752532",
+  "sourceTree": "cfd292d29799d209b8506ee9c21de3981cd15000",
   "reconstructionBoundaryCommit": "7dcb5b1",
+  "upstreamBaseCommit": "b2b521284d3d6a5126b58a5916de4ccdf4056c98",
+  "provenanceBridgeCommit": "4546da569ff13e07976a0cb34c1953a1b71a89dc",
   "upstreamLicense": "MIT",
   "fleetAdditionsLicense": "AGPL-3.0-or-later",
-  "repository": "https://github.com/pi0n00r/Ava",
+  "repository": "https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk",
   "upstreamRepository": "https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk",
   "independentFork": true,
   "upstreamAffiliation": false,
@@ -15,6 +17,8 @@
   "claims": {
     "sourceBuiltReleaseRequired": true,
     "upstreamHistoryComplete": false,
+    "upstreamLineageConnected": true,
+    "reconstructedSnapshotExactUpstreamCommitKnown": false,
     "humanCallAcceptance": false,
     "messageDepositDeliveryAcceptance": false
   }
