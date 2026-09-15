@@ -59,6 +59,7 @@ interface HTTPToolConfig {
     description?: string;
     parameters?: ToolParameter[];
     return_raw_json?: boolean;
+    caller_wait_ambience?: boolean;
     error_message?: string;
 }
 
@@ -1339,6 +1340,18 @@ const HTTPToolForm = ({ config, onChange, phase, contexts }: HTTPToolFormProps) 
                                     tooltip="Play hold audio if request takes longer than this threshold"
                                 />
                             </div>
+
+                            <FormSwitch
+                                label="Receptionist typing while this request runs"
+                                checked={Boolean(toolForm.caller_wait_ambience)}
+                                onChange={event =>
+                                    setToolForm({
+                                        ...toolForm,
+                                        caller_wait_ambience: event.target.checked,
+                                    })
+                                }
+                                tooltip="Opt this in-call HTTP tool into Ava's built-in low-level, caller-side CC0 typing loop. It stops before any success or failure response."
+                            />
 
                             {/* Test Values Configuration */}
                             <div className="border border-border rounded-lg p-3 bg-card/30">

@@ -966,6 +966,11 @@ class StreamingConfig(BaseModel):
     diag_out_dir: str = Field(default=DEFAULT_DIAGNOSTIC_TAP_DIR)
     # Smaller warm-up only for the initial greeting to get first audio out sooner
     greeting_min_start_ms: int = Field(default=0)
+    # Hold the initial greeting until inbound media is confirmed, then send
+    # this much silent media before the first spoken sample.  This protects the
+    # greeting from answer/bridge clipping without delaying later turns.
+    greeting_media_ready_delay_ms: int = Field(default=0, ge=0, le=2000)
+    greeting_media_ready_timeout_ms: int = Field(default=1000, ge=0, le=5000)
     # ExternalMedia-specific: safety net timeout (ms) for RTP endpoint establishment.
     # With RTP kick fix, RTP establishes in ~40-50ms. This fallback rarely triggers.
     greeting_rtp_wait_ms: int = Field(default=1000)
@@ -1414,6 +1419,11 @@ def load_config(path: str = "config/ai-agent.yaml") -> AppConfig:
     inject_asterisk_credentials(config_data)
     inject_llm_config(config_data)
     inject_provider_api_keys(config_data)
+
+    # Optional authoritative extension inventory. Hydration happens on every
+    # startup/reload so removals and renames cannot leave stale runtime routes.
+    from src.integrations.freepbx_extensions import hydrate_freepbx_extension_inventory
+    hydrate_freepbx_extension_inventory(config_data)
 
     # Phase 2b: Merge external context YAML files (config/contexts/*.yaml)
     try:

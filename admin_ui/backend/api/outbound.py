@@ -37,6 +37,7 @@ if project_root not in sys.path:
 
 from src.audio.resampler import resample_audio
 from src.core.outbound_schedule import normalize_outbound_daily_window
+from src.core.outbound_store import outbound_flag_enabled
 
 try:
     from zoneinfo import ZoneInfo, available_timezones
@@ -727,14 +728,16 @@ async def set_campaign_status(campaign_id: str, req: CampaignStatusRequest):
                     status_code=400,
                     detail=f"No pending leads to dial (canceled={canceled}, completed={completed}). Recycle leads back to pending, then Start again.",
                 )
-            if bool(int(campaign.get("voicemail_drop_enabled") or 1)):
+            if outbound_flag_enabled(
+                campaign.get("voicemail_drop_enabled"), default=True
+            ):
                 media_uri = (campaign.get("voicemail_drop_media_uri") or "").strip()
                 if not media_uri:
                     raise HTTPException(
                         status_code=400,
                         detail="Voicemail drop is enabled but no voicemail recording is set. Upload/generate voicemail before starting.",
                     )
-            if bool(int(campaign.get("consent_enabled") or 0)):
+            if outbound_flag_enabled(campaign.get("consent_enabled"), default=False):
                 consent_uri = (campaign.get("consent_media_uri") or "").strip()
                 if not consent_uri:
                     raise HTTPException(

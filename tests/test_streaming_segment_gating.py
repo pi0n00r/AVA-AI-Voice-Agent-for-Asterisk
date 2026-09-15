@@ -1,5 +1,7 @@
 import pytest
 import asyncio
+import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from src.core.conversation_coordinator import ConversationCoordinator
@@ -58,6 +60,44 @@ def test_diag_taps_enabled_by_env(monkeypatch):
         streaming_config={},
     )
     assert mgr.diag_enable_taps is True
+
+
+@pytest.mark.parametrize("diag_enabled", [False, True], ids=["disabled", "enabled"])
+@pytest.mark.asyncio
+async def test_pcm_to_ulaw_egress_is_independent_of_diagnostic_taps(
+    monkeypatch,
+    tmp_path,
+    diag_enabled,
+):
+    monkeypatch.delenv("AAVA_AUDIO_DIAGNOSTICS", raising=False)
+    mgr = StreamingPlaybackManager(
+        session_store=SessionStore(),
+        ari_client=_DummyARI(),
+        conversation_coordinator=None,
+        streaming_config={"diag_enable_taps": diag_enabled},
+        audio_transport="audiosocket",
+    )
+    mgr.audiosocket_format = "ulaw"
+    mgr.diag_out_dir = str(tmp_path)
+    call_id = f"call-diag-{diag_enabled}"
+    mgr.active_streams[call_id] = {
+        "stream_id": f"stream-diag-{diag_enabled}",
+        "target_format": "ulaw",
+        "target_sample_rate": 8000,
+        "source_encoding": "slin",
+        "source_sample_rate": 8000,
+        "tap_pre_pcm16": bytearray(),
+        "tap_post_pcm16": bytearray(),
+        "tap_first_window_pre": bytearray(),
+        "tap_first_window_post": bytearray(),
+    }
+
+    pcm = b"\x00\x04\x00\xfc" * 80
+    processed = await mgr._process_audio_chunk(call_id, pcm)
+
+    assert processed is not None
+    assert len(processed) == len(pcm) // 2
+    assert any(processed)
 
 
 @pytest.mark.parametrize("falsey", ["false", "False", "0", "no", "off", ""])
@@ -176,6 +216,47 @@ async def test_start_streaming_playback_normalizes_audiosocket_slin(monkeypatch)
     info = mgr.active_streams[call_id]
     assert info.get("target_format") == "slin"
     assert info.get("target_sample_rate") == 8000
+    assert info.get("first_frame_ts") == 0.0
+
+
+@pytest.mark.asyncio
+async def test_first_frame_timestamp_is_recorded_only_after_successful_tx():
+    session_store = SessionStore()
+    call_id = "call-first-frame"
+    session = CallSession(call_id=call_id, caller_channel_id=call_id)
+    session.audiosocket_conn_id = "conn-first-frame"
+    await session_store.upsert_call(session)
+
+    mgr = StreamingPlaybackManager(
+        session_store=session_store,
+        ari_client=_DummyARI(),
+        conversation_coordinator=None,
+        streaming_config={},
+        audio_transport="audiosocket",
+    )
+    mgr.audiosocket_server = SimpleNamespace(
+        send_audio=AsyncMock(side_effect=[False, True])
+    )
+    mgr.active_streams[call_id] = {
+        "stream_id": "stream-first-frame",
+        "playback_type": "pipeline-tts",
+        "start_time": time.time() - 1.0,
+        "first_frame_observed": False,
+        "first_frame_ts": 0.0,
+        "target_format": "slin",
+        "target_sample_rate": 8000,
+        "chunk_size_ms": 20,
+    }
+
+    assert not await mgr._send_audio_chunk(
+        call_id, "stream-first-frame", b"\x00\x00" * 160
+    )
+    assert mgr.active_streams[call_id]["first_frame_ts"] == 0.0
+    assert await mgr._send_audio_chunk(
+        call_id, "stream-first-frame", b"\x01\x00" * 160
+    )
+    assert mgr.active_streams[call_id]["first_frame_ts"] > 0.0
+    assert mgr.active_streams[call_id]["first_frame_observed"] is True
 
 
 @pytest.mark.asyncio

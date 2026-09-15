@@ -70,7 +70,8 @@ def test_runtime_guidance_warns_when_transfer_tools_have_no_configured_targets()
         ["live_agent_transfer", "blind_transfer", "attended_transfer"],
     )
 
-    assert "None configured. Do not call `live_agent_transfer`" in guidance
+    assert "No friendly-name directory entries are configured" in guidance
+    assert "exact caller-supplied numeric target may still be passed" in guidance
     assert "None configured. Do not call `blind_transfer`" in guidance
     assert "None configured. Do not call `attended_transfer`" in guidance
 

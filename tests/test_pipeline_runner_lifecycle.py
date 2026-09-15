@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -72,6 +73,18 @@ class _ResultStreamingStubSTT(_StreamingStubSTT):
 class _StubLLM(LLMComponent):
     async def generate(self, call_id, transcript, context, options):
         return "hello"
+
+
+class _MessageTakingStreamingLLM(LLMComponent):
+    supports_streaming = True
+
+    async def generate(self, call_id, transcript, context, options):
+        return "Of course. What would you like me to tell Gary?"
+
+    async def generate_stream(self, call_id, transcript, context, options):
+        assert transcript == "Could I leave a message?"
+        yield "Of course. "
+        yield "What would you like me to tell Gary?"
 
 
 class _RecordingLLM(LLMComponent):
@@ -267,6 +280,41 @@ class _DrainingStreamingStub(_StreamOwnershipStub):
         return True
 
 
+class _CollectingStreamingStub(_StreamOwnershipStub):
+    def __init__(self):
+        super().__init__("message-stream")
+        self.drained = []
+        self.done = asyncio.Event()
+        self._consumer = None
+
+    async def start_streaming_playback(self, call_id, queue, **kwargs):
+        async def consume():
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    self.done.set()
+                    return
+                self.drained.append(chunk)
+
+        self._consumer = asyncio.create_task(consume())
+        return self.stream_id
+
+    async def stop_streaming_playback(self, call_id, *, drain=False):
+        self.active = False
+        if self._consumer and not self._consumer.done():
+            self._consumer.cancel()
+        return True
+
+
+class _MessageTakingTTS(TTSComponent):
+    def __init__(self):
+        self.texts = []
+
+    async def synthesize(self, call_id, text, options):
+        self.texts.append(text)
+        yield (text.encode("utf-8") or b"audio")
+
+
 class _PCM16TTS:
     downstream_mode_override = "auto"
 
@@ -324,6 +372,245 @@ async def test_pipeline_stream_put_allows_healthy_consumer():
     assert await queue.get() == b"audio"
 
 
+def test_pipeline_pending_stream_sustained_inbound_cannot_barge_before_tx():
+    engine = Engine.__new__(Engine)
+    engine.streaming_playback_manager = SimpleNamespace(
+        active_streams={"call-pending": {"first_frame_ts": 0.0}}
+    )
+    session = SimpleNamespace(tts_started_ts=1.0)
+
+    for _ in range(8):
+        assert (
+            engine._pipeline_barge_tts_elapsed_ms(
+                "call-pending", session, now=100.0
+            )
+            is None
+        )
+
+
+def test_pipeline_barge_protection_is_anchored_to_first_tx_frame():
+    engine = Engine.__new__(Engine)
+    session = SimpleNamespace(tts_started_ts=1.0)
+    engine.streaming_playback_manager = SimpleNamespace(
+        active_streams={"call-audible": {"first_frame_ts": 99.85}}
+    )
+    assert engine._pipeline_barge_tts_elapsed_ms(
+        "call-audible", session, now=100.0
+    ) == 150
+
+    engine.streaming_playback_manager.active_streams["call-audible"][
+        "first_frame_ts"
+    ] = 99.75
+    elapsed_ms = engine._pipeline_barge_tts_elapsed_ms(
+        "call-audible", session, now=100.0
+    )
+    assert elapsed_ms == 250
+    candidate_ms = sum(20 for _ in range(6) if elapsed_ms >= 200 and 500 >= 300)
+    assert candidate_ms == 120
+
+
+def test_near_end_reply_is_released_once_into_one_second_stt_turn():
+    engine = Engine.__new__(Engine)
+    session = SimpleNamespace(
+        call_id="call-near-end",
+        vad_state={},
+        tts_started_ts=10.0,
+        tts_ended_ts=20.0,
+    )
+    speech_frame = b"\xff\x7f" * 160  # 20 ms at 8 kHz PCM16
+
+    # "The sky is blue" starts 100 ms before TTS ends, but has not reached
+    # the 120 ms barge threshold.
+    for index in range(5):
+        engine._buffer_pipeline_pending_caller_audio(
+            session,
+            speech_frame,
+            8000,
+            frame_ms=20,
+            now=19.90 + (index * 0.02),
+        )
+
+    first_post_gate = engine._take_pipeline_pending_caller_audio(
+        session,
+        speech_frame,
+        8000,
+        now=20.02,
+        energy=32767,
+        threshold=1000,
+    )
+    # A natural 20 ms dip immediately after capture reopens is held, then two
+    # energetic frames prove continuation and release the onset once.
+    post_gap = engine._take_pipeline_pending_caller_audio(
+        session, b"\x00\x00" * 160, 8000,
+        now=20.04, energy=0, threshold=1000,
+    )
+    subsequent = [
+        engine._take_pipeline_pending_caller_audio(
+            session,
+            speech_frame,
+            8000,
+            now=20.06 + (index * 0.02),
+            energy=32767,
+            threshold=1000,
+        )
+        for index in range(19)
+    ]
+
+    stt_audio = first_post_gate + b"".join(subsequent)
+    assert first_post_gate == b""  # One energetic tail frame is not enough.
+    assert post_gap == b""
+    assert len(subsequent[0]) == len(speech_frame) * 8
+    assert len(stt_audio) == len(speech_frame) * 26  # one 520 ms turn
+    finals = ["The sky is blue."] if len(stt_audio) >= 8000 else []
+    assert finals == ["The sky is blue."]
+    assert "pipeline_pending_caller_audio" not in session.vad_state
+
+
+def test_near_end_silence_or_tts_tail_is_not_released():
+    engine = Engine.__new__(Engine)
+    session = SimpleNamespace(
+        call_id="call-echo-tail",
+        vad_state={},
+        tts_started_ts=10.0,
+        tts_ended_ts=20.0,
+    )
+    speech_frame = b"\xff\x7f" * 160
+    silence = b"\x00\x00" * 160
+    for index in range(4):
+        engine._buffer_pipeline_pending_caller_audio(
+            session,
+            speech_frame,
+            8000,
+            frame_ms=20,
+            now=19.92 + (index * 0.02),
+        )
+
+    # One post-gate energetic echo frame and bounded silence are held, never
+    # flushed. The candidate expires after the 160 ms reopen window.
+    held = engine._take_pipeline_pending_caller_audio(
+        session,
+        speech_frame,
+        8000,
+        now=20.02,
+        energy=32767,
+        threshold=1000,
+    )
+    assert held == b""
+
+    held_silence = [
+        engine._take_pipeline_pending_caller_audio(
+            session, silence, 8000, now=20.04 + (index * 0.02),
+            energy=0, threshold=1000,
+        )
+        for index in range(7)
+    ]
+    assert held_silence[:6] == [b""] * 6
+    assert held_silence[6] == silence
+    released = engine._take_pipeline_pending_caller_audio(
+        session, silence, 8000, now=20.18, energy=0, threshold=1000,
+    )
+    assert released == silence
+    assert "pipeline_pending_caller_audio" not in session.vad_state
+
+
+def test_valid_barge_releases_buffer_without_duplicate_frames():
+    engine = Engine.__new__(Engine)
+    session = SimpleNamespace(
+        call_id="call-valid-barge",
+        vad_state={},
+        tts_started_ts=10.0,
+        tts_ended_ts=0.0,
+    )
+    speech_frame = b"\xff\x7f" * 160
+    for index in range(6):
+        engine._buffer_pipeline_pending_caller_audio(
+            session,
+            speech_frame,
+            8000,
+            frame_ms=20,
+            now=15.00 + (index * 0.02),
+        )
+
+    released = engine._take_pipeline_pending_caller_audio(
+        session,
+        speech_frame,
+        8000,
+        now=15.12,
+        energy=32767,
+        threshold=1000,
+        current_already_buffered=True,
+    )
+    next_frame = engine._take_pipeline_pending_caller_audio(
+        session,
+        speech_frame,
+        8000,
+        now=15.14,
+        energy=32767,
+        threshold=1000,
+    )
+    assert len(released) == len(speech_frame) * 6
+    assert next_frame == speech_frame
+
+
+@pytest.mark.asyncio
+async def test_message_taking_pipeline_emits_nonzero_audio_for_live_request(monkeypatch):
+    config_data = {
+        "default_provider": "local",
+        "providers": {"local": {"enabled": True}},
+        "asterisk": {
+            "host": "127.0.0.1",
+            "port": 8088,
+            "username": "u",
+            "password": "p",
+            "app_name": "ai-voice-agent",
+        },
+        "llm": {
+            "initial_greeting": "",
+            "prompt": "You are helpful",
+            "model": "test-model",
+        },
+        "pipelines": {"streaming": {}},
+        "active_pipeline": "streaming",
+        "audio_transport": "audiosocket",
+        "downstream_mode": "stream",
+        "streaming": {"pipeline_streaming_overlap": True},
+    }
+    engine = Engine(AppConfig(**config_data))
+    engine.pipeline_orchestrator._started = True
+    stt = _ResultStreamingStubSTT()
+    tts = _MessageTakingTTS()
+    resolution = _StubResolution(
+        stt_adapter=stt,
+        stt_options={"streaming": True, "chunk_ms": 80},
+        llm_adapter=_MessageTakingStreamingLLM(),
+        tts_adapter=tts,
+    )
+    monkeypatch.setattr(
+        engine.pipeline_orchestrator, "get_pipeline", lambda *args, **kwargs: resolution
+    )
+    manager = _CollectingStreamingStub()
+    engine.streaming_playback_manager = manager
+    engine.ari_client.set_channel_var = AsyncMock(return_value=True)
+
+    from src.core.models import CallSession
+
+    call_id = "call-message-taking"
+    session = CallSession(call_id=call_id, caller_channel_id=call_id)
+    session.pipeline_name = "streaming"
+    await engine.session_store.upsert_call(session)
+    await engine._ensure_pipeline_runner(session, forced=True)
+    await asyncio.wait_for(stt.started.wait(), timeout=2)
+    await stt.results.put("Could I leave a message?")
+    await asyncio.wait_for(manager.done.wait(), timeout=2)
+
+    assert tts.texts == [
+        "Of course.",
+        "What would you like me to tell Gary?",
+    ]
+    assert sum(len(chunk) for chunk in manager.drained) > 0
+    await engine._cleanup_call(call_id)
+
+
 @pytest.mark.asyncio
 async def test_pipeline_tool_continuation_uses_negotiated_stream_and_drains():
     engine = Engine.__new__(Engine)
@@ -376,6 +663,26 @@ def test_pipeline_terminal_fallback_requires_assistant_farewell():
         "That's all.",
         "Is there anything else you'd like to know?",
         normalize_hangup_policy({}),
+    )
+
+
+@pytest.mark.parametrize("caller,terminal", [
+    ("Thank you", False), ("Thanks", False), ("Okay, thank you", False),
+    ("Thank you very much", False), ("Thank you, please tell me more", False),
+    ("No thanks", False), ("That's all, thank you", True),
+    ("Goodbye", True), ("Hang up the call", True),
+])
+def test_main_fallback_requires_explicit_caller_end(caller, terminal):
+    assert Engine._is_pipeline_farewell_without_tool(
+        caller, "Thank you for calling. Goodbye.", normalize_hangup_policy({}),
+        explicit_caller_end_only=True,
+    ) is terminal
+
+
+@pytest.mark.parametrize("caller", ["Thank you", "Thanks", "Okay, thank you"])
+def test_ext7_default_terminal_fallback_keeps_retained_behavior(caller):
+    assert Engine._is_pipeline_farewell_without_tool(
+        caller, "Thank you for calling. Goodbye.", normalize_hangup_policy({}),
     )
 
 
@@ -955,3 +1262,470 @@ async def test_pipeline_dialog_consumer_restarts_after_unexpected_exit(monkeypat
 
     assert llm.transcripts == ["second turn survives"]
     await engine._cleanup_call(call_id)
+
+
+class _ControlledOverlapLLM(LLMComponent):
+    supports_streaming = True
+
+    def __init__(self, mode="text"):
+        self.mode = mode
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.closed = asyncio.Event()
+        self.serial_done = asyncio.Event()
+        self.serial_calls = 0
+        self.next_token_started = asyncio.Event()
+        self.tail_release = asyncio.Event()
+
+    async def generate(self, call_id, transcript, context, options):
+        self.serial_calls += 1
+        self.serial_done.set()
+        return ""
+
+    async def generate_stream(self, call_id, transcript, context, options):
+        self.started.set()
+        try:
+            await self.release.wait()
+            if self.mode == "failure":
+                raise RuntimeError("synthetic model failure")
+            if self.mode in ("text", "tail"):
+                yield "Hello. "
+            if self.mode == "tail":
+                self.next_token_started.set()
+                await self.tail_release.wait()
+                yield "Done. "
+        finally:
+            self.closed.set()
+
+
+class _ControlledOverlapTTS(TTSComponent):
+    def __init__(self, chunks=(b"first-real-audio", b"second-real-audio")):
+        self.chunks = chunks
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    async def synthesize(self, call_id, text, options):
+        self.started.set()
+        try:
+            await self.release.wait()
+            for chunk in self.chunks:
+                yield chunk
+        finally:
+            self.closed.set()
+
+
+class _OverlapPlaybackProbe:
+    """Fake media transport using the real coordinator/session gating contract."""
+
+    def __init__(self, engine, session):
+        self.engine = engine
+        self.session = session
+        self.stream_id = "owned-overlap-stream"
+        self.active = False
+        self.starts = []
+        self.stops = []
+        self.drained = []
+        self.eos = asyncio.Event()
+        self._consumer = None
+
+    def is_stream_active(self, call_id, stream_id=None):
+        return (
+            call_id == self.session.call_id
+            and self.active
+            and (stream_id is None or stream_id == self.stream_id)
+        )
+
+    async def start_streaming_playback(self, call_id, queue, **kwargs):
+        self.starts.append((call_id, list(queue._queue), kwargs))
+        self.active = True
+        await self.engine.conversation_coordinator.on_tts_start(call_id, self.stream_id)
+
+        async def consume():
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    self.eos.set()
+                    return
+                self.drained.append(chunk)
+
+        self._consumer = asyncio.create_task(consume())
+        return self.stream_id
+
+    async def stop_streaming_playback(self, call_id, *, drain=False):
+        self.stops.append((call_id, self.stream_id))
+        self.active = False
+        await self.engine.conversation_coordinator.on_tts_end(call_id, self.stream_id)
+        if self._consumer and not self._consumer.done():
+            self._consumer.cancel()
+            await asyncio.gather(self._consumer, return_exceptions=True)
+        return True
+
+
+async def _start_controlled_overlap(monkeypatch, *, mode="text", chunks=None):
+    from src.core.models import CallSession
+
+    engine = Engine(AppConfig(**{
+        "default_provider": "local",
+        "providers": {"local": {"enabled": True}},
+        "asterisk": {
+            "host": "127.0.0.1", "port": 8088, "username": "u",
+            "password": "p", "app_name": "ai-voice-agent",
+        },
+        "llm": {"initial_greeting": "", "prompt": "Synthetic test", "model": "test-model"},
+        "pipelines": {"streaming": {}},
+        "active_pipeline": "streaming",
+        "audio_transport": "audiosocket",
+        "downstream_mode": "stream",
+        "streaming": {"pipeline_streaming_overlap": True},
+    }))
+    engine.pipeline_orchestrator._started = True
+    stt = _ResultStreamingStubSTT()
+    llm = _ControlledOverlapLLM(mode)
+    tts = _ControlledOverlapTTS() if chunks is None else _ControlledOverlapTTS(chunks)
+    resolution = _StubResolution(
+        stt_adapter=stt, stt_options={"streaming": True, "chunk_ms": 160},
+        llm_adapter=llm, tts_adapter=tts,
+    )
+    resolution.llm_options["aggregation_timeout_sec"] = 0.02
+    monkeypatch.setattr(engine.pipeline_orchestrator, "get_pipeline", lambda *a, **k: resolution)
+    engine.ari_client.set_channel_var = AsyncMock(return_value=True)
+    call_id = "call-controlled-overlap-" + uuid.uuid4().hex
+    session = CallSession(call_id=call_id, caller_channel_id=call_id)
+    session.pipeline_name = "streaming"
+    session.audio_capture_enabled = True  # An established call after greeting/bootstrap.
+    await engine.session_store.upsert_call(session)
+    manager = _OverlapPlaybackProbe(engine, session)
+    engine.streaming_playback_manager = manager
+    await engine._ensure_pipeline_runner(session, forced=True)
+    await asyncio.wait_for(stt.started.wait(), timeout=2)
+    return engine, session, stt, llm, tts, manager
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("waiting_stage", ["model", "tts"])
+async def test_overlap_keeps_capture_open_until_real_audio_buffer(monkeypatch, waiting_stage):
+    engine, session, stt, llm, tts, manager = await _start_controlled_overlap(monkeypatch)
+    try:
+        await stt.results.put("please answer this question")
+        await asyncio.wait_for(llm.started.wait(), timeout=2)
+        if waiting_stage == "tts":
+            llm.release.set()
+            await asyncio.wait_for(tts.started.wait(), timeout=2)
+        assert manager.starts == []
+        assert not session.tts_playing
+        assert session.audio_capture_enabled
+        # Exercise the actual streaming STT sender while the model/TTS is pending.
+        await engine._pipeline_queues[session.call_id].put(b"\x00\x00" * 2560)
+        await asyncio.wait_for(stt.audio_sent.wait(), timeout=2)
+        llm.release.set()
+        tts.release.set()
+        await asyncio.wait_for(manager.eos.wait(), timeout=2)
+        assert len(manager.starts) == 1
+        assert manager.starts[0][1] == [b"first-real-audio"]
+        assert manager.starts[0][2]["playback_type"] == "pipeline-tts"
+        assert manager.drained == [b"first-real-audio", b"second-real-audio"]
+        assert session.tts_playing
+        assert not session.audio_capture_enabled
+    finally:
+        await engine._cleanup_call(session.call_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["empty", "failure"])
+async def test_overlap_empty_or_failed_model_never_starts_phantom_tts(monkeypatch, mode):
+    engine, session, stt, llm, tts, manager = await _start_controlled_overlap(monkeypatch, mode=mode)
+    try:
+        llm.release.set()
+        await stt.results.put("please answer this question")
+        await asyncio.wait_for(llm.serial_done.wait(), timeout=2)
+        assert manager.starts == []
+        assert not tts.started.is_set()
+        assert session.audio_capture_enabled and not session.tts_playing
+        assert llm.closed.is_set()
+        assert llm.serial_calls == 1  # Existing serial fallback, not a new retry policy.
+    finally:
+        await engine._cleanup_call(session.call_id)
+
+
+@pytest.mark.asyncio
+async def test_overlap_empty_tts_never_closes_capture(monkeypatch):
+    engine, session, stt, llm, tts, manager = await _start_controlled_overlap(monkeypatch, chunks=(b"",))
+    try:
+        llm.release.set()
+        tts.release.set()
+        await stt.results.put("please answer this question")
+        await asyncio.wait_for(llm.closed.wait(), timeout=2)
+        assert tts.closed.is_set()
+        assert manager.starts == []
+        assert session.audio_capture_enabled and not session.tts_playing
+    finally:
+        await engine._cleanup_call(session.call_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("waiting_stage", ["model", "tts"])
+@pytest.mark.parametrize("aggregation_flush", [False, True])
+async def test_overlap_teardown_settles_model_and_tts_including_flush(
+    monkeypatch, waiting_stage, aggregation_flush,
+):
+    engine, session, stt, llm, tts, manager = await _start_controlled_overlap(monkeypatch)
+    try:
+        await stt.results.put("hi" if aggregation_flush else "please answer this question")
+        await asyncio.wait_for(llm.started.wait(), timeout=2)
+        if waiting_stage == "tts":
+            llm.release.set()
+            await asyncio.wait_for(tts.started.wait(), timeout=2)
+        await engine._cleanup_call(session.call_id)
+        assert llm.closed.is_set()
+        if waiting_stage == "tts":
+            assert tts.closed.is_set()
+        assert manager.starts == []
+        assert session.call_id not in engine._pipeline_tasks
+        llm.release.set()
+        tts.release.set()
+        await asyncio.sleep(0)
+        assert manager.starts == []
+    finally:
+        llm.release.set()
+        tts.release.set()
+        await engine._cleanup_call(session.call_id)
+
+
+@pytest.mark.asyncio
+async def test_overlap_interruption_closes_suspended_generators_not_replacement_stream(monkeypatch):
+    engine, session, stt, llm, tts, manager = await _start_controlled_overlap(monkeypatch)
+    original_put = engine._put_pipeline_stream_chunk
+
+    async def replace_stream(call_id, stream_id, queue, chunk, **kwargs):
+        manager.stream_id = "replacement-stream"
+        await original_put(call_id, stream_id, queue, chunk, **kwargs)
+
+    monkeypatch.setattr(engine, "_put_pipeline_stream_chunk", replace_stream)
+    try:
+        llm.release.set()
+        tts.release.set()
+        await stt.results.put("please answer this question")
+        await asyncio.wait_for(llm.closed.wait(), timeout=2)
+        assert tts.closed.is_set()
+        assert manager.stops == []
+        assert manager.is_stream_active(session.call_id, "replacement-stream")
+        assert llm.serial_calls == 0
+    finally:
+        await engine._cleanup_call(session.call_id)
+
+
+class _CleanupFailureIterator:
+    def __init__(self, stream, component, observed, error):
+        self.stream = stream
+        self.component = component
+        self.observed = observed
+        self.error = error
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return await self.stream.__anext__()
+
+    async def aclose(self):
+        self.observed.append(self.component)
+        await self.stream.aclose()
+        if self.error:
+            raise self.error("synthetic close failure")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_error", [RuntimeError, asyncio.CancelledError])
+async def test_overlap_cleanup_failure_still_closes_llm_and_restores_provider(monkeypatch, close_error):
+    engine, session, stt, llm, tts, manager = await _start_controlled_overlap(monkeypatch)
+    old_provider = session.provider_name
+    observed = []
+    original_llm = llm.generate_stream
+    original_tts = tts.synthesize
+    monkeypatch.setattr(llm, "generate_stream", lambda *a, **k: _CleanupFailureIterator(
+        original_llm(*a, **k), "llm", observed, None,
+    ))
+    monkeypatch.setattr(tts, "synthesize", lambda *a, **k: _CleanupFailureIterator(
+        original_tts(*a, **k), "tts", observed, close_error,
+    ))
+    try:
+        llm.release.set()
+        await stt.results.put("please answer this question")
+        await asyncio.wait_for(tts.started.wait(), timeout=2)
+        await engine._cleanup_call(session.call_id)
+        assert observed == ["tts", "llm"]
+        assert llm.closed.is_set() and tts.closed.is_set()
+        assert session.provider_name == old_provider
+        assert llm.serial_calls == 0
+        assert manager.starts == []
+        assert session.call_id not in engine._pipeline_tasks
+    finally:
+        tts.release.set()
+        await engine._cleanup_call(session.call_id)
+
+
+class _FailingOverlapTTS(_ControlledOverlapTTS):
+    def __init__(self, after_audio):
+        super().__init__()
+        self.after_audio = after_audio
+
+    async def synthesize(self, call_id, text, options):
+        self.started.set()
+        try:
+            await self.release.wait()
+            if self.after_audio:
+                yield b"partial-real-audio"
+            raise RuntimeError("synthetic TTS failure")
+        finally:
+            self.closed.set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("after_audio", [False, True])
+async def test_overlap_tts_failure_never_regenerates_after_partial_audio(monkeypatch, after_audio):
+    engine, session, stt, llm, _, manager = await _start_controlled_overlap(monkeypatch)
+    old_provider = session.provider_name
+    tts = _FailingOverlapTTS(after_audio)
+    resolution = engine.pipeline_orchestrator.get_pipeline(session.call_id)
+    resolution.tts_adapter = tts
+    try:
+        llm.release.set()
+        tts.release.set()
+        await stt.results.put("please answer this question")
+        await asyncio.wait_for(llm.closed.wait(), timeout=2)
+        if not after_audio:
+            await asyncio.wait_for(llm.serial_done.wait(), timeout=2)
+        assert llm.serial_calls == (0 if after_audio else 1)
+        assert tts.closed.is_set()
+        assert len(manager.starts) == (1 if after_audio else 0)
+        assert not manager.active
+        assert session.provider_name == old_provider
+        assert session.audio_capture_enabled and not session.tts_playing
+    finally:
+        await engine._cleanup_call(session.call_id)
+
+
+@pytest.mark.asyncio
+async def test_overlap_teardown_settles_active_audio_and_pending_next_token(monkeypatch):
+    engine, session, stt, llm, tts, manager = await _start_controlled_overlap(monkeypatch, mode="tail")
+    old_provider = session.provider_name
+    try:
+        llm.release.set()
+        tts.release.set()
+        await stt.results.put("please answer this question")
+        await asyncio.wait_for(llm.next_token_started.wait(), timeout=2)
+        assert manager.active
+        assert not llm.closed.is_set()
+        await engine._cleanup_call(session.call_id)
+        assert llm.closed.is_set() and tts.closed.is_set()
+        assert not manager.active
+        assert session.provider_name == old_provider
+        assert all(call_id == session.call_id for call_id, _ in manager.stops)
+        assert llm.serial_calls == 0
+    finally:
+        llm.tail_release.set()
+        await engine._cleanup_call(session.call_id)
+
+
+@pytest.mark.asyncio
+async def test_overlap_teardown_settles_already_failed_flush_task(monkeypatch):
+    engine, session, stt, llm, tts, manager = await _start_controlled_overlap(monkeypatch)
+    old_provider = session.provider_name
+    failed = asyncio.Event()
+    original_upsert = engine.session_store.upsert_call
+
+    async def fail_history_upsert(call):
+        if call.conversation_history and not call.cleanup_in_progress:
+            failed.set()
+            raise RuntimeError("synthetic failed aggregation task")
+        return await original_upsert(call)
+
+    monkeypatch.setattr(engine.session_store, "upsert_call", fail_history_upsert)
+    try:
+        llm.release.set()
+        tts.release.set()
+        await stt.results.put("hi")
+        await asyncio.wait_for(failed.wait(), timeout=2)
+        await asyncio.sleep(0)
+        await engine._cleanup_call(session.call_id)
+        assert llm.closed.is_set() and tts.closed.is_set()
+        assert session.provider_name == old_provider
+        assert session.call_id not in engine._pipeline_tasks
+        assert not manager.active
+    finally:
+        await engine._cleanup_call(session.call_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent", ["aimee_main", "aimee"])
+async def test_initial_350ms_preroll_survives_real_processing_and_frame_output(
+    monkeypatch, tmp_path, agent,
+):
+    from tests import test_local_caller_ingress as ingress
+    from src.core.streaming_playback_manager import StreamingPlaybackManager, _JITTER_SENTINEL
+
+    call_id = "preroll-" + uuid.uuid4().hex
+    monkeypatch.setattr(ingress, "LOCAL_ID", call_id)
+    original_event = ingress.local_event
+
+    def event_for_test(*args, **kwargs):
+        kwargs.setdefault("channel_id", call_id)
+        return original_event(*args, **kwargs)
+
+    monkeypatch.setattr(ingress, "local_event", event_for_test)
+    engine, pipeline, playback, waiting, ready = ingress.timing_engine(
+        monkeypatch, tmp_path, agent=agent,
+    )
+    try:
+        await engine._handle_stasis_start(ingress.local_event(channel_id=call_id, agent=agent))
+        await asyncio.wait_for(waiting.wait(), timeout=1)
+        queue = playback.queues[call_id]
+        assert queue.empty()
+        session = await engine.session_store.get_by_call_id(call_id)
+        session.media_rx_confirmed = True
+        await asyncio.wait_for(ready.wait(), timeout=1)
+        chunks = []
+        while not queue.empty():
+            chunks.append(queue.get_nowait())
+        assert chunks[:3] == [b"\xff" * 2800, b"first-spoken-chunk", b"second-spoken-chunk"]
+
+        manager = StreamingPlaybackManager(
+            session_store=engine.session_store, ari_client=engine.ari_client,
+            streaming_config=engine.config.streaming.model_dump(), audio_transport="audiosocket",
+        )
+        manager.audiosocket_format = "ulaw"
+        stream_id = "preroll-output"
+        manager.active_streams[call_id] = {
+            "stream_id": stream_id, "target_format": "ulaw", "target_sample_rate": 8000,
+            "source_encoding": "mulaw", "source_sample_rate": 8000,
+            "producer_closed": True,
+        }
+        emitted = []
+
+        async def send_audio(call, stream, frame, **kwargs):
+            assert call == call_id and stream == stream_id
+            emitted.append(frame)
+            return True
+
+        manager._send_audio_chunk = send_audio
+        jitter = asyncio.Queue()
+        for chunk in chunks:
+            jitter.put_nowait(_JITTER_SENTINEL if chunk is None else chunk)
+        for _ in range(64):
+            result = await manager._drain_next_frame(call_id, stream_id, jitter)
+            if result == "finished":
+                break
+        else:
+            pytest.fail("Native frame drain did not finish")
+        output = b"".join(emitted)
+        assert output[:2800] == b"\xff" * 2800
+        assert any(byte != 0xff for byte in output[2800:])
+        assert len(output[:2800]) / 8000 == 0.350
+        assert manager.normalizer_enabled  # Includes the existing leading-silence trim branch.
+        assert engine._wait_for_initial_media.await_count == 1
+        await engine._stream_pipeline_tts_text(call_id, session, pipeline, "next reply")
+        assert playback.drained == [b"first-spoken-chunk", b"second-spoken-chunk", None]
+        assert engine._wait_for_initial_media.await_count == 1  # Initial speech only.
+    finally:
+        await engine._cleanup_call(call_id)

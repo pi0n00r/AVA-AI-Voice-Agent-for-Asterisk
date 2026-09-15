@@ -192,14 +192,32 @@ class SessionStore:
                 except Exception:
                     session.tts_ended_ts = 0.0
 
+                vad_state = getattr(session, "vad_state", None)
+                if not isinstance(vad_state, dict):
+                    session.vad_state = vad_state = {}
+                observed = vad_state.setdefault("pipeline_observability", {})
+                if not isinstance(observed, dict):
+                    observed = {}
+                    vad_state["pipeline_observability"] = observed
+                observed["capture_reopen_count"] = (
+                    int(observed.get("capture_reopen_count", 0) or 0) + 1
+                )
+                observed["last_capture_reopen_ts"] = session.tts_ended_ts
+                logger.info(
+                    "Pipeline capture reopened after TTS",
+                    call_id=call_id,
+                    playback_id=playback_id,
+                    counters=dict(observed),
+                )
+
                 # Update VAD state
-                if session.vad_state:
-                    session.vad_state["tts_playing"] = False
+                if vad_state:
+                    vad_state["tts_playing"] = False
                     # ARCHITECT FIX: Reset both audio_buffer and frame_buffer
-                    if "audio_buffer" in session.vad_state:
-                        session.vad_state["audio_buffer"] = b""
-                    if "frame_buffer" in session.vad_state:
-                        session.vad_state["frame_buffer"] = b""
+                    if "audio_buffer" in vad_state:
+                        vad_state["audio_buffer"] = b""
+                    if "frame_buffer" in vad_state:
+                        vad_state["frame_buffer"] = b""
             else:
                 # Ensure we remain gated if any tokens remain (even if pre-state drifted).
                 if session.tts_active_count > 0:

@@ -88,6 +88,7 @@ venv.bak/
 *.mp3
 *.ulaw
 *.alaw
+!assets/audio/receptionist-typing-cc0.wav
 
 # Models (large files)
 models/
@@ -127,6 +128,9 @@ pip-wheel-metadata/
 
 # Taskmaster-AI
 .taskmaster/
+
+# Fleet deployment metadata and private rollback material
+.fleet-overlay/
 
 # Mypy
 .mypy_cache/

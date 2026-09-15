@@ -194,7 +194,7 @@ def build_in_call_tool_runtime_guidance(config: Dict[str, Any], allowed_tools: I
     header = [
         "## Runtime Tool Target Inventory",
         "- Never invent extension numbers, destination keys, aliases, queue names, or ring groups.",
-        "- Use only the exact configured values listed below when calling telephony tools.",
+        "- Use exact configured names, aliases, destination keys, queue names, and ring groups.",
     ]
     sections.append("\n".join(header))
 
@@ -205,14 +205,18 @@ def build_in_call_tool_runtime_guidance(config: Dict[str, Any], allowed_tools: I
                 "Configured live agents:",
                 *live_agent_lines,
             ]
-            lines.append("- Use `live_agent_transfer.target` with one of the listed extensions, names, or aliases.")
+            lines.append("- Use listed names and aliases for friendly resolution.")
+            lines.append(
+                "- An exact caller-supplied numeric target may be passed to `live_agent_transfer.target`; FreePBX decides whether it exists and how it routes."
+            )
             sections.append("\n".join(lines))
         else:
             sections.append(
                 "\n".join(
                     [
                         "Configured live agents:",
-                        "- None configured. Do not call `live_agent_transfer` unless a live agent is configured.",
+                        "- No friendly-name directory entries are configured.",
+                        "- An exact caller-supplied numeric target may still be passed to `live_agent_transfer.target`; FreePBX decides whether it exists and how it routes.",
                     ]
                 )
             )

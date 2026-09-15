@@ -17,6 +17,8 @@ from prometheus_client import Counter, Gauge, Histogram
 import math
 import os
 import wave
+import hashlib
+import random
 
 from src.audio.resampler import (
     mulaw_to_pcm16le,
@@ -44,6 +46,20 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 logger = structlog.get_logger(__name__)
 
 _JITTER_SENTINEL = object()
+
+_CALLER_WAIT_AMBIENCE_PATH = os.path.abspath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "..",
+        "assets",
+        "audio",
+        "receptionist-typing-cc0.wav",
+    )
+)
+_CALLER_WAIT_AMBIENCE_SHA256 = (
+    "db4198f9d1d25748593588b3ceda9079c287873f1e932740914602b82936ac38"
+)
 
 # Prometheus metrics for streaming playback (module-scope, registered once)
 _STREAMING_ACTIVE_GAUGE = Gauge(
@@ -188,6 +204,12 @@ class StreamingPlaybackManager:
         self.jitter_buffers: Dict[str, asyncio.Queue] = {}  # call_id -> audio_queue
         self.keepalive_tasks: Dict[str, asyncio.Task] = {}  # call_id -> keepalive_task
         self._cleanup_in_progress: Set[str] = set()
+        # Caller-side wait ambience deliberately does not enter active_streams:
+        # it must not gate capture, participate in barge-in, or masquerade as
+        # agent TTS.  The owning tool stops it before any response playback.
+        self._caller_wait_ambience_tasks: Dict[str, asyncio.Task] = {}
+        self._caller_wait_ambience_stops: Dict[str, asyncio.Event] = {}
+        self._caller_wait_ambience_lock = asyncio.Lock()
         # Per-call remainder buffer for precise frame sizing
         self.frame_remainders: Dict[str, bytes] = {}
         # Per-call resampler state (used when converting between rates)
@@ -813,6 +835,10 @@ class StreamingPlaybackManager:
                 'low_watermark_chunks': low_watermark_chunks,
                 'startup_ready': bool(initial_startup_ready),
                 'first_frame_observed': False,
+                # Barge-in protection begins when caller-facing audio is
+                # actually written, not when an empty stream is reserved
+                # while LLM/TTS work is still pending.
+                'first_frame_ts': 0.0,
                 'min_start_chunks': min_start_chunks,
                 'empty_backoff_ticks': 0,
                 'buffer_depth_max_frames': 0,
@@ -2165,6 +2191,14 @@ class StreamingPlaybackManager:
                         working = self._apply_soft_limiter(working, self.limiter_headroom_ratio)
                     except Exception:
                         pass
+                # Diagnostic-only locals must have harmless defaults because the
+                # first-window block below is intentionally shared with the
+                # diagnostic branch. Normal uLaw egress cannot depend on taps
+                # being enabled.
+                info = {}
+                back_pcm = b""
+                ulaw_bytes = b""
+                win_bytes = 0
                 if getattr(self, 'diag_enable_taps', False) and call_id in self.active_streams:
                     info = self.active_streams.get(call_id, {})
                     try:
@@ -2674,6 +2708,146 @@ class StreamingPlaybackManager:
         except Exception:
             return pcm_bytes
 
+    @staticmethod
+    def _load_caller_wait_ambience() -> bytes:
+        """Load and authenticate the built-in CC0 PCM16/8 kHz typing loop."""
+        with open(_CALLER_WAIT_AMBIENCE_PATH, "rb") as asset_file:
+            encoded = asset_file.read()
+        if hashlib.sha256(encoded).hexdigest() != _CALLER_WAIT_AMBIENCE_SHA256:
+            raise ValueError("caller wait ambience asset hash mismatch")
+        with wave.open(_CALLER_WAIT_AMBIENCE_PATH, "rb") as source:
+            if (
+                source.getnchannels() != 1
+                or source.getsampwidth() != 2
+                or source.getframerate() != 8000
+            ):
+                raise ValueError("caller wait ambience must be mono PCM16 at 8 kHz")
+            frames = source.readframes(source.getnframes())
+        if not frames or not any(frames):
+            raise ValueError("caller wait ambience asset is silent")
+        return frames
+
+    def _caller_wait_ambience_frames(self, asset: bytes, *, varied: bool = False, rng=None):
+        """Keep legacy bytes exact; shape bounded excerpts for main model wait."""
+        frame_bytes = 320
+        offset = 0
+        if not varied:
+            while True:
+                end = offset + frame_bytes
+                if end <= len(asset):
+                    frame = asset[offset:end]
+                else:
+                    frame = asset[offset:] + asset[: end - len(asset)]
+                offset = end % len(asset)
+                yield frame
+
+        # Local to this call's existing task; no shared random cursor or schedule.
+        rng = rng if rng is not None else random.Random()
+        while True:
+            offset = rng.randrange(len(asset) // frame_bytes) * frame_bytes
+            burst_frames = rng.randint(40, 110)
+            excerpt = (asset[offset:] + asset[:offset])[:burst_frames * frame_bytes]
+            burst = audioop.mul(excerpt, 2, rng.uniform(0.55, 0.90))
+            burst = self._apply_attack_envelope("", burst, 8000, {})
+            burst = audioop.reverse(self._apply_attack_envelope(
+                "", audioop.reverse(burst, 2), 8000, {}
+            ), 2)
+            for start in range(0, len(burst), frame_bytes):
+                yield burst[start:start + frame_bytes]
+            for _ in range(rng.randint(15, 55)):
+                yield b"\x00" * frame_bytes
+
+    async def _caller_wait_ambience_loop(
+        self,
+        call_id: str,
+        stop_event: asyncio.Event,
+        *,
+        varied: bool = False,
+    ) -> None:
+        """Pace one non-gating typing loop onto the call-owned AudioSocket."""
+        frame_ms = 20
+        frame_bytes = 8000 * 2 * frame_ms // 1000
+        loop = asyncio.get_running_loop()
+        try:
+            asset = self._load_caller_wait_ambience()
+            frames = self._caller_wait_ambience_frames(asset, varied=varied)
+            deadline = loop.time()
+            while not stop_event.is_set():
+                # Agent TTS always wins.  Pausing here is defense-in-depth;
+                # the tool owner also awaits stop before response playback.
+                if self.active_streams.get(call_id):
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=0.02)
+                    except asyncio.TimeoutError:
+                        pass
+                    deadline = loop.time()
+                    continue
+
+                frame = next(frames)
+                sent = await self._send_audio_chunk(
+                    call_id,
+                    "caller-wait-ambience",
+                    frame,
+                    target_fmt="slin",
+                    target_rate=8000,
+                )
+                if not sent:
+                    break
+
+                deadline += frame_ms / 1000.0
+                delay = max(0.0, deadline - loop.time())
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Caller wait ambience stopped after an error", exc_info=True)
+
+    async def start_caller_wait_ambience(self, call_id: str, *, varied: bool = False) -> bool:
+        """Start one caller-side typing loop without changing TTS/VAD state."""
+        if self.audio_transport != "audiosocket" or not self.audiosocket_server:
+            logger.warning("Caller wait ambience requires AudioSocket transport")
+            return False
+        async with self._caller_wait_ambience_lock:
+            existing = self._caller_wait_ambience_tasks.get(call_id)
+            if existing and not existing.done():
+                return False
+            if existing:
+                self._caller_wait_ambience_tasks.pop(call_id, None)
+                self._caller_wait_ambience_stops.pop(call_id, None)
+            stop_event = asyncio.Event()
+            task = asyncio.create_task(
+                self._caller_wait_ambience_loop(call_id, stop_event, varied=varied),
+                name="caller-wait-ambience",
+            )
+            self._caller_wait_ambience_stops[call_id] = stop_event
+            self._caller_wait_ambience_tasks[call_id] = task
+            return True
+
+    async def stop_caller_wait_ambience(self, call_id: str) -> bool:
+        """Stop and join the caller-side loop before any response is spoken."""
+        async with self._caller_wait_ambience_lock:
+            stop_event = self._caller_wait_ambience_stops.pop(call_id, None)
+            task = self._caller_wait_ambience_tasks.pop(call_id, None)
+            if stop_event:
+                stop_event.set()
+        if not task:
+            return False
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        except asyncio.CancelledError:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            raise
+        return True
+
     async def _send_audio_chunk(
         self,
         call_id: str,
@@ -2909,10 +3083,12 @@ class StreamingPlaybackManager:
                 # First-frame observability
                 try:
                     if call_id in self.active_streams and not self.active_streams[call_id].get('first_frame_observed', False) and success:
+                        first_frame_ts = time.time()
                         start_time = float(self.active_streams[call_id].get('start_time', time.time()))
                         pb_type = str(self.active_streams[call_id].get('playback_type', 'response'))
-                        first_s = max(0.0, time.time() - start_time)
+                        first_s = max(0.0, first_frame_ts - start_time)
                         _STREAM_FIRST_FRAME_SECONDS.labels(pb_type).observe(first_s)
+                        self.active_streams[call_id]['first_frame_ts'] = first_frame_ts
                         self.active_streams[call_id]['first_frame_observed'] = True
                 except Exception:
                     pass

@@ -1,4 +1,5 @@
 import asyncio
+import struct
 import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -15,6 +16,8 @@ from src.audio.audiosocket_server import AudioSocketServer, TYPE_TERMINATE, TYPE
 from src.core.streaming_playback_manager import StreamingPlaybackManager
 from src.core.transport_orchestrator import TransportOrchestrator
 from src.engine import Engine
+from src.core.models import CallSession
+from src.core.session_store import SessionStore
 from src.providers.base import ProviderCapabilities
 from src.providers.local import LocalProvider
 
@@ -126,6 +129,89 @@ async def test_server_writes_rate_specific_type_and_rejects_oversized_frame():
     assert writer.data[:3] == bytes([0x12]) + len(payload).to_bytes(2, "big")
     assert writer.data[3:] == payload
     assert not await server.send_audio("conn", b"x" * 65536)
+
+
+@pytest.mark.asyncio
+async def test_real_audiosocket_handler_carries_near_end_reply_across_capture_reopen(
+    monkeypatch,
+):
+    """Exercise the actual AudioSocket callback, gating store, and pipeline queue."""
+    call_id = "call-handler-cross-boundary"
+    conn_id = "conn-handler-cross-boundary"
+    now = [100.0]
+    monkeypatch.setattr("src.engine.time.time", lambda: now[0])
+    monkeypatch.setattr("src.core.session_store.time.time", lambda: now[0])
+
+    engine = Engine.__new__(Engine)
+    engine.config = SimpleNamespace(
+        audio_transport="audiosocket",
+        default_provider="local",
+        barge_in=SimpleNamespace(
+            enabled=True,
+            initial_protection_ms=200,
+            greeting_protection_ms=0,
+            pipeline_energy_threshold=1000,
+            energy_threshold=1000,
+            cooldown_ms=500,
+            pipeline_min_speech_ms=120,
+            min_speech_ms=120,
+        ),
+    )
+    engine.session_store = SessionStore()
+    session = CallSession(
+        call_id=call_id,
+        caller_channel_id=call_id,
+        provider_name="pipeline",
+        pipeline_name="local_hybrid",
+        conversation_state="listening",
+    )
+    session.audio_capture_enabled = True
+    await engine.session_store.upsert_call(session)
+    assert await engine.session_store.set_gating_token(call_id, "question-playback")
+
+    engine.conn_to_channel = {conn_id: call_id}
+    engine.audio_socket_server = None
+    engine._audiosocket_frame_count = {}
+    engine._pipeline_forced = {call_id: True}
+    engine._pipeline_queues = {call_id: asyncio.Queue()}
+    engine._resample_state_pipeline16k = {}
+    engine._save_session = AsyncMock()
+    engine._update_transport_profile = AsyncMock()
+    engine._update_audio_diagnostics = lambda *args, **kwargs: None
+    engine.audio_capture = SimpleNamespace(append_pcm16=lambda *args, **kwargs: None)
+    engine._observe_no_input_audio = AsyncMock()
+    engine._attended_transfer_screening_state_by_call = {}
+    engine.streaming_playback_manager = SimpleNamespace(
+        active_streams={call_id: {"first_frame_ts": 99.6}}
+    )
+    engine.conversation_coordinator = None
+
+    speech = struct.pack("<" + ("h" * 160), *([12000, -12000] * 80))
+    frame = AudioSocketAudioFrame(speech, 0x10, "slin", 8000)
+
+    # The caller begins 100 ms before the question finishes. This is below the
+    # 120 ms barge threshold and therefore remains a bounded carry candidate.
+    for _ in range(5):
+        await engine._audiosocket_handle_audio(conn_id, frame)
+        now[0] += 0.02
+    assert engine._pipeline_queues[call_id].empty()
+
+    assert await engine.session_store.clear_gating_token(
+        call_id, "question-playback"
+    )
+    for _ in range(2):
+        now[0] += 0.02
+        await engine._audiosocket_handle_audio(conn_id, frame)
+
+    queued = engine._pipeline_queues[call_id].get_nowait()
+    assert len(queued) == len(speech) * 14  # 7 x 20 ms at 8 kHz -> 16 kHz.
+    assert engine._pipeline_queues[call_id].empty()
+    observed = session.vad_state["pipeline_observability"]
+    assert observed["carry_candidate_count"] == 1
+    assert observed["carry_release_count"] == 1
+    assert observed["capture_reopen_count"] == 1
+    assert observed["pipeline_queue_chunks"] == 1
+    assert observed["post_reopen_rx_frames"] == 2
 
 
 def _orchestrator_config():

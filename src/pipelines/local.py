@@ -106,6 +106,10 @@ class _LocalSessionState:
     stopping: bool = False
     receiver_restart_count: int = 0
     last_final_result_ts: float = 0.0
+    ws_sent_chunks: int = 0
+    ws_sent_bytes: int = 0
+    ws_max_rms: int = 0
+    final_count: int = 0
 
 
 class _LocalAdapterBase:
@@ -448,6 +452,10 @@ class _LocalAdapterBase:
             stopping = existing.stopping if existing else False
             receiver_restart_count = existing.receiver_restart_count if existing else 0
             last_final_result_ts = existing.last_final_result_ts if existing else 0.0
+            ws_sent_chunks = existing.ws_sent_chunks if existing else 0
+            ws_sent_bytes = existing.ws_sent_bytes if existing else 0
+            ws_max_rms = existing.ws_max_rms if existing else 0
+            final_count = existing.final_count if existing else 0
 
             # Clean up stale session
             if existing:
@@ -489,6 +497,10 @@ class _LocalAdapterBase:
                 session.stopping = stopping
                 session.receiver_restart_count = receiver_restart_count
                 session.last_final_result_ts = last_final_result_ts
+                session.ws_sent_chunks = ws_sent_chunks
+                session.ws_sent_bytes = ws_sent_bytes
+                session.ws_max_rms = ws_max_rms
+                session.final_count = final_count
             
             logger.info(
                 "Local adapter session reconnected successfully",
@@ -739,6 +751,19 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
             # WebSocket before the next STT result arrives.
             active_session = self._sessions.get(call_id)
             if active_session is not None:
+                active_session.ws_sent_chunks += 1
+                active_session.ws_sent_bytes += len(pcm16)
+                active_session.ws_max_rms = max(
+                    int(active_session.ws_max_rms), int(egress_rms)
+                )
+                if active_session.ws_sent_chunks == 1:
+                    logger.info(
+                        "Local STT first audio chunk sent",
+                        component=self.component_key,
+                        call_id=call_id,
+                        sent_bytes=len(pcm16),
+                        egress_rms_int16=egress_rms,
+                    )
                 self._ensure_stream_receiver(
                     active_session,
                     active_session.options,
@@ -784,6 +809,16 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
         session = self._sessions.get(call_id)
         if not session:
             return
+        logger.info(
+            "Local STT transport observability summary",
+            component=self.component_key,
+            call_id=call_id,
+            ws_sent_chunks=session.ws_sent_chunks,
+            ws_sent_bytes=session.ws_sent_bytes,
+            ws_max_rms=session.ws_max_rms,
+            final_count=session.final_count,
+            receiver_restart_count=session.receiver_restart_count,
+        )
         session.stopping = True
         if session.receiver_task:
             session.receiver_task.cancel()
@@ -869,6 +904,7 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
                     continue
                 text = (message.get("text") or "")
                 session.last_final_result_ts = time.time()
+                session.final_count += 1
                 logger.info(
                     "Local STT final received by adapter",
                     component=self.component_key,

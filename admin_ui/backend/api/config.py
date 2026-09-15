@@ -1863,8 +1863,12 @@ async def test_provider_connection(request: ProviderTestRequest):
         # OPENAI-COMPATIBLE (OpenAI / Groq / OpenRouter / etc.) - validate /models
         # ============================================================
         if provider_type == 'openai':
-            chat_base_url = _safe_base_url(
-                provider_config.get('chat_base_url') or '', 'https://api.openai.com/v1'
+            configured_chat_base_url = provider_config.get('chat_base_url')
+            chat_base_url = (
+                str(configured_chat_base_url).strip().rstrip('/')
+                if configured_chat_base_url is not None
+                and str(configured_chat_base_url).strip()
+                else 'https://api.openai.com/v1'
             )
             api_key = provider_config.get('api_key')
             if not api_key:

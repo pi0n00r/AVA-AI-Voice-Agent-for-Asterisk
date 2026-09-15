@@ -1,3 +1,7 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Project=Ava
+
 import asyncio
 import base64
 import json
@@ -9,9 +13,11 @@ import pytest
 
 from src.audio.resampler import convert_pcm16le_to_target_format
 from src.config import AppConfig, OpenAIProviderConfig
+from src.engine import _context_in_call_tool_names
 from src.pipelines.openai import OpenAISTTAdapter, OpenAILLMAdapter, OpenAITTSAdapter
 from src.pipelines.orchestrator import PipelineOrchestrator
-from src.tools.base import ToolPhase
+from src.tools.base import Tool, ToolCategory, ToolDefinition, ToolPhase
+from src.tools.registry import ToolRegistry
 
 
 def _build_app_config() -> AppConfig:
@@ -184,6 +190,279 @@ async def test_openai_llm_adapter_chat_completion(monkeypatch):
     request = fake_session.requests[0]
     assert request["json"]["model"] == "gpt-4o-mini"
     assert request["json"]["messages"][-1] == {"role": "user", "content": "hello"}
+
+
+def _bind_realistic_tool(adapter, name="blind_transfer"):
+    schema = {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": "Transfer through an authoritative configured destination",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "destination": {"type": "string", "enum": ["jd", "operator"]}
+                },
+                "required": ["destination"],
+            },
+        },
+    }
+    definition = MagicMock()
+    definition.phase = ToolPhase.IN_CALL
+    definition.to_openai_schema.return_value = schema
+    registry = MagicMock()
+    registry.get.return_value = MagicMock(definition=definition)
+    adapter.bind_tool_registry(registry)
+    return schema
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ordinary_tools", "http_tools", "expected_names"),
+    [
+        (None, ["pbx_message_deposit"], ["pbx_message_deposit"]),
+        ([], ["pbx_message_deposit"], ["pbx_message_deposit"]),
+        (["ordinary_tool"], ["pbx_message_deposit"], ["ordinary_tool", "pbx_message_deposit"]),
+        (["pbx_message_deposit"], ["pbx_message_deposit"], ["pbx_message_deposit"]),
+        (
+            ["ordinary_tool"],
+            {"pbx_message_deposit": {"url": "https://example.invalid/deposit"}},
+            ["ordinary_tool", "pbx_message_deposit"],
+        ),
+        (["ordinary_tool"], None, ["ordinary_tool"]),
+    ],
+)
+async def test_agent_http_tool_projection_reaches_openai_wire_exactly(
+    ordinary_tools, http_tools, expected_names
+):
+    app_config = _build_app_config()
+    provider_config = OpenAIProviderConfig(**app_config.providers["openai"])
+    body = json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
+    fake_session = _FakeSession(body)
+    context_config = type(
+        "Context",
+        (),
+        {
+            "tools": ordinary_tools,
+            "in_call_http_tools": http_tools,
+        },
+    )()
+    names = _context_in_call_tool_names(context_config)
+    assert names == expected_names
+
+    adapter = OpenAILLMAdapter(
+        "openai_llm",
+        app_config,
+        provider_config,
+        {"use_realtime": False},
+        session_factory=lambda: fake_session,
+    )
+    definitions = {}
+    for name in names:
+        definition = MagicMock()
+        definition.phase = ToolPhase.IN_CALL
+        definition.to_openai_schema.return_value = {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": f"{name} schema",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        definitions[name] = MagicMock(definition=definition)
+    registry = MagicMock()
+    registry.get.side_effect = definitions.get
+    adapter.bind_tool_registry(registry)
+
+    await adapter.start()
+    await adapter.generate("call-1", "hello", {}, {"tools": names})
+
+    wire_names = [
+        item["function"]["name"] for item in fake_session.requests[0]["json"]["tools"]
+    ]
+    assert wire_names == expected_names
+    assert wire_names.count("pbx_message_deposit") == (
+        1 if "pbx_message_deposit" in expected_names else 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_http_tool_wire_retains_global_inclusion_and_context_opt_out():
+    class _Tool(Tool):
+        def __init__(self, name, *, is_global=False):
+            self._definition = ToolDefinition(
+                name=name,
+                description=f"{name} schema",
+                category=ToolCategory.BUSINESS,
+                is_global=is_global,
+            )
+
+        @property
+        def definition(self):
+            return self._definition
+
+        async def execute(self, parameters, context):
+            return {"status": "success"}
+
+    registry = ToolRegistry.isolated()
+    for tool in (
+        _Tool("global_tool", is_global=True),
+        _Tool("ordinary_tool"),
+        _Tool("pbx_message_deposit"),
+    ):
+        registry.register_instance(tool)
+    context_config = type(
+        "Context",
+        (),
+        {
+            "tools": ["ordinary_tool"],
+            "in_call_http_tools": ["pbx_message_deposit"],
+        },
+    )()
+    projected = _context_in_call_tool_names(context_config)
+    enabled = [
+        tool.definition.name
+        for tool in registry.get_tools_for_context(
+            ToolPhase.IN_CALL,
+            context_tool_names=projected,
+            disabled_global_tools=[],
+        )
+    ]
+    disabled = [
+        tool.definition.name
+        for tool in registry.get_tools_for_context(
+            ToolPhase.IN_CALL,
+            context_tool_names=projected,
+            disabled_global_tools=["global_tool"],
+        )
+    ]
+    assert enabled == ["global_tool", "ordinary_tool", "pbx_message_deposit"]
+    assert disabled == ["ordinary_tool", "pbx_message_deposit"]
+
+    app_config = _build_app_config()
+    provider_config = OpenAIProviderConfig(**app_config.providers["openai"])
+    body = json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
+    fake_session = _FakeSession(body)
+    adapter = OpenAILLMAdapter(
+        "openai_llm",
+        app_config,
+        provider_config,
+        {"use_realtime": False},
+        session_factory=lambda: fake_session,
+    )
+    adapter.bind_tool_registry(registry)
+    await adapter.start()
+    await adapter.generate("call-1", "hello", {}, {"tools": disabled})
+
+    wire_names = [
+        item["function"]["name"] for item in fake_session.requests[0]["json"]["tools"]
+    ]
+    assert wire_names == ["ordinary_tool", "pbx_message_deposit"]
+
+
+def _extra_body_with_reserved_collisions():
+    return {
+        "reasoning_effort": "none", "keep_alive": -1,
+        "model": "replacement", "messages": [], "tools": [{"unsafe": True}],
+        "tool_choice": "required", "stream": False, "temperature": 99,
+        "max_tokens": 999, "functions": [{"unsafe": True}],
+        "function_call": "unsafe", "parallel_tool_calls": True, "n": 99,
+    }
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_adapter_extra_body_preserves_owned_fields_and_tools():
+    app_config = _build_app_config()
+    provider_config = OpenAIProviderConfig(**app_config.providers["openai"])
+    body = json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
+    fake_session = _FakeSession(body)
+    adapter = OpenAILLMAdapter(
+        "openai_llm",
+        app_config,
+        provider_config,
+        {
+            "temperature": 0.25, "max_tokens": 80, "tools": ["blind_transfer"],
+            "extra_body": _extra_body_with_reserved_collisions(),
+        },
+        session_factory=lambda: fake_session,
+    )
+    schema = _bind_realistic_tool(adapter)
+
+    await adapter.start()
+    await adapter.generate("call-1", "hello", {}, {})
+
+    payload = fake_session.requests[0]["json"]
+    assert payload["reasoning_effort"] == "none"
+    assert payload["keep_alive"] == -1
+    assert payload["model"] == "gpt-4o-mini"
+    assert payload["messages"][-1] == {"role": "user", "content": "hello"}
+    assert payload["tools"] == [schema]
+    assert payload["tool_choice"] == "auto"
+    assert "stream" not in payload
+    assert payload["temperature"] == 0.25
+    assert payload["max_tokens"] == 80
+    for key in ("functions", "function_call", "parallel_tool_calls", "n"):
+        assert key not in payload
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_stream_extra_body_preserves_stream_and_real_tools():
+    app_config = _build_app_config()
+    provider_config = OpenAIProviderConfig(**app_config.providers["openai"])
+    fake_session = _FakeStreamingSession(_TimeoutStream())
+    adapter = OpenAILLMAdapter(
+        "openai_llm", app_config, provider_config,
+        {
+            "temperature": 0.25, "max_tokens": 80, "tools": ["blind_transfer"],
+            "extra_body": _extra_body_with_reserved_collisions(),
+        },
+        session_factory=lambda: fake_session,
+    )
+    schema = _bind_realistic_tool(adapter)
+
+    await adapter.start()
+    chunks = [chunk async for chunk in adapter.generate_stream("call-1", "hello", {}, {})]
+
+    assert chunks == []
+    payload = fake_session.requests[0]["json"]
+    assert payload["reasoning_effort"] == "none"
+    assert payload["keep_alive"] == -1
+    assert payload["model"] == "gpt-4o-mini"
+    assert payload["messages"][-1] == {"role": "user", "content": "hello"}
+    assert payload["tools"] == [schema]
+    assert payload["tool_choice"] == "auto"
+    assert payload["stream"] is True
+    assert payload["temperature"] == 0.25
+    assert payload["max_tokens"] == 80
+    for key in ("functions", "function_call", "parallel_tool_calls", "n"):
+        assert key not in payload
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_adapter_without_extra_body_is_unchanged(monkeypatch):
+    app_config = _build_app_config()
+    provider_config = OpenAIProviderConfig(**app_config.providers["openai"])
+    body = json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
+    fake_session = _FakeSession(body)
+    adapter = OpenAILLMAdapter(
+        "openai_llm",
+        app_config,
+        provider_config,
+        {},
+        session_factory=lambda: fake_session,
+    )
+
+    await adapter.start()
+    await adapter.generate("call-1", "hello", {}, {})
+
+    assert fake_session.requests[0]["json"] == {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": "prompt"},
+            {"role": "user", "content": "hello"},
+        ],
+        "temperature": 0.7,
+    }
 
 
 @pytest.mark.asyncio

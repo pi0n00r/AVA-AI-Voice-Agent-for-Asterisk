@@ -64,8 +64,11 @@ RUN if [ "$INCLUDE_SHERPA" = "true" ]; then \
 RUN if [ "$INCLUDE_FASTER_WHISPER" = "true" ]; then \
         echo "📦 Installing Faster-Whisper STT..." && \
         FASTER_WHISPER_REQUIREMENT="$(grep -m 1 '^faster-whisper==' requirements.txt || true)"; \
+        REQUESTS_REQUIREMENT="$(grep -m 1 '^requests==' requirements.txt || true)"; \
         if [ -z "$FASTER_WHISPER_REQUIREMENT" ]; then echo "❌ Missing faster-whisper pin" >&2; exit 1; fi; \
-        pip install --no-cache-dir "$FASTER_WHISPER_REQUIREMENT"; \
+        if [ -z "$REQUESTS_REQUIREMENT" ]; then echo "❌ Missing requests pin required by faster-whisper 1.0.3" >&2; exit 1; fi; \
+        pip install --no-cache-dir "$FASTER_WHISPER_REQUIREMENT" "$REQUESTS_REQUIREMENT" && \
+        python -c "import ctranslate2, faster_whisper, requests; print('Faster-Whisper import smoke passed')"; \
     fi
 
 RUN if [ "$INCLUDE_WHISPER_CPP" = "true" ]; then \

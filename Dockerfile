@@ -50,6 +50,8 @@ COPY --from=builder /opt/venv /opt/venv
 # Copy application source code
 COPY --chown=appuser:appuser src/ ./src
 COPY --chown=appuser:appuser config/ ./config
+COPY --chown=appuser:appuser assets/audio/receptionist-typing-cc0.wav ./assets/audio/receptionist-typing-cc0.wav
+COPY --chown=appuser:appuser assets/audio/receptionist-typing-cc0.LICENSE ./assets/audio/receptionist-typing-cc0.LICENSE
 COPY --chown=appuser:appuser main.py ./
 
 # Prepare log directory for file logging

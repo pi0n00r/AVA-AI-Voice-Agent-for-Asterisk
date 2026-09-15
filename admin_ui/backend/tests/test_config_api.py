@@ -14,6 +14,97 @@ sys.path.insert(0, str(BACKEND_ROOT))
 from api import config  # noqa: E402
 
 
+class _ProviderResponse:
+    status_code = 200
+
+    @staticmethod
+    def json():
+        return {"data": [{"id": "test-model"}]}
+
+
+def _provider_test_client(monkeypatch, *, failure=False):
+    calls = []
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url, **_kwargs):
+            calls.append(url)
+            if failure:
+                raise OSError("offline test connection failure")
+            return _ProviderResponse()
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    app = FastAPI()
+    app.include_router(config.router, prefix="/api/config")
+    return TestClient(app), calls
+
+
+def test_openai_provider_endpoint_uses_configured_base_exactly(monkeypatch):
+    client, calls = _provider_test_client(monkeypatch)
+    configured = "  http://validation-api.future.example:9443/tenant/v9///  "
+
+    response = client.post(
+        "/api/config/providers/test",
+        json={
+            "name": "future-compatible",
+            "config": {
+                "type": "openai",
+                "api_key": "test-only",
+                "chat_base_url": configured,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["success"] is True
+    assert calls == ["http://validation-api.future.example:9443/tenant/v9/models"]
+
+
+def test_openai_provider_endpoint_connection_failure_never_calls_default(monkeypatch):
+    client, calls = _provider_test_client(monkeypatch, failure=True)
+
+    response = client.post(
+        "/api/config/providers/test",
+        json={
+            "name": "future-compatible",
+            "config": {
+                "type": "openai",
+                "api_key": "test-only",
+                "chat_base_url": "http://unavailable.future.example:9555/api/v2",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["success"] is False
+    assert calls == ["http://unavailable.future.example:9555/api/v2/models"]
+    assert all("api.openai.com" not in url for url in calls)
+
+
+@pytest.mark.parametrize("provider_config", [{"type": "openai"}, {"type": "openai", "chat_base_url": "   "}])
+def test_openai_provider_endpoint_blank_or_omitted_base_uses_stock_default(
+    monkeypatch, provider_config
+):
+    client, calls = _provider_test_client(monkeypatch)
+    provider_config["api_key"] = "test-only"
+
+    response = client.post(
+        "/api/config/providers/test",
+        json={"name": "stock-openai", "config": provider_config},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["success"] is True
+    assert calls == ["https://api.openai.com/v1/models"]
+
+
 def test_get_config_returns_merged_structured_config(monkeypatch):
     monkeypatch.setattr(
         config,

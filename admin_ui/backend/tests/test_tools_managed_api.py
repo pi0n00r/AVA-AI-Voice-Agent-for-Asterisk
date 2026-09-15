@@ -126,12 +126,14 @@ def test_in_call_tool_goes_to_in_call_block(client):
         "name": "check_availability", "phase": "in_call",
         "url": "https://api.example.com/avail", "method": "POST",
         "description": "Check slot availability",
+        "caller_wait_ambience": True,
         "parameters": [{"name": "date", "type": "string", "required": True}],
     })
     assert r.status_code == 201, r.text
     assert r.json()["block"] == "in_call_tools"
     assert r.json()["kind"] == "in_call_http_lookup"
     assert client.cfg_state["cfg"]["in_call_tools"]["check_availability"]["phase"] == "in_call"
+    assert client.cfg_state["cfg"]["in_call_tools"]["check_availability"]["caller_wait_ambience"] is True
     assert "check_availability" not in client.cfg_state["cfg"]["tools"]
 
 

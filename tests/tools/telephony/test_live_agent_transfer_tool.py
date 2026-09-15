@@ -147,7 +147,7 @@ class TestLiveAgentTransferTool:
         assert call_args["params"]["extension"] == "6000"
 
     @pytest.mark.asyncio
-    async def test_explicit_target_fails_when_not_configured(self, tool, tool_context, mock_ari_client):
+    async def test_unlisted_numeric_target_is_handed_to_freepbx(self, tool, tool_context, mock_ari_client):
         tool_context.config["tools"]["extensions"] = {
             "internal": {
                 "6000": {"name": "Live Agent", "dial_string": "SIP/6000", "transfer": True},
@@ -156,6 +156,30 @@ class TestLiveAgentTransferTool:
 
         result = await tool.execute({"target": "2765"}, tool_context)
 
+        assert result["status"] == "success"
+        assert result["destination"] == "2765"
+        call_args = mock_ari_client.send_command.call_args.kwargs
+        assert call_args["resource"] == f"channels/{tool_context.caller_channel_id}/continue"
+        assert call_args["params"]["context"] == "from-internal"
+        assert call_args["params"]["extension"] == "2765"
+
+    @pytest.mark.asyncio
+    async def test_numeric_target_is_handed_to_freepbx_without_directory(self, tool, tool_context, mock_ari_client):
+        tool_context.config["tools"]["extensions"] = {"internal": {}}
+
+        result = await tool.execute({"target": "2765"}, tool_context)
+
+        assert result["status"] == "success"
+        call_args = mock_ari_client.send_command.call_args.kwargs
+        assert call_args["params"]["context"] == "from-internal"
+        assert call_args["params"]["extension"] == "2765"
+
+    @pytest.mark.asyncio
+    async def test_unlisted_friendly_name_still_fails(self, tool, tool_context, mock_ari_client):
+        tool_context.config["tools"]["extensions"] = {
+            "internal": {"6000": {"name": "Live Agent", "transfer": True}}
+        }
+        result = await tool.execute({"target": "unknown desk"}, tool_context)
         assert result["status"] == "failed"
         assert "not configured" in result["message"]
         mock_ari_client.send_command.assert_not_called()

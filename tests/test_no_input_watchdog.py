@@ -851,3 +851,110 @@ async def test_no_input_wait_keeps_gating_active_until_transport_drains(monkeypa
     after = await engine.session_store.get_by_call_id(call_id)
     assert "no_input_drain:no-input:final:test" not in after.tts_tokens
     assert after.tts_playing is False
+
+
+@pytest.mark.asyncio
+async def test_pipeline_no_input_announcement_uses_streaming_media_not_file_player():
+    class _TTS:
+        downstream_mode_override = "stream"
+
+        async def synthesize(self, call_id, text, options):
+            assert call_id == "pipeline-idle"
+            assert text == "Are you still there?"
+            yield b"audio-a"
+            yield b"audio-b"
+
+    class _Streaming:
+        def __init__(self):
+            self.active = False
+            self.queue = None
+            self.chunks = []
+
+        async def start_streaming_playback(self, call_id, queue, **kwargs):
+            assert call_id == "pipeline-idle"
+            assert kwargs["playback_type"] == "no-input-check_in"
+            self.active = True
+            self.queue = queue
+            return "no-input-stream"
+
+        def is_stream_active(self, call_id, stream_id=None):
+            return self.active and stream_id == "no-input-stream"
+
+        async def stop_streaming_playback(self, call_id, *, drain=False):
+            assert drain is True
+            while True:
+                chunk = self.queue.get_nowait()
+                if chunk is None:
+                    break
+                self.chunks.append(chunk)
+            self.active = False
+            return True
+
+    engine = Engine.__new__(Engine)
+    engine.config = SimpleNamespace(downstream_mode="stream")
+    engine.session_store = SessionStore()
+    engine._provider_output_operations = {}
+    engine._call_providers = {}
+    engine._save_session = AsyncMock()
+    engine.playback_manager = SimpleNamespace(
+        play_audio=AsyncMock(side_effect=AssertionError("file playback must not run"))
+    )
+    manager = _Streaming()
+    engine.streaming_playback_manager = manager
+    pipeline = SimpleNamespace(
+        tts_adapter=_TTS(),
+        tts_options={"format": {"encoding": "mulaw", "sample_rate": 8000}},
+    )
+    engine.pipeline_orchestrator = SimpleNamespace(
+        get_pipeline=lambda *_args, **_kwargs: pipeline
+    )
+    session = CallSession(call_id="pipeline-idle", caller_channel_id="channel-idle")
+    session.pipeline_name = "local_hybrid"
+    await engine.session_store.upsert_call(session)
+
+    assert await engine._speak_no_input_announcement(
+        "pipeline-idle",
+        "Are you still there?",
+        "check_in",
+    )
+    assert manager.chunks == [b"audio-a", b"audio-b"]
+    assert sum(len(chunk) for chunk in manager.chunks) > 0
+    engine.playback_manager.play_audio.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_in_flight_tool_suspends_watchdog_until_direct_response_finishes():
+    announcements = []
+
+    async def announce(_call_id, _text, kind):
+        announcements.append(kind)
+        return True
+
+    watchdog = NoInputWatchdog(announce, AsyncMock())
+    policy = NoInputPolicy(
+        initial_timeout_sec=0.04,
+        grace_timeout_sec=0.03,
+        max_check_ins=1,
+    )
+    await watchdog.register("deposit-call", policy, is_outbound=False)
+    try:
+        await watchdog.mark_ready("deposit-call")
+        await watchdog.set_suspended("deposit-call", True)
+
+        # This represents a deposit that takes longer than the entire idle
+        # window.  No check-in may overlap the tool or its direct response.
+        await asyncio.sleep(0.10)
+        assert announcements == []
+        assert watchdog.snapshot("deposit-call")["suspended"] is True
+
+        await watchdog.note_agent_output_start("deposit-call")
+        await asyncio.sleep(0.05)
+        assert announcements == []
+        await watchdog.note_agent_output_end("deposit-call")
+        await watchdog.set_suspended("deposit-call", False)
+
+        await asyncio.sleep(0.025)
+        assert announcements == []
+        await _wait_until(lambda: announcements == ["check_in"])
+    finally:
+        await watchdog.stop("deposit-call")

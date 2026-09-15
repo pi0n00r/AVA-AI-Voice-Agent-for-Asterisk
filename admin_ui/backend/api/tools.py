@@ -947,6 +947,9 @@ _PASSTHROUGH_FIELDS = (
     "summary_max_words",
     "description",
     "return_raw_json",
+    "direct_response_json_path",
+    "direct_failure_message",
+    "caller_wait_ambience",
     "error_message",
 )
 
@@ -1020,6 +1023,9 @@ class ManagedToolWrite(BaseModel):
     description: Optional[str] = None
     parameters: Optional[List[ManagedToolParameter]] = None
     return_raw_json: Optional[bool] = None
+    direct_response_json_path: Optional[str] = None
+    direct_failure_message: Optional[str] = None
+    caller_wait_ambience: Optional[bool] = None
     error_message: Optional[str] = None
 
     @field_validator("url")
@@ -1059,6 +1065,9 @@ class ManagedToolPatch(BaseModel):
     description: Optional[str] = None
     parameters: Optional[List[ManagedToolParameter]] = None
     return_raw_json: Optional[bool] = None
+    direct_response_json_path: Optional[str] = None
+    direct_failure_message: Optional[str] = None
+    caller_wait_ambience: Optional[bool] = None
     error_message: Optional[str] = None
 
     @field_validator("url")

@@ -55,6 +55,16 @@ def _as_str(value: Any) -> str:
     return "" if value is None else str(value)
 
 
+def outbound_flag_enabled(value: Any, *, default: bool) -> bool:
+    """Parse a persisted outbound feature flag without treating explicit 0 as missing."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        return default
+
+
 def _normalize_agent_routing_method(value: Any, default: str = "ai_agent") -> str:
     method = _as_str(value).strip().lower()
     if method in {"ai_agent", "ai_context"}:

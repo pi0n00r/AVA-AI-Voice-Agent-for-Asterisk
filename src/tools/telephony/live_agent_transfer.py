@@ -31,9 +31,10 @@ class LiveAgentTransferTool(Tool):
                 "Transfer the caller to a live (human) agent. "
                 "By default routes to Tools -> Live Agents. Optionally, an advanced/legacy "
                 "override can route live-agent requests via a transfer destination. "
-                "An optional target can specify the desired live agent extension, name, or alias. "
-                "Use only configured live-agent targets exposed in the runtime prompt/context; "
-                "never invent extension numbers."
+                "An optional target can specify a configured name or alias, or an exact numeric "
+                "FreePBX dialplan target supplied by the caller. Directory discovery resolves "
+                "friendly names; FreePBX remains authoritative for numeric routing. Never invent "
+                "extension numbers."
             ),
             category=ToolCategory.TELEPHONY,
             requires_channel=True,
@@ -43,8 +44,8 @@ class LiveAgentTransferTool(Tool):
                     name="target",
                     type="string",
                     description=(
-                        "Optional target live agent extension number, configured name, or alias "
-                        "(for example '6000', 'Live Agent 2', or 'support')."
+                        "Optional configured name/alias or exact caller-supplied numeric FreePBX "
+                        "dialplan target (for example '6000', 'Live Agent 2', or 'support')."
                     ),
                     required=False,
                 ),
@@ -194,27 +195,31 @@ class LiveAgentTransferTool(Tool):
         target: str,
         extensions_cfg: Dict[str, Any],
     ) -> Tuple[Optional[str], Dict[str, Any], str]:
-        if not isinstance(extensions_cfg, dict) or not extensions_cfg:
-            return None, {}, "extensions.internal.empty"
-
         normalized_target = cls._normalize_text(target)
         if not normalized_target:
             return None, {}, "parameter.target.empty"
+
+        direct_numeric = str(target or "").strip()
+        if direct_numeric.isdigit():
+            if isinstance(extensions_cfg, dict):
+                for key, cfg in extensions_cfg.items():
+                    if str(key or "").strip() != direct_numeric or not isinstance(cfg, dict):
+                        continue
+                    if cfg.get("transfer") is False:
+                        return None, {}, "extensions.internal.target_transfer_disabled"
+                    return direct_numeric, dict(cfg), "parameter.target.extension"
+            # The directory is a friendly-name resolver, not an authorization
+            # list. FreePBX validates and executes numeric targets in its dialplan.
+            return direct_numeric, {}, "parameter.target.freepbx_numeric"
+
+        if not isinstance(extensions_cfg, dict) or not extensions_cfg:
+            return None, {}, "extensions.internal.empty"
 
         def _extension_key(key: Any) -> Optional[str]:
             ext = str(key or "").strip()
             if ext and ext.isdigit():
                 return ext
             return None
-
-        direct_numeric = str(target or "").strip()
-        if direct_numeric.isdigit():
-            for key, cfg in extensions_cfg.items():
-                if str(key or "").strip() != direct_numeric or not isinstance(cfg, dict):
-                    continue
-                if cfg.get("transfer") is False:
-                    return None, {}, "extensions.internal.target_transfer_disabled"
-                return direct_numeric, dict(cfg), "parameter.target.extension"
 
         name_matches: List[Tuple[str, Dict[str, Any]]] = []
         alias_matches: List[Tuple[str, Dict[str, Any]]] = []

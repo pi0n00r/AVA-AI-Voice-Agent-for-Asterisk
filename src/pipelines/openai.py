@@ -10,7 +10,9 @@ endpoint. The adapters mirror the contract defined in `base.py` so that
 from __future__ import annotations
 
 import asyncio
+import ast
 import base64
+import hashlib
 import json
 import time
 import uuid
@@ -56,6 +58,109 @@ def _merge_dicts(base: Dict[str, Any], override: Optional[Dict[str, Any]]) -> Di
     return merged
 
 
+def _tool_schema_matches(
+    rendered_name: str,
+    parameters: Dict[str, Any],
+    tool_schemas: list[Dict[str, Any]],
+) -> list[str]:
+    """Return enabled tools whose names and parameter keys match exactly."""
+    matches: list[str] = []
+    for schema in tool_schemas:
+        function = schema.get("function") if isinstance(schema, dict) else None
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "").strip()
+        parameter_schema = function.get("parameters")
+        if not name or not isinstance(parameter_schema, dict):
+            continue
+        properties = parameter_schema.get("properties")
+        properties = properties if isinstance(properties, dict) else {}
+        required = {
+            str(item)
+            for item in (parameter_schema.get("required") or [])
+            if str(item)
+        }
+        supplied = set(parameters)
+        if not required.issubset(supplied) or not supplied.issubset(set(properties)):
+            continue
+        if rendered_name == name or rendered_name.lower() == "call":
+            matches.append(name)
+    return matches
+
+
+def _parse_compatibility_tool_text(
+    text: str,
+    tool_schemas: list[Dict[str, Any]],
+) -> list[Dict[str, Any]]:
+    """Normalize one complete literal call to one enabled tool."""
+    candidate = str(text or "").strip()
+    if not candidate or not tool_schemas:
+        return []
+
+    rendered_name = ""
+    parameters: Any = None
+    try:
+        expression = ast.parse(candidate, mode="eval").body
+    except (SyntaxError, ValueError):
+        expression = None
+    if isinstance(expression, ast.Call) and isinstance(expression.func, ast.Name):
+        if expression.args or any(keyword.arg is None for keyword in expression.keywords):
+            return []
+        try:
+            parameters = {
+                str(keyword.arg): ast.literal_eval(keyword.value)
+                for keyword in expression.keywords
+            }
+        except (ValueError, TypeError, SyntaxError):
+            return []
+        rendered_name = expression.func.id
+    else:
+        brace = candidate.find("{")
+        if brace <= 0 or not candidate.endswith("}"):
+            return []
+        rendered_name = candidate[:brace]
+        if not rendered_name.isidentifier():
+            return []
+        try:
+            parameters = json.loads(candidate[brace:])
+        except (json.JSONDecodeError, TypeError):
+            return []
+        if not isinstance(parameters, dict):
+            return []
+
+    matches = _tool_schema_matches(rendered_name, parameters, tool_schemas)
+    if len(matches) != 1:
+        return []
+    return [{
+        "id": "",
+        "name": matches[0],
+        "parameters": parameters,
+        "type": "function",
+    }]
+
+
+def _could_be_compatibility_tool_prefix(
+    text: str,
+    tool_schemas: list[Dict[str, Any]],
+) -> bool:
+    """Keep buffering only while text can become one enabled literal call."""
+    candidate = str(text or "").lstrip()
+    if not candidate:
+        return True
+    prefixes = ["call("]
+    for schema in tool_schemas:
+        function = schema.get("function") if isinstance(schema, dict) else None
+        name = str(function.get("name") or "") if isinstance(function, dict) else ""
+        if name:
+            prefixes.extend((f"{name}(", f"{name}{{"))
+    candidate_lower = candidate.lower()
+    return any(
+        prefix.lower().startswith(candidate_lower)
+        or candidate_lower.startswith(prefix.lower())
+        for prefix in prefixes
+    )
+
+
 def _bytes_per_sample(encoding: str) -> int:
     fmt = (encoding or "").lower()
     if fmt in ("ulaw", "mulaw", "mu-law", "g711_ulaw"):
@@ -96,6 +201,29 @@ def _make_http_headers(options: Dict[str, Any]) -> Dict[str, str]:
         headers["OpenAI-Organization"] = options["organization"]
     if options.get("project"):
         headers["OpenAI-Project"] = options["project"]
+    return headers
+
+
+def _session_user_for_call(call_id: str) -> str:
+    """Return a stable, non-identifying OpenAI user value for one call."""
+    digest = hashlib.sha256(str(call_id).encode("utf-8")).hexdigest()[:32]
+    return f"asterisk-call-{digest}"
+
+def _make_call_http_headers(options: Dict[str, Any], call_id: str) -> Dict[str, str]:
+    headers = _make_http_headers(options)
+    if options.get("call_id_header_enabled") is not True:
+        return headers
+    if options.get("session_user_from_call_id") is not True:
+        raise RuntimeError("raw call header requires call-scoped user identity")
+    if not options.get("api_key"):
+        raise RuntimeError("raw call header requires authenticated HTTP transport")
+    if (
+        not isinstance(call_id, str)
+        or not 8 <= len(call_id) <= 128
+        or any(not (c.isascii() and (c.isalnum() or c in "_.:-")) for c in call_id)
+    ):
+        raise RuntimeError("invalid transport call identity")
+    headers["X-Ava-Call-Id"] = call_id
     return headers
 
 
@@ -382,6 +510,14 @@ def _pcm16le_to_wav(audio_pcm16: bytes, sample_rate_hz: int) -> bytes:
 # Milestone7: OpenAI Chat/Reatime LLM Adapter ------------------------------------
 
 
+_CHAT_PAYLOAD_RESERVED_EXTRA_KEYS = frozenset(
+    {
+        "function_call", "functions", "max_tokens", "messages", "model", "n",
+        "parallel_tool_calls", "stream", "temperature", "tool_choice", "tools",
+    }
+)
+
+
 class OpenAILLMAdapter(LLMComponent):
     """# Milestone7: OpenAI LLM adapter supporting Chat Completions and Realtime."""
 
@@ -403,6 +539,7 @@ class OpenAILLMAdapter(LLMComponent):
         self._pipeline_defaults = options or {}
         self._session_factory = session_factory
         self._session: Optional[aiohttp.ClientSession] = None
+        self._session_force_close: Optional[bool] = None
         self._default_timeout = float(self._pipeline_defaults.get("response_timeout_sec", provider_config.response_timeout_sec))
         self._pending_tool_calls_by_call: dict = {}
 
@@ -417,6 +554,7 @@ class OpenAILLMAdapter(LLMComponent):
         if self._session and not self._session.closed:
             await self._session.close()
         self._session = None
+        self._session_force_close = None
 
     async def validate_connectivity(self, options: Dict[str, Any]) -> Dict[str, Any]:
         """Override to merge provider defaults with options for validation."""
@@ -455,9 +593,11 @@ class OpenAILLMAdapter(LLMComponent):
         if use_realtime:
             return await self._generate_realtime(call_id, transcript, context, merged)
 
-        await self._ensure_session()
+        await self._ensure_session(bool(merged.get("http_force_close", False)))
         assert self._session
         payload = self._build_chat_payload(transcript, context, merged)
+        if merged.get("session_user_from_call_id") is True:
+            payload["user"] = _session_user_for_call(call_id)
         
         # Tool support: tool allowlists are resolved per-context by the engine and passed in via `merged["tools"]`.
         # Do not gate tools by provider-level flags; contexts are the source of truth for tool availability.
@@ -483,7 +623,9 @@ class OpenAILLMAdapter(LLMComponent):
             payload["tools"] = tool_schemas
             payload["tool_choice"] = "auto"
 
-        headers = _make_http_headers(merged)
+        headers = _make_call_http_headers(merged, call_id)
+        if merged.get("http_force_close"):
+            headers["Connection"] = "close"
         url = merged["chat_base_url"].rstrip("/") + "/chat/completions"
 
         _msgs = payload.get("messages", [])
@@ -573,6 +715,21 @@ class OpenAILLMAdapter(LLMComponent):
                             text=content or "",
                             tool_calls=parsed_tool_calls,
                             metadata=data.get("usage", {})
+                        )
+
+                    compatibility_calls = _parse_compatibility_tool_text(
+                        content or "", tool_schemas
+                    )
+                    if compatibility_calls:
+                        logger.info(
+                            "OpenAI-compatible textual tool call normalized",
+                            call_id=call_id,
+                            tools=[call["name"] for call in compatibility_calls],
+                        )
+                        return LLMResponse(
+                            text="",
+                            tool_calls=compatibility_calls,
+                            metadata=data.get("usage", {}),
                         )
                     
                     logger.info("OpenAI chat completion received", **log_ctx)
@@ -676,9 +833,11 @@ class OpenAILLMAdapter(LLMComponent):
                 yield text
             return
 
-        await self._ensure_session()
+        await self._ensure_session(bool(merged.get("http_force_close", False)))
         assert self._session
         payload = self._build_chat_payload(transcript, context, merged)
+        if merged.get("session_user_from_call_id") is True:
+            payload["user"] = _session_user_for_call(call_id)
         payload["stream"] = True
 
         # Include tools in streaming request so the LLM can return tool calls
@@ -694,11 +853,15 @@ class OpenAILLMAdapter(LLMComponent):
             payload["tools"] = tool_schemas
             payload["tool_choice"] = "auto"
 
-        headers = _make_http_headers(merged)
+        headers = _make_call_http_headers(merged, call_id)
+        if merged.get("http_force_close"):
+            headers["Connection"] = "close"
         url = merged["chat_base_url"].rstrip("/") + "/chat/completions"
 
         # Accumulate tool call deltas across chunks
         _tool_call_accum: dict = {}  # index -> {id, name, arguments}
+        _buffered_content: list[str] = []
+        _buffering_compatibility = bool(tool_schemas)
 
         try:
             async with self._session.post(url, json=payload, headers=headers, timeout=merged["timeout_sec"]) as response:
@@ -721,7 +884,17 @@ class OpenAILLMAdapter(LLMComponent):
                             delta = choices[0].get("delta", {})
                             content = delta.get("content")
                             if content:
-                                yield content
+                                if _buffering_compatibility:
+                                    _buffered_content.append(content)
+                                    if not _could_be_compatibility_tool_prefix(
+                                        "".join(_buffered_content), tool_schemas
+                                    ):
+                                        for buffered in _buffered_content:
+                                            yield buffered
+                                        _buffered_content.clear()
+                                        _buffering_compatibility = False
+                                else:
+                                    yield content
 
                             # Accumulate tool call deltas
                             for tc_delta in delta.get("tool_calls", []):
@@ -765,6 +938,26 @@ class OpenAILLMAdapter(LLMComponent):
                     tools=[tc["name"] for tc in self._pending_tool_calls_by_call[call_id]],
                 )
 
+            if (
+                _buffering_compatibility
+                and tool_schemas
+                and not self._pending_tool_calls_by_call[call_id]
+            ):
+                buffered_text = "".join(_buffered_content)
+                compatibility_calls = _parse_compatibility_tool_text(
+                    buffered_text, tool_schemas
+                )
+                if compatibility_calls:
+                    self._pending_tool_calls_by_call[call_id] = compatibility_calls
+                    logger.info(
+                        "OpenAI-compatible streaming textual tool call normalized",
+                        call_id=call_id,
+                        tools=[call["name"] for call in compatibility_calls],
+                    )
+                else:
+                    for content in _buffered_content:
+                        yield content
+
         except asyncio.TimeoutError as e:
             logger.warning(
                 "OpenAI streaming timed out; falling back to serial path",
@@ -775,11 +968,32 @@ class OpenAILLMAdapter(LLMComponent):
         except aiohttp.ClientError as e:
             logger.error("OpenAI streaming connection error", call_id=call_id, error=str(e))
 
-    async def _ensure_session(self) -> None:
-        if self._session and not self._session.closed:
+    async def _ensure_session(self, force_close: bool = False) -> None:
+        requested_mode = bool(force_close)
+        if (
+            self._session
+            and not self._session.closed
+            and self._session_force_close == requested_mode
+        ):
             return
-        factory = self._session_factory or aiohttp.ClientSession
-        self._session = factory()
+        if self._session and not self._session.closed:
+            await self._session.close()
+        if self._session_factory is not None:
+            if requested_mode:
+                connector = aiohttp.TCPConnector(force_close=True)
+                try:
+                    self._session = self._session_factory(connector=connector)
+                except TypeError:
+                    await connector.close()
+                    raise RuntimeError(
+                        "A force-close LLM session factory must accept connector="
+                    )
+            else:
+                self._session = self._session_factory()
+        else:
+            connector = aiohttp.TCPConnector(force_close=True) if requested_mode else None
+            self._session = aiohttp.ClientSession(connector=connector)
+        self._session_force_close = requested_mode
 
     def _compose_options(self, runtime_options: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         runtime_options = runtime_options or {}
@@ -818,17 +1032,38 @@ class OpenAILLMAdapter(LLMComponent):
                 self._pipeline_defaults.get("modalities", self._provider_defaults.default_modalities or ["text"]),
             ),
             "system_prompt": runtime_options.get("system_prompt", self._pipeline_defaults.get("system_prompt")),
+            "user_first_history": runtime_options.get(
+                "user_first_history", self._pipeline_defaults.get("user_first_history", False)
+            ) is True,
             "instructions": runtime_options.get("instructions", self._pipeline_defaults.get("instructions")),
             "temperature": runtime_options.get("temperature", self._pipeline_defaults.get("temperature", 0.7)),
             "max_tokens": runtime_options.get("max_tokens", self._pipeline_defaults.get("max_tokens")),
             "timeout_sec": float(runtime_options.get("timeout_sec", self._pipeline_defaults.get("timeout_sec", self._default_timeout))),
             "use_realtime": runtime_options.get("use_realtime", self._pipeline_defaults.get("use_realtime", False)),
             "tools": runtime_options.get("tools", self._pipeline_defaults.get("tools", [])),
+            "extra_body": runtime_options.get(
+                "extra_body", self._pipeline_defaults.get("extra_body")
+            ),
+            "http_force_close": runtime_options.get(
+                "http_force_close",
+                self._pipeline_defaults.get("http_force_close", False),
+            ),
+            "session_user_from_call_id": runtime_options.get(
+                "session_user_from_call_id",
+                self._pipeline_defaults.get("session_user_from_call_id", False),
+            ) is True,
+            "call_id_header_enabled": runtime_options.get(
+                "call_id_header_enabled",
+                self._pipeline_defaults.get("call_id_header_enabled", False),
+            ) is True,
             "api_version": runtime_options.get(
                 "api_version",
                 self._pipeline_defaults.get("api_version", getattr(self._provider_defaults, "api_version", "ga")),
             ),
         }
+
+        if merged["call_id_header_enabled"] and merged["use_realtime"]:
+            raise RuntimeError("raw call header requires HTTP chat completions")
 
         # If a pipeline swap left provider-specific LLM settings behind (e.g., Groq base_url + llama model),
         # ignore them and fall back to OpenAI defaults. This keeps modular providers interchangeable in pipelines.
@@ -877,23 +1112,38 @@ class OpenAILLMAdapter(LLMComponent):
             payload["temperature"] = merged["temperature"]
         if merged.get("max_tokens") is not None:
             payload["max_tokens"] = merged["max_tokens"]
+        extra_body = merged.get("extra_body")
+        if isinstance(extra_body, dict):
+            payload.update(
+                (key, value)
+                for key, value in extra_body.items()
+                if key not in _CHAT_PAYLOAD_RESERVED_EXTRA_KEYS
+            )
         return payload
 
     def _coalesce_messages(self, transcript: str, context: Dict[str, Any], merged: Dict[str, Any]) -> list[Dict[str, str]]:
         messages = context.get("messages")
         if messages:
-            return messages
+            conversation = messages
+        else:
+            conversation = []
+            system_prompt = merged.get("system_prompt") or context.get("system_prompt")
+            if system_prompt:
+                conversation.append({"role": "system", "content": system_prompt})
+            prior = context.get("prior_messages") or []
+            conversation.extend(prior)
+            if transcript:
+                conversation.append({"role": "user", "content": transcript})
 
-        conversation = []
-        system_prompt = merged.get("system_prompt") or context.get("system_prompt")
-        if system_prompt:
-            conversation.append({"role": "system", "content": system_prompt})
-
-        prior = context.get("prior_messages") or []
-        conversation.extend(prior)
-
-        if transcript:
-            conversation.append({"role": "user", "content": transcript})
+        if merged.get("user_first_history") is True:
+            # Strict templates require a user slot before our spoken greeting.
+            # Keep every spoken word and tool record; the empty slot is wire-only.
+            first = next((i for i, msg in enumerate(conversation)
+                          if msg.get("role") != "system"), None)
+            if first is not None and conversation[first].get("role") == "assistant":
+                conversation = (conversation[:first]
+                                + [{"role": "user", "content": ""}]
+                                + conversation[first:])
         return conversation
 
 
