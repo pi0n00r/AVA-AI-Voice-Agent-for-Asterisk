@@ -234,3 +234,31 @@ class TestConfigIntegrity:
         
         assert hasattr(config, 'contexts')
         assert isinstance(config.contexts, dict)
+
+
+@pytest.mark.parametrize("model_name", [
+    "LocalProviderConfig", "DeepgramProviderConfig", "OpenAIProviderConfig",
+    "GoogleProviderConfig", "ElevenLabsProviderConfig", "CambAiProviderConfig",
+    "FishAudioProviderConfig",
+])
+def test_legacy_provider_farewell_delay_is_preserved_and_deprecated(model_name):
+    import src.config as config_module
+
+    model = getattr(config_module, model_name)
+    config = model(farewell_hangup_delay_sec=4)
+    assert config.model_dump()["farewell_hangup_delay_sec"] == 4
+    field_schema = model.model_json_schema()["properties"]["farewell_hangup_delay_sec"]
+    assert field_schema["deprecated"] is True
+    assert "ignored" in field_schema["description"]
+
+
+def test_legacy_global_farewell_delay_survives_validation_and_serialization():
+    config = AppConfig(
+        asterisk={"host": "127.0.0.1", "username": "u", "password": "p"},
+        llm={},
+        default_provider="local",
+        providers={"local": {}},
+        farewell_hangup_delay_sec=4,
+    )
+    assert config.model_dump()["farewell_hangup_delay_sec"] == 4
+    assert AppConfig.model_json_schema()["properties"]["farewell_hangup_delay_sec"]["deprecated"] is True

@@ -14,7 +14,7 @@ AI-NOTICE:Scope=Fleet-authored fork notice; retained upstream documentation rema
   <img alt="Asterisk AI Voice Agent" src="assets/banner_light_mode.png?v=9" width="100%">
 </picture>
 
-![Version](https://img.shields.io/badge/version-7.5.4-blue.svg)
+![Version](https://img.shields.io/badge/version-7.6.2-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT%20upstream%20%7C%20AGPL--3.0%2B%20fleet-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.11+-blue.svg)
 ![Docker](https://img.shields.io/badge/docker-compose-blue.svg)
@@ -25,6 +25,8 @@ AI-NOTICE:Scope=Fleet-authored fork notice; retained upstream documentation rema
 <a href="https://www.producthunt.com/products/ava-ai-voice-agent-for-asterisk?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-ava-ai-voice-agent-for-asterisk" target="_blank" rel="noopener noreferrer"><img alt="AVA - AI Voice Agent for Asterisk - Open-source AI voice agent for any phone system | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1120145&amp;theme=light&amp;t=1775845744279"></a>
 
 The most powerful, flexible open-source AI voice agent for Asterisk/FreePBX. Featuring a **modular pipeline architecture** that lets you mix and match STT, LLM, and TTS providers, plus **6 production-ready golden baselines** validated for enterprise deployment.
+
+> **Managing multiple PBXs or customer installations?** [Explore AVA Operator](https://operator.agent6789.com/?utm_source=github&utm_medium=readme&utm_campaign=ava_operator_preview&utm_content=core_readme) — the commercial multi-installation management layer built around AVA Core, currently available as an early-access preview. AVA Core remains MIT-licensed, free, and fully functional on its own.
 
 [Quick Start](#-quick-start) • [Features](#-features) • [Roadmap](docs/ROADMAP.md) • [Demo](#-demo) • [Docs](docs/README.md) • [Community](#-community)
 
@@ -66,6 +68,7 @@ AGPL-3.0-or-later as declared there.
 - [📊 Requirements](#-requirements)
 - [🗺️ Documentation](#-documentation)
 - [🤝 Contributing](#-contributing)
+- [AVA Operator](#ava-operator)
 - [💬 Community](#-community)
 - [📝 License](#-license)
 
@@ -78,6 +81,7 @@ Get the **Admin UI running in 2 minutes**.
 For a complete **first successful call** walkthrough (dialplan + transport selection + verification), see:
 - **[Installation Guide](docs/INSTALLATION.md)**
 - **[Transport Compatibility](docs/Transport-Mode-Compatibility.md)**
+- **[WebSocket Transport Setup](docs/WebSocket-Transport.md)** — opt-in authenticated transport; qualify the intended provider, codec, and topology
 
 ### 1. Run Pre-flight Check (Required)
 
@@ -195,6 +199,188 @@ docker compose -p asterisk-ai-voice-agent logs -f ai_engine
 ## 🎉 What's New
 
 <details open>
+<summary><b>v7.6.2 — Gemini 3.8 Live, Microsoft bookings, and clearer call analytics</b></summary>
+
+v7.6.2 is an in-place feature and reliability release. It does not migrate
+databases, reassign Agents, or change the selected provider, transport, Audio
+Profile, or shipped Google Live model defaults.
+
+- **Gemini 3.8 Live is opt-in on Developer API and Vertex AI** — model-aware
+  regions, Audio Only output, ID-matched tool responses, and full-duplex
+  interruption handling. An unanswered attended transfer returns the caller to
+  AI. Attached Vertex 3.8/2.5 calls validate the changed paths; broader production
+  and Developer API qualification remains outstanding
+  ([#674](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/674)).
+- **Microsoft Calendar supports caller-confirmed invitations and same-call
+  booking changes** — check an exact requested interval, reconcile creation
+  retries, and reschedule or cancel the tracked booking with consent. Invitations
+  and hours/horizon enforcement remain opt-in; saved OAuth caches, calendar IDs,
+  and Agent prompts are preserved. Later-call changes require staff; creation
+  does not prove invitation delivery or acceptance
+  ([#686](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/686)).
+- **Call History filters now agree with statistics and exports** — multi-outcome
+  **Only / Hide**, tool usage, duration, transcript, and metadata filters apply
+  consistently, with stale responses ignored
+  ([#683](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/683),
+  contributed by [@Rea-PC08](https://github.com/Rea-PC08)).
+- **Admin UI is easier to read and navigate** — aligned numeric displays,
+  accessible icon controls, and shared empty states
+  ([#681](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/681),
+  [#682](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/682),
+  [#684](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/684),
+  contributed by [@arnavp27](https://github.com/arnavp27)).
+- **The ignored farewell delay is deprecated** — existing YAML/API values remain
+  compatible, but misleading controls are removed. Terminal hangup still drains
+  caller-facing audio rather than sleeping for a fixed delay
+  ([#678](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/678)).
+
+See the [v7.6.2 changelog](CHANGELOG.md#762---2026-10-02),
+[migration notes](docs/MIGRATION.md#v761-to-v762), and
+[validation matrix](docs/baselines/golden/v7.6.2-validation-matrix.md).
+
+</details>
+
+<details>
+<summary><b>v7.6.1 — Fish Audio streaming and safer transfer/calendar operations</b></summary>
+
+v7.6.1 is an in-place feature, reliability, and security release. It does not
+migrate databases, reassign Agents, or change the selected provider, transport,
+or Audio Profile.
+
+- **Fish Audio joins the modular TTS catalog** — configure provider-scoped
+  credentials and stream PCM through either the supported HTTP path or the new
+  realtime WebSocket path. WebSocket mode can consume LLM text deltas directly
+  for lower first-audio latency
+  ([#653](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/653),
+  [#654](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/654),
+  contributed by [@Rea-PC08](https://github.com/Rea-PC08)).
+- **Calendar tools preserve useful structured results** — safe event,
+  event-detail, availability, and truncation metadata now reaches every voice
+  provider instead of being discarded by the shared sanitizer
+  ([#663](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/663)).
+- **Google credential status matches effective authentication** — unresolved
+  environment references no longer appear configured, legacy Vertex credential
+  files are recognized, and new uploads keep the saved provider path aligned
+  ([#664](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/664)).
+- **Attended transfers fail safer** — FreePBX pickup channels inherit transfer
+  ownership before the original ringing leg disappears, while a deferred
+  transfer that cannot drain its caller-facing audio is cancelled and returned
+  to the active AI voice
+  ([#665](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/665),
+  [#666](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/666)).
+- **msgpack is updated to 1.2.1** — resolving the high-severity
+  `Unpacker` denial-of-service and out-of-bounds read advisory
+  ([#670](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/670)).
+
+See the [v7.6.1 changelog](CHANGELOG.md#761---2026-09-20),
+[migration notes](docs/MIGRATION.md#v760-to-v761), and
+[validation matrix](docs/baselines/golden/v7.6.1-validation-matrix.md).
+
+</details>
+
+<details>
+<summary><b>v7.6.0 — Asterisk Media WebSocket, call metadata, and safer troubleshooting</b></summary>
+
+v7.6.0 adds a third, opt-in media transport and expands call diagnostics while
+keeping existing AudioSocket, ExternalMedia RTP, Agent, and provider selections
+unchanged by default.
+
+- **Asterisk Media WebSocket is available as an opt-in transport** — supported
+  Asterisk releases can open an authenticated, per-call media WebSocket to AVA,
+  with Admin UI setup, CLI/preflight validation, codec conversion, lifecycle
+  cleanup, and explicit qualification boundaries. Only OpenAI Realtime with
+  `ulaw` on Asterisk 22.10.1/FreePBX 17 has a live qualified smoke; other
+  combinations remain unqualified until tested
+  ([#644](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/644)).
+- **Selected pre-call data can become bounded call metadata** — HTTP lookup
+  fields are opt-in, scalar, and non-authoritative. An Agent may correct only
+  explicitly allowed fields during the active call, without changing caller
+  identity, routing, consent/DNC, transfers, disposition, or external systems
+  ([#632](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/632)).
+- **Call troubleshooting now produces privacy-safe support packages** — Call
+  History captures the effective provider, pipeline, Audio Profile, transport,
+  codec, VAD, streaming, and tool settings for new calls, then combines that
+  snapshot with correlated sanitized logs and tool lifecycle evidence. General
+  diagnostics exports are bounded and the legacy export endpoint now uses the
+  same safe path
+  ([#657](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/657)).
+- **Admin UI reliability and configuration handling are hardened** — slow
+  Docker log reads no longer block the API event loop, overlapping Logs polls
+  are prevented, and non-finite YAML/JavaScript numbers are rejected with exact
+  paths before persistence
+  ([#656](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/656)).
+
+See the [v7.6.0 changelog](CHANGELOG.md#760---2026-09-13),
+[migration notes](docs/MIGRATION.md#v756-to-v760), and
+[validation matrix](docs/baselines/golden/v7.6.0-validation-matrix.md).
+
+</details>
+
+<details>
+<summary><b>v7.5.6 — Safer outbound context, Agent hangup policies, and configured summary LLMs</b></summary>
+
+v7.5.6 is an in-place feature and reliability release. It does not migrate
+databases, reassign Agents, or change Audio Profiles.
+
+- **Outbound lead context is delivered or the call fails closed** — ARI
+  origination now uses its documented `variables` object, restoring routing,
+  identity, AudioSocket, AMD/consent, and campaign metadata. Nonempty lead
+  `custom_vars` is bounded, confirmed before provider startup, recovered after
+  an engine restart, and redacted from diagnostics
+  ([#613](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/613)).
+- **Hangup intent markers can be scoped per Agent** — each Agent can inherit,
+  extend, or replace the global end-of-call phrases. New calls capture an
+  immutable policy, and Full Local negotiates call-scoped support so older
+  servers and malformed overrides fail closed
+  ([#619](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/619)).
+- **Post-call summaries can use configured modular LLMs** — each webhook can
+  select an enabled LLM provider and configure its model readiness, timeout,
+  word limit, and prompt. Explicit selections never fall back to another
+  provider; summary failures leave `{summary}` empty while webhook delivery
+  continues. Existing webhooks retain the legacy OpenAI behavior until
+  configured ([#618](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/618)).
+- **Summary prompts stay isolated from the live Agent persona** — provider
+  adapters receive the webhook's summary instructions as authoritative job
+  context, and the default Groq LLM moves to `openai/gpt-oss-120b`.
+
+See the [v7.5.6 changelog](CHANGELOG.md#756---2026-08-26),
+[migration notes](docs/MIGRATION.md#v755-to-v756), and
+[validation matrix](docs/baselines/golden/v7.5.6-validation-matrix.md).
+
+</details>
+
+<details>
+<summary><b>v7.5.5 — Sidebar collapse, post-call webhook variables, and configurable extension availability</b></summary>
+
+v7.5.5 is an in-place feature release. It does not migrate databases, reassign
+Agents, or change Audio Profiles.
+
+- **Collapsible Admin UI sidebar** — the left navigation can collapse to an
+  icon-only rail, with hover tooltips and a persisted preference, reclaiming
+  space on smaller displays ([#596](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/596)).
+- **Pre-call variables now flow into post-call webhooks** — each pre-call
+  output variable is exposed as its own placeholder in webhook payload
+  templates, matching prompt and in-call tool behavior
+  ([#608](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/608)).
+- **Configurable extension availability mapping** — `check_extension_status`
+  now classifies multiple ARI device states per extension (including
+  operator-configured custom states for DND/away) via a configurable
+  free/busy/unavailable mapping, with a fail-closed default and new Admin UI
+  editors for per-extension and global state mapping
+  ([#577](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/577)).
+- **`check_extension_status` reliability fixes** — availability fields
+  survive JSON sanitization across all tool adapters, live-transfer channel
+  activity is cross-checked against stale device state, and an unmapped
+  `device_state_id` can no longer bypass `restrict_to_configured_extensions`
+  ([#577](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/577)).
+
+See the [v7.5.5 changelog](CHANGELOG.md#755---2026-08-08),
+[migration notes](docs/MIGRATION.md#v754-to-v755), and
+[validation matrix](docs/baselines/golden/v7.5.5-validation-matrix.md).
+
+</details>
+
+<details>
 <summary><b>v7.5.4 — Privacy-safe diagnostics and provider/update hardening</b></summary>
 
 v7.5.4 is an in-place reliability and privacy release. It does not migrate
@@ -397,7 +583,7 @@ voicemail mailboxes it should be allowed to use.**
   working.
 
 Before upgrading—especially from v7.3.0–v7.3.3—read the
-[current upgrade procedure](docs/INSTALLATION.md#upgrade-to-v754-existing-checkout)
+[current upgrade procedure](docs/INSTALLATION.md#upgrade-to-v762-existing-checkout)
 and [Contexts → Agents migration guide](docs/OPERATOR_MIGRATION.md).
 
 </details>
@@ -812,7 +998,7 @@ pipelines:
 - **Tool Calling System**: AI-powered actions (transfers, emails) work with any provider.
 - **Agent CLI Tools**: `setup`, `check`, `rca`, `update`, `version` commands (legacy aliases: `init`, `doctor`, `troubleshoot`).
 - **Modular Pipeline System**: Independent STT, LLM, and TTS provider selection.
-- **Dual Transport Support**: AudioSocket (default in `config/ai-agent.yaml`) and ExternalMedia RTP (both supported — see the transport matrix).
+- **Multiple Transports**: AudioSocket (default in `config/ai-agent.yaml`), ExternalMedia RTP, and opt-in, version-gated [Asterisk Media WebSocket](docs/WebSocket-Transport.md) (see the transport matrix).
 - **Per-Agent Audio Profiles**: Stable and enhanced 8 kHz telephony profiles, plus opt-in 16 kHz AudioSocket with provider-native PCM conversion on supported Asterisk versions and G.722/wideband endpoint or trunk legs. ExternalMedia RTP remains on the supported 8 kHz profiles; G.711/PSTN Agents remain on an 8 kHz profile.
 - **Streaming-First Downstream**: Streaming playback when possible, with automatic fallback to file playback for robustness.
 - **High-Performance Architecture**: Separate `ai_engine` and `local_ai_server` containers.
@@ -1139,15 +1325,31 @@ Then load **[AVA.mdc](AVA.mdc)** into your AI coding assistant (Claude, Cursor, 
 <td align="center"><a href="https://github.com/gcsuri"><img src="https://github.com/gcsuri.png" width="60" alt="gcsuri"><br><sub><b>gcsuri</b></sub></a><br>Code — Google Calendar</td>
 <td align="center"><a href="https://github.com/octo-patch"><img src="https://github.com/octo-patch.png" width="60" alt="octo-patch"><br><sub><b>octo-patch</b></sub></a><br>MiniMax LLM Provider</td>
 <td align="center"><a href="https://github.com/neilruaro-camb"><img src="https://github.com/neilruaro-camb.png" width="60" alt="neilruaro-camb"><br><sub><b>neilruaro-camb</b></sub></a><br>CAMB AI TTS Provider</td>
-<td align="center"><a href="https://github.com/aoi-dev-0411"><img src="https://github.com/aoi-dev-0411.png" width="60" alt="aoi-dev-0411"><br><sub><b>aoi-dev-0411</b></sub></a><br>Transcript Search, Health Badges</td>
+<td align="center"><a href="https://github.com/Ai-chan-0411"><img src="https://github.com/Ai-chan-0411.png" width="60" alt="Ai-chan-0411"><br><sub><b>Ai-chan-0411</b></sub></a><br>Transcript Search, Health Badges</td>
 </tr>
 <tr>
 <td align="center"><a href="https://github.com/exaland"><img src="https://github.com/exaland.png" width="60" alt="exaland"><br><sub><b>exaland</b></sub></a><br>Outbound .ULAW Compatibility</td>
 <td align="center"><a href="https://github.com/YosefAdPro"><img src="https://github.com/YosefAdPro.png" width="60" alt="YosefAdPro"><br><sub><b>YosefAdPro</b></sub></a><br>Agents API/OpenAPI</td>
+<td align="center"><a href="https://github.com/cswilsnetex"><img src="https://github.com/cswilsnetex.png" width="60" alt="cswilsnetex"><br><sub><b>Chris Wilson</b></sub></a><br>Google Live Key Handling, Admin UI Accessibility</td>
+<td align="center"><a href="https://github.com/Rea-PC08"><img src="https://github.com/Rea-PC08.png" width="60" alt="Rea-PC08"><br><sub><b>Rea-PC08</b></sub></a><br>Fish Audio TTS, Call History Filters</td>
+<td align="center"><a href="https://github.com/arnavp27"><img src="https://github.com/arnavp27.png" width="60" alt="arnavp27"><br><sub><b>Arnav Patil</b></sub></a><br>Admin UI Accessibility, Numeric Alignment, Empty States</td>
+</tr>
+<tr>
+<td align="center"><a href="https://github.com/alceops"><img src="https://github.com/alceops.png" width="60" alt="alceops"><br><sub><b>Alce</b></sub></a><br>OpenAI Streaming Timeouts</td>
+<td align="center"><a href="https://github.com/Genmin"><img src="https://github.com/Genmin.png" width="60" alt="Genmin"><br><sub><b>Joey Roth</b></sub></a><br>OpenAI Tool-call Tests</td>
+<td align="center"><a href="https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/commit/3053c616"><img src="https://img.shields.io/badge/contributor-Ivan%20Garcia-blue" alt="Ivan Garcia contributor badge"><br><sub><b>Ivan Garcia</b></sub></a><br>Azure STT/TTS, OpenAI GA Tools</td>
 </tr>
 </table>
 
 See [CONTRIBUTORS.md](CONTRIBUTORS.md) for the full list — contributions are recognized there, in release notes, and on Discord.
+
+---
+
+## AVA Operator
+
+AVA Operator helps MSPs and operators manage AI voice across multiple Asterisk and FreePBX installations from one console. It builds on AVA Core while remaining a separate commercial product.
+
+[Explore the early-access preview →](https://operator.agent6789.com/?utm_source=github&utm_medium=readme&utm_campaign=ava_operator_preview&utm_content=core_readme)
 
 ---
 
@@ -1198,4 +1400,10 @@ If you find this project useful, please also give it a ⭐️!
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=hkjarral/AVA-AI-Voice-Agent-for-Asterisk&type=date&legend=top-left)](https://www.star-history.com/#hkjarral/AVA-AI-Voice-Agent-for-Asterisk&type=date&legend=top-left)
+<a href="https://www.star-history.com/?repos=hkjarral%2FAVA-AI-Voice-Agent-for-Asterisk&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=hkjarral/AVA-AI-Voice-Agent-for-Asterisk&type=date&theme=dark&legend=top-left&sealed_token=OFUaTIQ_cHQIeI9JOUvCGWT1NhM4MLx-xr5TRZEdODgPVlh-fSiAKxhs6Oa328sldbZyjiYVOHXlxkkn02lMmVdoYXZdQRMWI72Dzjddo9VI67yQaZHOqg" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=hkjarral/AVA-AI-Voice-Agent-for-Asterisk&type=date&legend=top-left&sealed_token=OFUaTIQ_cHQIeI9JOUvCGWT1NhM4MLx-xr5TRZEdODgPVlh-fSiAKxhs6Oa328sldbZyjiYVOHXlxkkn02lMmVdoYXZdQRMWI72Dzjddo9VI67yQaZHOqg" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=hkjarral/AVA-AI-Voice-Agent-for-Asterisk&type=date&legend=top-left&sealed_token=OFUaTIQ_cHQIeI9JOUvCGWT1NhM4MLx-xr5TRZEdODgPVlh-fSiAKxhs6Oa328sldbZyjiYVOHXlxkkn02lMmVdoYXZdQRMWI72Dzjddo9VI67yQaZHOqg" />
+ </picture>
+</a>

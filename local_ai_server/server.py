@@ -7,6 +7,8 @@ import audioop
 import base64
 import contextlib
 import contextvars
+import hashlib
+import hmac
 import io
 import json
 import logging
@@ -94,6 +96,8 @@ _END_CALL_MARKERS: Tuple[str, ...] = (
     "take care",
     "talk to you later",
 )
+_MAX_SESSION_END_CALL_MARKERS = 100
+_MAX_SESSION_END_CALL_MARKER_LENGTH = 160
 
 
 class _LegacyKrokoSTTBackend:
@@ -4420,7 +4424,9 @@ class LocalAIServer:
         allowed = {str(name).strip() for name in (session.allowed_tools or []) if str(name).strip()}
         if not allowed:
             return False
-        if allowed == {"hangup_call"} and not self._text_has_end_call_intent(latest_user_text):
+        if allowed == {"hangup_call"} and not self._text_has_end_call_intent(
+            latest_user_text, session.hangup_end_call_markers
+        ):
             return False
         return True
 
@@ -4595,7 +4601,9 @@ class LocalAIServer:
         
         return clean
 
-    def _text_has_end_call_intent(self, text: str) -> bool:
+    def _text_has_end_call_intent(
+        self, text: str, markers: Optional[List[str]] = None
+    ) -> bool:
         import re
         t = _normalize_text(text or "")
         if not t:
@@ -4604,9 +4612,10 @@ class LocalAIServer:
         # Do not turn quoted/metalinguistic uses of farewell words into an
         # irreversible hangup.  Weak phone STT commonly produces phrases such
         # as "reply with the word goodbye" while the caller is correcting the
-        # agent.  Explicit commands ("hang up", "end call") remain terminal.
+        # agent. Explicit English commands remain terminal only for the legacy
+        # global policy; a call-scoped replacement list is authoritative.
         explicit_commands = ("hang up", "end call")
-        if any(command in t for command in explicit_commands):
+        if markers is None and any(command in t for command in explicit_commands):
             return True
         meta_patterns = (
             r"\b(?:say|saying|said|repeat|reply|respond|answer)\b.{0,32}\b(?:goodbye|bye|thanks|thank you)\b",
@@ -4615,7 +4624,10 @@ class LocalAIServer:
         )
         if any(re.search(pattern, t) for pattern in meta_patterns):
             return False
-        for marker in _END_CALL_MARKERS:
+        effective_markers = (
+            list(_END_CALL_MARKERS) if markers is None else list(markers)
+        )
+        for marker in effective_markers:
             m = _normalize_text(marker)
             if not m:
                 continue
@@ -4626,6 +4638,39 @@ class LocalAIServer:
             if re.search(rf"(?:^|\b){re.escape(m)}(?:\b|$)", t):
                 return True
         return False
+
+    @staticmethod
+    def _normalize_session_end_call_markers(data: Dict[str, Any]) -> Optional[List[str]]:
+        """Return validated call-scoped markers, or None for legacy defaults."""
+        if "hangup_policy" not in data:
+            return None
+        policy = data.get("hangup_policy")
+        if not isinstance(policy, dict):
+            raise ValueError("hangup_policy must be an object")
+        markers_cfg = policy.get("markers")
+        if not isinstance(markers_cfg, dict):
+            raise ValueError("hangup_policy.markers must be an object")
+        raw_markers = markers_cfg.get("end_call")
+        if not isinstance(raw_markers, list):
+            raise ValueError("hangup_policy.markers.end_call must be an array")
+        if not raw_markers:
+            raise ValueError("hangup_policy.markers.end_call must not be empty")
+        if len(raw_markers) > _MAX_SESSION_END_CALL_MARKERS:
+            raise ValueError("too many session end-call markers")
+        normalized: List[str] = []
+        seen = set()
+        for raw_marker in raw_markers:
+            if not isinstance(raw_marker, str):
+                raise ValueError("session end-call markers must be strings")
+            marker = _normalize_text(raw_marker)
+            if not marker:
+                raise ValueError("session end-call markers must not be empty")
+            if len(marker) > _MAX_SESSION_END_CALL_MARKER_LENGTH:
+                raise ValueError("session end-call marker is too long")
+            if marker not in seen:
+                normalized.append(marker)
+                seen.add(marker)
+        return normalized
 
     def _text_has_hangup_tool_call(self, text: str) -> bool:
         import re
@@ -4972,11 +5017,57 @@ class LocalAIServer:
         data: Dict[str, Any],
     ) -> None:
         call_id = data.get("call_id")
-        if call_id:
-            session.call_id = call_id
+        self._bind_session_call_id(session, call_id)
         session.allowed_tools = self._extract_allowed_tool_names(data)
         session.tool_schemas = data.get("tools") if isinstance(data.get("tools"), list) else []
         session.tool_policy = self._normalize_tool_policy(data.get("tool_policy"))
+        try:
+            session.hangup_end_call_markers = self._normalize_session_end_call_markers(data)
+            effective_markers = (
+                list(_END_CALL_MARKERS)
+                if session.hangup_end_call_markers is None
+                else list(session.hangup_end_call_markers)
+            )
+            requested_source = str(data.get("hangup_marker_source") or "").strip()
+            session.hangup_marker_source = requested_source or (
+                "global" if session.hangup_end_call_markers is None else "session"
+            )
+            session.hangup_marker_digest = hashlib.sha256(
+                json.dumps(
+                    effective_markers,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()[:16]
+            if "hangup_policy" in data:
+                requested_version = data.get("protocol_version")
+                if requested_version != PROTOCOL_VERSION:
+                    raise ValueError(
+                        "call-scoped hangup policy requires protocol_version "
+                        f"{PROTOCOL_VERSION}"
+                    )
+                supplied_digest = str(
+                    data.get("hangup_marker_digest") or ""
+                ).strip()
+                if not supplied_digest or not hmac.compare_digest(
+                    supplied_digest, session.hangup_marker_digest
+                ):
+                    raise ValueError("hangup marker digest mismatch")
+        except (TypeError, ValueError) as exc:
+            # Explicit malformed policy must never fall back to permissive
+            # server defaults. Remove the irreversible tool from this call.
+            session.hangup_end_call_markers = []
+            session.hangup_marker_source = "invalid"
+            session.hangup_marker_digest = None
+            session.allowed_tools = [
+                name for name in session.allowed_tools if name != "hangup_call"
+            ]
+            logging.error(
+                "🧩 TOOL CONTEXT - Invalid hangup policy; hangup_call disabled "
+                "call_id=%s error=%s",
+                session.call_id,
+                exc,
+            )
         # Bind the cached tool context to its originating call_id. A long-lived
         # WebSocket session can serve multiple calls; without this binding the
         # ACL/schemas/policy would silently leak from one call to the next when
@@ -4985,12 +5076,40 @@ class LocalAIServer:
         # PR #384 comment 3214130571.
         session.tool_context_call_id = session.call_id or None
         logging.info(
-            "🧩 TOOL CONTEXT - call_id=%s allowed_tools=%s policy=%s schemas=%s",
+            "🧩 TOOL CONTEXT - call_id=%s allowed_tools=%s policy=%s schemas=%s "
+            "hangup_marker_source=%s hangup_marker_count=%s hangup_marker_digest=%s",
             session.call_id,
             session.allowed_tools,
             session.tool_policy,
             len(session.tool_schemas or []),
+            session.hangup_marker_source,
+            len(
+                _END_CALL_MARKERS
+                if session.hangup_end_call_markers is None
+                else session.hangup_end_call_markers
+            ),
+            session.hangup_marker_digest,
         )
+
+    @staticmethod
+    def _bind_session_call_id(session: SessionContext, call_id: Any) -> None:
+        """Bind a call-bearing message and clear stale call-scoped tool state."""
+        cached_call_id = getattr(session, "tool_context_call_id", None)
+        if cached_call_id and call_id and cached_call_id != call_id:
+            logging.warning(
+                "🧩 TOOL CONTEXT - call_id mismatch (cached=%s incoming=%s); clearing stale cache",
+                cached_call_id,
+                call_id,
+            )
+            session.allowed_tools = []
+            session.tool_schemas = []
+            session.tool_policy = "auto"
+            session.hangup_end_call_markers = None
+            session.hangup_marker_source = "global"
+            session.hangup_marker_digest = None
+            session.tool_context_call_id = None
+        if call_id:
+            session.call_id = call_id
 
     async def _build_llm_tool_response_payload(
         self,
@@ -5054,7 +5173,9 @@ class LocalAIServer:
             tool_choice != "none"
             and not tool_calls
             and "hangup_call" in allowed_set
-            and self._text_has_end_call_intent(latest_user_text)
+            and self._text_has_end_call_intent(
+                latest_user_text, session.hangup_end_call_markers
+            )
         )
         if should_apply_hangup_heuristic:
             tool_calls = [
@@ -5105,7 +5226,9 @@ class LocalAIServer:
             tool_calls = []
             tool_path = "none"
 
-        if tool_calls and not self._text_has_end_call_intent(latest_user_text):
+        if tool_calls and not self._text_has_end_call_intent(
+            latest_user_text, session.hangup_end_call_markers
+        ):
             kept_calls = [
                 tc
                 for tc in tool_calls
@@ -5159,27 +5282,7 @@ class LocalAIServer:
     ) -> None:
         request_id = str(data.get("request_id") or "").strip()
         call_id = data.get("call_id")
-        if call_id:
-            session.call_id = call_id
-        # Cross-call leakage guard: a long-lived WebSocket session can serve
-        # multiple calls. The cached `tool_context` (allowed_tools / schemas /
-        # policy) is bound to the call_id that created it; if a different
-        # call_id arrives without sending a fresh `tool_context`, drop the
-        # stale cache so we don't authorize tools the new call wasn't given.
-        # The request will then fall through with an empty allowlist
-        # (effectively rejecting tool calls until a `tool_context` is sent
-        # for this call). Per CodeRabbit review of PR #384 comment 3214130571.
-        cached_ctx_call_id = getattr(session, "tool_context_call_id", None)
-        if cached_ctx_call_id and call_id and cached_ctx_call_id != call_id:
-            logging.warning(
-                "🧩 TOOL CONTEXT - call_id mismatch (cached=%s incoming=%s); clearing stale cache",
-                cached_ctx_call_id,
-                call_id,
-            )
-            session.allowed_tools = []
-            session.tool_schemas = []
-            session.tool_policy = "auto"
-            session.tool_context_call_id = None
+        self._bind_session_call_id(session, call_id)
         text = str(data.get("text") or "")
         # When the request omits tool metadata, pass None so
         # `_build_llm_tool_response_payload` can fall back to whatever was
@@ -5213,8 +5316,7 @@ class LocalAIServer:
         data: Dict[str, Any],
     ) -> None:
         call_id = data.get("call_id")
-        if call_id:
-            session.call_id = call_id
+        self._bind_session_call_id(session, call_id)
         request_id = str(data.get("request_id") or "").strip() or None
         tool_name = str(data.get("tool_name") or data.get("function_call_id") or "tool").strip()
         result = data.get("result") if isinstance(data.get("result"), dict) else {"value": data.get("result")}
@@ -5681,7 +5783,9 @@ class LocalAIServer:
 
         if mode in {"full", "llm"} and normalized_text:
             words = normalized_text.split()
-            end_call_like = self._text_has_end_call_intent(clean_text)
+            end_call_like = self._text_has_end_call_intent(
+                clean_text, session.hangup_end_call_markers
+            )
             single_word_fragments = {"a", "an", "the", "then", "uh", "um", "hmm"}
             filler_tail_words = {"uh", "um", "hmm"}
             should_suppress_short = (
@@ -5848,7 +5952,9 @@ class LocalAIServer:
         # hasn't indicated they want to end the call (e.g., "how to set up the project").
         # When this happens, retry once with an explicit "no tools" instruction.
         if mode == "full" and llm_response and self._text_has_hangup_tool_call(llm_response):
-            if not self._text_has_end_call_intent(clean_text):
+            if not self._text_has_end_call_intent(
+                clean_text, session.hangup_end_call_markers
+            ):
                 logging.warning(
                     "⚠️ LLM emitted hangup_call without end-of-call intent; retrying without tools call_id=%s mode=%s preview=%s",
                     session.call_id,
@@ -6102,7 +6208,9 @@ class LocalAIServer:
         if llm_response:
             # Hangup tool call guardrail (same as serial path)
             if self._text_has_hangup_tool_call(llm_response):
-                if not self._text_has_end_call_intent(clean_text):
+                if not self._text_has_end_call_intent(
+                    clean_text, session.hangup_end_call_markers
+                ):
                     logging.warning(
                         "⚠️ STREAMING: LLM emitted hangup_call without end-of-call intent call_id=%s",
                         session.call_id,
@@ -6242,8 +6350,7 @@ class LocalAIServer:
         mode = self._normalize_mode(data.get("mode"), session)
         request_id = data.get("request_id")
         call_id = data.get("call_id")
-        if call_id:
-            session.call_id = call_id
+        self._bind_session_call_id(session, call_id)
         
         if DEBUG_AUDIO_FLOW:
             logging.debug(
@@ -6429,8 +6536,7 @@ class LocalAIServer:
 
         request_id = data.get("request_id")
         call_id = data.get("call_id")
-        if call_id:
-            session.call_id = call_id
+        self._bind_session_call_id(session, call_id)
 
         generation = self._start_output_generation(session)
 
@@ -6500,8 +6606,7 @@ class LocalAIServer:
         mode = self._normalize_mode(data.get("mode"), session)
         request_id = data.get("request_id")
         call_id = data.get("call_id")
-        if call_id:
-            session.call_id = call_id
+        self._bind_session_call_id(session, call_id)
 
         generation = self._start_output_generation(session)
 

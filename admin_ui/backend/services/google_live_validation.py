@@ -8,6 +8,7 @@ GOOGLE_LIVE_PREFERRED_MODELS = [
     "gemini-2.5-flash-native-audio-preview-12-2025",
     "gemini-2.5-flash-native-audio-preview-09-2025",
     "gemini-3.1-flash-live-preview",
+    "gemini-3.8-live",
     "gemini-live-2.5-flash-native-audio",
     "gemini-live-2.5-flash-preview-native-audio-09-2025",
     "gemini-live-2.5-flash-preview",

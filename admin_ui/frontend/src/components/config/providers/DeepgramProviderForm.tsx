@@ -1030,43 +1030,6 @@ const DeepgramProviderForm: React.FC<DeepgramProviderFormProps> = ({
                     </div>
                 </div>
 
-                <div className="space-y-2">
-                    <div className="flex items-center gap-1.5">
-                        <label className="text-sm font-medium">
-                            Farewell Hangup Delay (seconds)
-                        </label>
-                        <HelpTooltip
-                            content={
-                                <>
-                                    <strong>Farewell Hangup Delay</strong> — wait this long after
-                                    the agent finishes its final TTS playback before hanging up the
-                                    channel.
-                                    <ul className="list-disc pl-4 mt-1 space-y-0.5">
-                                        <li>Prevents clipping the last word</li>
-                                        <li>Leave empty to use the global default (2.5s)</li>
-                                    </ul>
-                                </>
-                            }
-                        />
-                    </div>
-                    <input
-                        type="number"
-                        step="0.5"
-                        className="w-full p-2 rounded border border-input bg-background"
-                        value={config.farewell_hangup_delay_sec ?? ''}
-                        onChange={e =>
-                            handleChange(
-                                'farewell_hangup_delay_sec',
-                                e.target.value ? parseFloat(e.target.value) : null
-                            )
-                        }
-                        placeholder="Use global default (2.5s)"
-                    />
-                    <p className="text-xs text-muted-foreground">
-                        Seconds to wait after farewell audio before hanging up. Leave empty to use
-                        global default.
-                    </p>
-                </div>
 
                 {/* Flux tuning — only when a flux-* model is selected */}
                 {(config.model || '').startsWith('flux-') && (

@@ -98,6 +98,17 @@ class _RecordingLLM(LLMComponent):
         return ""
 
 
+class _HistoryRecordingLLM(LLMComponent):
+    def __init__(self):
+        self.contexts = []
+        self.calls = asyncio.Queue()
+
+    async def generate(self, call_id, transcript, context, options):
+        self.contexts.append(list(context.get("prior_messages") or []))
+        self.calls.put_nowait(len(self.contexts))
+        return "Transferring you now." if len(self.contexts) == 1 else "Okay."
+
+
 class _BlockingLLM(LLMComponent):
     def __init__(self):
         self.started = asyncio.Event()
@@ -245,6 +256,39 @@ class _HangingTTS(TTSComponent):
         await self.release.wait()
         if False:
             yield b""
+
+
+class _StreamingSentenceLLM(LLMComponent):
+    supports_streaming = True
+
+    async def generate(self, call_id, transcript, context, options):
+        return "This response is streamed."
+
+    async def generate_stream(self, call_id, transcript, context, options):
+        yield "This response is streamed. "
+
+
+class _ClosableStreamingTTS(TTSComponent):
+    supports_text_stream = True
+
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    async def synthesize(self, call_id, text, options):
+        if False:
+            yield b""
+
+    async def synthesize_stream(self, call_id, text_chunks, options):
+        try:
+            async for fragment in text_chunks:
+                if fragment:
+                    self.started.set()
+                    await asyncio.Event().wait()
+            if False:
+                yield b""
+        finally:
+            self.closed.set()
 
 
 class _StreamOwnershipStub:
@@ -938,6 +982,81 @@ async def test_pipeline_tool_only_turn_keeps_persisted_history_transcript_only(m
 
 
 @pytest.mark.asyncio
+async def test_pipeline_turn_rehydrates_history_after_external_timeout_apology(monkeypatch):
+    config_data = {
+        "default_provider": "local",
+        "providers": {"local": {"enabled": True}},
+        "asterisk": {
+            "host": "127.0.0.1",
+            "port": 8088,
+            "username": "u",
+            "password": "p",
+            "app_name": "ai-voice-agent",
+        },
+        "llm": {"initial_greeting": "", "prompt": "You are helpful", "model": "gpt-4o"},
+        "pipelines": {"history_sync": {}},
+        "active_pipeline": "history_sync",
+        "audio_transport": "audiosocket",
+    }
+    engine = Engine(AppConfig(**config_data))
+    engine.pipeline_orchestrator._started = True
+    stt = _ResultStreamingStubSTT()
+    llm = _HistoryRecordingLLM()
+    resolution = _StubResolution(
+        stt_adapter=stt,
+        stt_options={"streaming": True, "chunk_ms": 80},
+        llm_adapter=llm,
+        tts_adapter=_SilentTTS(),
+    )
+    resolution.llm_options = {"aggregation_timeout_sec": 0.01}
+    monkeypatch.setattr(
+        engine.pipeline_orchestrator,
+        "get_pipeline",
+        lambda *args, **kwargs: resolution,
+    )
+    engine.ari_client.set_channel_var = AsyncMock(return_value=True)
+
+    from src.core.models import CallSession
+
+    call_id = "call-pipeline-history-sync"
+    session = CallSession(call_id=call_id, caller_channel_id=call_id)
+    session.pipeline_name = "history_sync"
+    await engine.session_store.upsert_call(session)
+
+    await engine._ensure_pipeline_runner(session, forced=True)
+    await asyncio.wait_for(stt.started.wait(), timeout=2)
+    await stt.results.put("please transfer me")
+    assert await asyncio.wait_for(llm.calls.get(), timeout=2) == 1
+    for _ in range(100):
+        current = await engine.session_store.get_by_call_id(call_id)
+        if any(
+            item.get("content") == "Transferring you now."
+            for item in current.conversation_history
+        ):
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("first pipeline turn was not persisted")
+
+    current.conversation_history.append(
+        {
+            "role": "assistant",
+            "content": "I'm sorry, I couldn't complete that transfer.",
+            "event": "no_input_deferred_transfer_timeout",
+        }
+    )
+    await engine.session_store.upsert_call(current)
+
+    await stt.results.put("what happened")
+    assert await asyncio.wait_for(llm.calls.get(), timeout=2) == 2
+
+    assert llm.contexts[1][-1]["content"] == (
+        "I'm sorry, I couldn't complete that transfer."
+    )
+    await engine._cleanup_call(call_id)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure_mode", ["record", "canonicalize"])
 async def test_disallowed_follow_up_tool_stays_blocked_when_guardrail_bookkeeping_fails(
     monkeypatch,
@@ -1097,6 +1216,66 @@ async def test_cleanup_cancels_inflight_pipeline_turn_before_bridge_teardown(mon
     assert llm.cancelled.is_set()
     assert not tts.started.is_set()
     engine.streaming_playback_manager.start_streaming_playback.assert_not_awaited()
+    assert call_id not in engine._pipeline_tasks
+
+
+@pytest.mark.asyncio
+async def test_cleanup_closes_turn_scoped_tts_text_stream(monkeypatch):
+    """Barge-in/call cleanup must not leave a realtime TTS session running."""
+    config_data = {
+        "default_provider": "local",
+        "providers": {"local": {"enabled": True}},
+        "asterisk": {
+            "host": "127.0.0.1",
+            "port": 8088,
+            "username": "u",
+            "password": "p",
+            "app_name": "ai-voice-agent",
+        },
+        "llm": {"initial_greeting": "", "prompt": "You are helpful", "model": "gpt-4o"},
+        "pipelines": {"streaming": {}},
+        "active_pipeline": "streaming",
+        "audio_transport": "audiosocket",
+        "downstream_mode": "stream",
+    }
+    engine = Engine(AppConfig(**config_data))
+    engine.pipeline_orchestrator._started = True
+    stt = _ResultStreamingStubSTT()
+    tts = _ClosableStreamingTTS()
+    resolution = _StubResolution(
+        stt_adapter=stt,
+        stt_options={"streaming": True, "chunk_ms": 80},
+        llm_adapter=_StreamingSentenceLLM(),
+        tts_adapter=tts,
+    )
+    monkeypatch.setattr(
+        engine.pipeline_orchestrator,
+        "get_pipeline",
+        lambda *args, **kwargs: resolution,
+    )
+    engine.ari_client.set_channel_var = AsyncMock(return_value=True)
+    engine.streaming_playback_manager.start_streaming_playback = AsyncMock(
+        return_value="tts-stream"
+    )
+    engine.streaming_playback_manager.stop_streaming_playback = AsyncMock(
+        return_value=True
+    )
+
+    from src.core.models import CallSession
+
+    call_id = "call-cleanup-realtime-tts"
+    session = CallSession(call_id=call_id, caller_channel_id=call_id)
+    session.pipeline_name = "streaming"
+    await engine.session_store.upsert_call(session)
+
+    await engine._ensure_pipeline_runner(session, forced=True)
+    await asyncio.wait_for(stt.started.wait(), timeout=2)
+    await stt.results.put("please explain")
+    await asyncio.wait_for(tts.started.wait(), timeout=2)
+
+    await engine._cleanup_call(call_id)
+
+    assert tts.closed.is_set()
     assert call_id not in engine._pipeline_tasks
 
 
@@ -1430,6 +1609,71 @@ async def test_overlap_keeps_capture_open_until_real_audio_buffer(monkeypatch, w
     finally:
         await engine._cleanup_call(session.call_id)
 
+@pytest.mark.asyncio
+async def test_pipeline_farewell_without_tool_waits_for_audio_drain(monkeypatch):
+    from src.core.models import CallSession
+
+    class FarewellLLM(LLMComponent):
+        async def generate(self, call_id, transcript, context, options):
+            return "Thank you for calling. Goodbye!"
+
+    engine = Engine(AppConfig(
+        default_provider="local",
+        providers={"local": {"enabled": True}},
+        asterisk={"host": "127.0.0.1", "username": "u", "password": "p"},
+        llm={"initial_greeting": "", "prompt": "You are helpful"},
+        pipelines={"farewell": {}},
+        active_pipeline="farewell",
+        audio_transport="audiosocket",
+        downstream_mode="file",
+        farewell_hangup_delay_sec=300,
+    ))
+    engine.pipeline_orchestrator._started = True
+    stt = _ResultStreamingStubSTT()
+    resolution = _StubResolution(
+        stt_adapter=stt,
+        stt_options={"streaming": True, "chunk_ms": 80},
+        llm_adapter=FarewellLLM(),
+    )
+    monkeypatch.setattr(engine.pipeline_orchestrator, "get_pipeline", lambda *args, **kwargs: resolution)
+    engine.ari_client.set_channel_var = AsyncMock(return_value=True)
+    engine.ari_client.hangup_channel = AsyncMock(return_value=True)
+    engine.playback_manager.play_audio = AsyncMock(return_value="farewell-playback")
+    drain_started = asyncio.Event()
+    drain_release = asyncio.Event()
+    hung_up = asyncio.Event()
+
+    async def drain(call_id, **kwargs):
+        assert kwargs["reason"] == "pipeline_farewell_without_tool"
+        drain_started.set()
+        await drain_release.wait()
+        return True
+
+    async def hangup(channel_id):
+        assert channel_id == "pipeline-no-tool-farewell"
+        hung_up.set()
+        return True
+
+    monkeypatch.setattr(engine, "_wait_for_call_audio_drain", drain)
+    engine.ari_client.hangup_channel.side_effect = hangup
+    session = CallSession(call_id="pipeline-no-tool-farewell", caller_channel_id="pipeline-no-tool-farewell")
+    session.pipeline_name = "farewell"
+    await engine.session_store.upsert_call(session)
+    try:
+        await engine._ensure_pipeline_runner(session, forced=True)
+        await asyncio.wait_for(stt.started.wait(), timeout=2)
+        await stt.results.put("That's all. Goodbye.")
+        await asyncio.wait_for(drain_started.wait(), timeout=2)
+        engine.playback_manager.play_audio.assert_awaited_once()
+        engine.ari_client.hangup_channel.assert_not_awaited()
+        drain_release.set()
+        await asyncio.wait_for(hung_up.wait(), timeout=2)
+        engine.ari_client.hangup_channel.assert_awaited_once()
+        assert session.call_outcome == "agent_hangup"
+    finally:
+        drain_release.set()
+        await engine._cleanup_call(session.call_id)
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["empty", "failure"])
@@ -1729,3 +1973,100 @@ async def test_initial_350ms_preroll_survives_real_processing_and_frame_output(
         assert engine._wait_for_initial_media.await_count == 1  # Initial speech only.
     finally:
         await engine._cleanup_call(call_id)
+@pytest.mark.parametrize("allowed", [True, False])
+async def test_pipeline_open_receives_calendar_policy_from_call_snapshot_without_rewriting_saved_prompt(
+    monkeypatch, allowed
+):
+    from src.tools.business.microsoft_calendar import MicrosoftCalendarTool
+    from src.core.models import CallSession
+
+    saved_prompt = (
+        "Existing agent instructions: keep our qualification and transfer procedure."
+    )
+    cfg = AppConfig(
+        **{
+            "default_provider": "local",
+            "providers": {"local": {"enabled": True}},
+            "asterisk": {
+                "host": "127.0.0.1",
+                "port": 8088,
+                "username": "synthetic",
+                "password": "synthetic",
+                "app_name": "test",
+            },
+            "llm": {"prompt": saved_prompt, "initial_greeting": ""},
+            "pipelines": {"synthetic": {}},
+            "active_pipeline": "synthetic",
+            "audio_transport": "externalmedia",
+        }
+    )
+    engine = Engine(cfg)
+    registry = ToolRegistry.isolated()
+    registry.register_instance(MicrosoftCalendarTool())
+    registry.get_tools_for_context = lambda *args, **kwargs: (
+        [registry.get("microsoft_calendar")] if allowed else []
+    )
+    scoped = {
+        "tools": {
+            "microsoft_calendar": {
+                "invitations_enabled": False,
+                "enforce_booking_limits": False,
+                "selected_accounts": ["allowed"],
+                "accounts": {
+                    "allowed": {"timezone": "America/Phoenix"},
+                    "unselected": {"timezone": "Europe/London"},
+                },
+            }
+        }
+    }
+    # A different live generation must not affect the prompt of this call.
+    engine.config.tools = {"microsoft_calendar": {"invitations_enabled": True}}
+    monkeypatch.setattr(engine, "_tool_config_for_session", lambda session: scoped)
+    monkeypatch.setattr(engine, "_tool_registry_for_session", lambda session: registry)
+    monkeypatch.setattr(
+        engine.transport_orchestrator,
+        "get_context_config",
+        lambda *args: SimpleNamespace(
+            prompt=saved_prompt,
+            tools=["microsoft_calendar"],
+            disable_global_in_call_tools=[],
+            greeting="",
+        ),
+    )
+
+    class CapturingLLM(_StubLLM):
+        def __init__(self):
+            self.options = None
+
+        async def open_call(self, call_id, options):
+            self.options = dict(options)
+            raise asyncio.CancelledError()  # Stop after capture, before audio/network/tool execution.
+
+    llm = CapturingLLM()
+    resolution = _StubResolution(llm_adapter=llm)
+    monkeypatch.setattr(
+        engine.pipeline_orchestrator, "get_pipeline", lambda *args: resolution
+    )
+    session = CallSession(
+        call_id="synthetic-upgrade-pipeline", caller_channel_id="synthetic-channel"
+    )
+    session.context_name = "existing-agent"
+    session.pipeline_name = "synthetic"
+    await engine.session_store.upsert_call(session)
+    try:
+        await engine._pipeline_runner(session.call_id)
+    except asyncio.CancelledError:
+        pass
+    assert llm.options is not None
+    prompt = llm.options["system_prompt"]
+    assert prompt.startswith(saved_prompt)
+    assert cfg.llm.prompt == saved_prompt
+    if allowed:
+        assert "Microsoft Calendar booking rules:" in prompt
+        assert "invitations are disabled" in prompt
+        assert "enforcement is disabled" in prompt
+        assert "America/Phoenix" in prompt and "Europe/London" not in prompt
+        assert "reschedule_event" in prompt and "cancellation_confirmed=true" in prompt
+        assert prompt.count("Microsoft Calendar booking rules:") == 1
+    else:
+        assert "Microsoft Calendar booking rules:" not in prompt

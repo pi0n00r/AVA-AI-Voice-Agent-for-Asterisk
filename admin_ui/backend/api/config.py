@@ -13,6 +13,8 @@ import tempfile
 import sys
 import threading
 import logging
+import math
+import json
 import ssl
 import smtplib
 from copy import deepcopy
@@ -35,6 +37,10 @@ except ModuleNotFoundError:
     # Source checkout/tests: import the same canonical module from root src/.
     from src.config_apply import classify_config_change
 
+from src.fish_audio_url import (
+    fish_audio_synthesis_test_url,
+    fish_audio_verification_url,
+)
 from src.tools.execution_history import CALL_HISTORY_TOOL_REDACTION_MODES
 
 # A11: Maximum number of backups to keep
@@ -272,34 +278,71 @@ def _admin_ui_env_key(key: str) -> bool:
     )
 
 
-def _assert_no_duplicate_yaml_keys(node: yaml.Node) -> None:
+class _RecursiveYamlAliasError(ConstructorError):
+    """Raised when YAML aliases create a cycle in the configuration graph."""
+
+
+class _NonFiniteYamlKeyError(ConstructorError):
+    """Raised when a YAML mapping uses a non-JSON-compatible numeric key."""
+
+
+def _assert_no_duplicate_yaml_keys(
+    node: yaml.Node,
+    visiting: Optional[set[int]] = None,
+) -> None:
     """
     Detect duplicate mapping keys before calling yaml.safe_load().
 
     We avoid yaml.load() here to keep CodeQL happy while still enforcing our
     "no duplicate keys" constraint for Admin UI config edits.
     """
-    if isinstance(node, MappingNode):
-        seen: dict[str, ScalarNode] = {}
-        for key_node, value_node in node.value:
-            # Config files use string keys; if not, fall back to a stable repr.
-            if isinstance(key_node, ScalarNode):
-                key = str(key_node.value)
-            else:
-                key = str(key_node)
-            if key in seen:
-                raise ConstructorError(
-                    "while constructing a mapping",
-                    node.start_mark,
-                    f"found duplicate key ({key!r})",
-                    key_node.start_mark,
-                )
-            if isinstance(key_node, ScalarNode):
-                seen[key] = key_node
-            _assert_no_duplicate_yaml_keys(value_node)
-    elif isinstance(node, SequenceNode):
-        for item in node.value:
-            _assert_no_duplicate_yaml_keys(item)
+    if not isinstance(node, (MappingNode, SequenceNode)):
+        return
+
+    active = visiting if visiting is not None else set()
+    node_id = id(node)
+    if node_id in active:
+        raise _RecursiveYamlAliasError(
+            "while constructing the configuration",
+            node.start_mark,
+            "found recursive YAML alias",
+            node.start_mark,
+        )
+
+    active.add(node_id)
+    try:
+        if isinstance(node, MappingNode):
+            seen: dict[str, ScalarNode] = {}
+            for key_node, value_node in node.value:
+                # Config files use string keys; if not, fall back to a stable repr.
+                if isinstance(key_node, ScalarNode):
+                    if key_node.tag == "tag:yaml.org,2002:float":
+                        parsed_key = yaml.safe_load(key_node.value)
+                        if isinstance(parsed_key, float) and not math.isfinite(parsed_key):
+                            raise _NonFiniteYamlKeyError(
+                                "while constructing a mapping",
+                                node.start_mark,
+                                f"found non-finite numeric key ({key_node.value!r})",
+                                key_node.start_mark,
+                            )
+                    key = str(key_node.value)
+                else:
+                    key = str(key_node)
+                if key in seen:
+                    raise ConstructorError(
+                        "while constructing a mapping",
+                        node.start_mark,
+                        f"found duplicate key ({key!r})",
+                        key_node.start_mark,
+                    )
+                if isinstance(key_node, ScalarNode):
+                    seen[key] = key_node
+                _assert_no_duplicate_yaml_keys(value_node, active)
+        else:
+            for item in node.value:
+                _assert_no_duplicate_yaml_keys(item, active)
+    finally:
+        active.remove(node_id)
 
 
 def _safe_load_no_duplicates(content: str):
@@ -307,6 +350,75 @@ def _safe_load_no_duplicates(content: str):
     if node is not None:
         _assert_no_duplicate_yaml_keys(node)
     return yaml.safe_load(content)
+
+
+class _RecursiveConfigAliasError(ValueError):
+    """Raised when an in-memory configuration contains a recursive container."""
+
+    def __init__(self, path: str):
+        self.path = path or "<root>"
+        super().__init__(self.path)
+
+
+def _non_finite_number_paths(
+    value: Any,
+    path: str = "",
+    visiting: Optional[set[int]] = None,
+) -> list[str]:
+    """Return config paths containing floats that cannot be represented in JSON."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return [path or "<root>"]
+
+    if not isinstance(value, (dict, list)):
+        return []
+
+    active = visiting if visiting is not None else set()
+    value_id = id(value)
+    if value_id in active:
+        raise _RecursiveConfigAliasError(path)
+
+    active.add(value_id)
+    paths: list[str] = []
+    try:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                key_text = str(key)
+                if re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", key_text):
+                    child_path = f"{path}.{key_text}" if path else key_text
+                else:
+                    child_path = f"{path}[{json.dumps(key_text)}]"
+                paths.extend(_non_finite_number_paths(child, child_path, active))
+        else:
+            for index, child in enumerate(value):
+                paths.extend(_non_finite_number_paths(child, f"{path}[{index}]", active))
+        return paths
+    finally:
+        active.remove(value_id)
+
+
+def _assert_finite_config_numbers(value: Any, *, status_code: int = 400) -> None:
+    try:
+        paths = _non_finite_number_paths(value)
+    except _RecursiveConfigAliasError as exc:
+        raise HTTPException(
+            status_code=status_code,
+            detail=(
+                "Configuration contains a recursive YAML alias at "
+                f"{exc.path}. Replace the alias with an ordinary mapping or list."
+            ),
+        ) from exc
+    if not paths:
+        return
+    displayed = ", ".join(paths[:10])
+    if len(paths) > 10:
+        displayed += f", and {len(paths) - 10} more"
+    raise HTTPException(
+        status_code=status_code,
+        detail=(
+            "Configuration contains non-finite numeric values that are not JSON-compatible: "
+            f"{displayed}. Replace .nan/.inf values in Advanced > Raw YAML with finite numbers."
+        ),
+    )
 
 
 def _deep_merge_dicts(base: dict, override: dict) -> dict:
@@ -394,6 +506,8 @@ def _read_merged_config_dict() -> dict:
     try:
         with open(settings.LOCAL_CONFIG_PATH, "r") as f:
             local = _safe_load_no_duplicates(f.read()) or {}
+    except (_RecursiveYamlAliasError, _NonFiniteYamlKeyError):
+        raise
     except Exception:
         return base
 
@@ -565,6 +679,9 @@ _SAFE_BASE_URLS: dict[str, str] = {
     "api.openai.com": "https://api.openai.com/v1",
     "api.groq.com": "https://api.groq.com/openai/v1",
     "openrouter.ai": "https://openrouter.ai/api/v1",
+    "api.deepseek.com": "https://api.deepseek.com/v1",
+    "api.minimax.io": "https://api.minimax.io/v1",
+    "api.minimaxi.com": "https://api.minimaxi.com/v1",
     "api.anthropic.com": "https://api.anthropic.com/v1",
     "api.deepgram.com": "https://api.deepgram.com/v1",
     "api.elevenlabs.io": "https://api.elevenlabs.io/v1",
@@ -773,6 +890,11 @@ def _validate_ai_agent_config(content: str) -> Dict[str, Any]:
 
     if not isinstance(parsed, dict):
         raise HTTPException(status_code=400, detail="Invalid YAML: expected a mapping at the document root")
+
+    # YAML permits .nan/.inf, but JSON and downstream numeric operations do not.
+    # Reject these values before validation or persistence so a form edit cannot
+    # poison the structured config endpoint or runtime behavior.
+    _assert_finite_config_numbers(parsed)
 
     # Ensure project root is importable so we can reuse canonical Pydantic models.
     project_root = getattr(settings, "PROJECT_ROOT", None)
@@ -1196,7 +1318,77 @@ async def reset_pipeline_audio(pipeline_name: str):
 @router.get("")
 @router.get("/")
 async def get_config():
-    return _read_merged_config_dict()
+    try:
+        safe = _redact_websocket_media_secrets(_read_merged_config_dict())
+    except _RecursiveYamlAliasError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Configuration contains a recursive YAML alias. Repair the local "
+                "configuration file by replacing the alias with an ordinary mapping or list."
+            ),
+        ) from exc
+    except _NonFiniteYamlKeyError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Configuration contains a non-finite numeric mapping key. Repair the local "
+                "configuration file by replacing .nan/.inf keys with ordinary text keys."
+            ),
+        ) from exc
+    # Existing operator overrides may predate write-time validation. Return a
+    # controlled, actionable response while leaving /yaml available for repair.
+    _assert_finite_config_numbers(safe, status_code=422)
+    return safe
+
+
+def _redact_websocket_media_secrets(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Defensively keep an accidentally hand-written WS secret out of API reads."""
+    safe = deepcopy(config)
+    websocket_media = safe.get("websocket_media") if isinstance(safe, dict) else None
+    auth = websocket_media.get("auth") if isinstance(websocket_media, dict) else None
+    if isinstance(auth, dict):
+        # `password_env` is an identifier, not a credential, and remains visible
+        # so operators know exactly which ai_engine env var is required.
+        for key in ("password", "secret", "token"):
+            auth.pop(key, None)
+    return safe
+
+
+@router.get("/websocket-media-status")
+async def get_websocket_media_status():
+    """Return safe WebSocket listener configuration and env-file secret state.
+
+    The Admin UI does not infer secret availability from its own container
+    environment.  ai_engine receives the project `.env` through Compose's
+    `env_file`, so this endpoint checks that intended source only and never
+    returns its value.
+    """
+    try:
+        from dotenv import dotenv_values
+        from src.config import WebSocketMediaConfig
+
+        merged = _read_merged_config_dict()
+        raw = merged.get("websocket_media") if isinstance(merged, dict) else None
+        websocket_media = WebSocketMediaConfig.model_validate(raw or {})
+        password_env = websocket_media.auth.password_env
+        dotenv_map = dotenv_values(settings.ENV_PATH) if os.path.exists(settings.ENV_PATH) else {}
+        secret_present = bool(str(dotenv_map.get(password_env) or "").strip())
+        return {
+            "config": websocket_media.model_dump(),
+            "secret_reference": password_env,
+            "secret_present": secret_present,
+            "secret_source": "ai_engine env_file (.env)",
+        }
+    except Exception as exc:
+        # Validation errors can include rejected raw input values (including an
+        # accidentally hand-written auth.password), so never attach traceback
+        # data to this operator-facing status failure.
+        logger.warning("Unable to read WebSocket media status")
+        raise HTTPException(
+            status_code=400,
+            detail="WebSocket media configuration is invalid; correct it in Audio Transport settings.",
+        ) from exc
 
 
 @router.post("/yaml")
@@ -1222,8 +1414,13 @@ async def get_yaml_config():
         # Return the merged config (base + local overrides) so the editor
         # always shows the effective configuration the engine will use.
         config_content = _read_merged_config_content()
-        _safe_load_no_duplicates(config_content)  # Validate YAML and reject duplicate keys
-        return {"content": config_content}
+        parsed = _safe_load_no_duplicates(config_content)  # Validate YAML and reject duplicate keys
+        safe_content = yaml.dump(
+            _redact_websocket_media_secrets(parsed or {}),
+            default_flow_style=False,
+            sort_keys=False,
+        )
+        return {"content": safe_content}
     except yaml.YAMLError as e:
         logger.info("YAML parse error while reading config YAML", exc_info=True)
         # Extract detailed error information for user-friendly display
@@ -1483,6 +1680,16 @@ async def update_env(env_data: Dict[str, Optional[str]]):
         changed_keys = sorted(set(keys_to_update) | set(keys_to_delete))
 
         impacts_ai_engine = any(_ai_engine_env_key(k) for k in changed_keys)
+        # A WebSocket credential may use an operator-selected env name rather
+        # than the default ASTERISK_* prefix. Its value still enters ai_engine
+        # through env_file and requires recreation, including on deletion.
+        try:
+            effective = _read_merged_config_dict()
+            ws_auth = ((effective.get("websocket_media") or {}).get("auth") or {})
+            ws_password_env = str(ws_auth.get("password_env") or "ASTERISK_MEDIA_WS_PASSWORD")
+            impacts_ai_engine = impacts_ai_engine or ws_password_env in changed_keys
+        except Exception:
+            logger.warning("Unable to resolve custom media credential reference for environment apply plan")
         impacts_local_ai = any(_local_ai_env_key(k) for k in changed_keys)
         impacts_admin_ui = any(_admin_ui_env_key(k) for k in changed_keys)
 
@@ -1675,7 +1882,27 @@ async def test_provider_connection(request: ProviderTestRequest):
         # Apply substitution to the config
         provider_config = substitute_env_vars(request.config)
         provider_name = request.name.lower()
+        # Saved provider instances may keep credentials in owner-only files.
+        # Resolve the key in memory for this verification request without ever
+        # returning it to the browser or writing it back into YAML.
+        if provider_config.get("api_key_file") or provider_config.get("api_key_env"):
+            try:
+                helpers = _provider_instances_module()
+                kind = str(provider_config.get("type") or provider_name.rsplit("_llm", 1)[0]).lower()
+                resolved_key = helpers["resolve_secret_value"](
+                    provider_config,
+                    file_field="api_key_file",
+                    env_field="api_key_env",
+                    inline_field="api_key",
+                    legacy_env_names=_provider_legacy_api_key_env_names(provider_name, kind),
+                )
+                if resolved_key:
+                    provider_config["api_key"] = resolved_key
+            except Exception:
+                logger.warning("Provider connection test could not resolve managed API key")
         
+        provider_type = str(provider_config.get('type') or '').lower()
+
         # ============================================================
         # LOCAL PROVIDER - test connection to local_ai_server
         # ============================================================
@@ -1747,6 +1974,71 @@ async def test_provider_connection(request: ProviderTestRequest):
                 return {"success": False, "message": f"Cannot connect to Local AI Server at {ws_url} (see server logs)"}
         
         # ============================================================
+        # FISH AUDIO TTS - perform a minimal real synthesis. A key-only model
+        # listing can succeed even when the configured model returns 402 for
+        # missing credit or entitlement. A loopback-only exception supports
+        # the bundled mock; bearer credentials never reach arbitrary hosts.
+        # ============================================================
+        if provider_type == 'fishaudio':
+            api_key = (
+                str(provider_config.get('api_key') or '').strip()
+                or get_env_key('FISH_AUDIO_API_KEY')
+                or os.getenv('FISH_AUDIO_API_KEY')
+                or ''
+            )
+            if not api_key:
+                return {"success": False, "message": "Fish Audio API key is not configured"}
+            reference_id = str(provider_config.get('reference_id') or '').strip()
+            if not reference_id:
+                return {"success": False, "message": "Fish Audio reference ID is not configured"}
+            model = str(provider_config.get('model') or 's2.1-pro').strip()
+            try:
+                tts_url = fish_audio_synthesis_test_url(
+                    str(provider_config.get('base_url') or 'https://api.fish.audio/v1')
+                )
+                async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+                    response = await client.post(
+                        tts_url,
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                            "model": model,
+                        },
+                        json={
+                            "text": "Connection test.",
+                            "reference_id": reference_id,
+                            "format": "pcm",
+                            "sample_rate": 8000,
+                            "latency": "low",
+                            "chunk_length": 200,
+                            "normalize": True,
+                            "temperature": 0.7,
+                            "top_p": 0.7,
+                        },
+                    )
+                if response.status_code == 200 and response.content:
+                    return {"success": True, "message": "Fish Audio synthesis verified"}
+                if response.status_code == 200:
+                    return {"success": False, "message": "Fish Audio returned no audio"}
+                if response.status_code == 401:
+                    return {"success": False, "message": "Invalid Fish Audio API key (401)"}
+                if response.status_code == 402:
+                    return {
+                        "success": False,
+                        "message": "Fish Audio rejected synthesis (402): check model access or account credit",
+                    }
+                return {
+                    "success": False,
+                    "message": f"Fish Audio synthesis failed: HTTP {response.status_code}",
+                }
+            except Exception:
+                logger.debug("Fish Audio provider validation failed", exc_info=True)
+                return {
+                    "success": False,
+                    "message": "Cannot connect to the configured Fish Audio endpoint",
+                }
+
+        # ============================================================
         # ELEVENLABS AGENT - check before other providers
         # ============================================================
         if 'elevenlabs' in provider_name or 'agent_id' in provider_config:
@@ -1788,13 +2080,17 @@ async def test_provider_connection(request: ProviderTestRequest):
         # ============================================================
         # TELNYX (OpenAI-compatible) - validate /models + a tiny /chat/completions
         # ============================================================
-        provider_type = str(provider_config.get('type') or '').lower()
         chat_base_url = (provider_config.get('chat_base_url') or provider_config.get('base_url') or '').rstrip('/')
         host = _url_host(chat_base_url)
         is_telnyx = provider_type in ('telnyx', 'telenyx') or ('telnyx' in provider_name) or host == 'api.telnyx.com'
         if is_telnyx:
             base_url = _safe_base_url(chat_base_url, 'https://api.telnyx.com/v2/ai')
-            api_key = get_env_key('TELNYX_API_KEY') or os.getenv('TELNYX_API_KEY') or ''
+            api_key = (
+                str(provider_config.get('api_key') or '').strip()
+                or get_env_key('TELNYX_API_KEY')
+                or os.getenv('TELNYX_API_KEY')
+                or ''
+            )
             if not api_key:
                 return {"success": False, "message": "TELNYX_API_KEY not set in .env"}
 
@@ -1942,9 +2238,9 @@ async def test_provider_connection(request: ProviderTestRequest):
                 
         elif 'google_live' in provider_config or ('llm_model' in provider_config and 'gemini' in provider_config.get('llm_model', '')):
             # Google Live
-            api_key = get_env_key('GOOGLE_API_KEY')
+            api_key = provider_config.get('api_key') or get_env_key('GOOGLE_API_KEY')
             if not api_key:
-                return {"success": False, "message": "GOOGLE_API_KEY not set in .env file"}
+                return {"success": False, "message": "No Google API key configured (checked api_key_file/api_key_env and GOOGLE_API_KEY in .env)"}
             async with httpx.AsyncClient() as client:
                 response = await client.get(
                     f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
@@ -2270,143 +2566,14 @@ async def test_smtp_settings(req: SmtpTestRequest):
 
 @router.get("/export-logs")
 async def export_logs():
-    """Export logs and sanitized configuration for troubleshooting"""
-    try:
-        import zipfile
-        import io
-        import glob
-        from datetime import datetime
-        import subprocess
-        
-        # Create ZIP in memory
-        zip_buffer = io.BytesIO()
-        
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            # 1. Sanitized YAML (merged base + local override)
-            try:
-                import yaml
-                parsed = _read_merged_config_dict()
+    """Deprecated compatibility export: bounded, sanitized system diagnostics."""
+    from api.support import SystemBundleRequest, _system_bundle_sync
 
-                import re
-                email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
-                # Pattern for hostnames that look like internal infrastructure
-                hostname_pattern = re.compile(r'\b(?:pbx|sip|voip|trunk|asterisk)[a-zA-Z0-9.-]*\.[a-zA-Z]{2,}\b', re.IGNORECASE)
-                
-                def redact(obj):
-                    if isinstance(obj, dict):
-                        out = {}
-                        for k, v in obj.items():
-                            key = str(k).lower()
-                            # Redact sensitive keys
-                            if any(s in key for s in ["api_key", "apikey", "token", "secret", "password", "pass", "key"]):
-                                out[k] = "[REDACTED]"
-                            # Redact email fields
-                            elif "email" in key:
-                                out[k] = "[EMAIL_REDACTED]"
-                            else:
-                                out[k] = redact(v)
-                        return out
-                    if isinstance(obj, list):
-                        return [redact(v) for v in obj]
-                    # Redact email addresses and sensitive hostnames in string values
-                    if isinstance(obj, str):
-                        result = email_pattern.sub('[EMAIL_REDACTED]', obj)
-                        result = hostname_pattern.sub('[HOSTNAME_REDACTED]', result)
-                        return result
-                    return obj
-
-                if parsed:
-                    redacted = redact(parsed)
-                    zip_file.writestr(
-                        'ai-agent-sanitized.yaml',
-                        yaml.safe_dump(redacted, sort_keys=False, default_flow_style=False),
-                    )
-            except Exception:
-                # Fallback: write raw base if sanitization fails
-                if os.path.exists(settings.CONFIG_PATH):
-                    with open(settings.CONFIG_PATH, 'r') as f:
-                        zip_file.writestr('ai-agent-sanitized.yaml', f.read())
-            
-            # 2. Sanitized ENV (Just keys, no values)
-            if os.path.exists(settings.ENV_PATH):
-                env_keys = []
-                with open(settings.ENV_PATH, 'r') as f:
-                    for line in f:
-                        if '=' in line and not line.startswith('#'):
-                            key = line.split('=')[0].strip()
-                            env_keys.append(f"{key}=[REDACTED]")
-                zip_file.writestr('.env.sanitized', '\n'.join(env_keys))
-
-            # 2b. Host OS info (if mounted) and basic Docker versions
-            for os_release in ("/host/etc/os-release", "/etc/os-release"):
-                if os.path.exists(os_release):
-                    try:
-                        with open(os_release, "r") as f:
-                            zip_file.writestr("os-release.txt", f.read())
-                        break
-                    except Exception:
-                        pass
-
-            def add_cmd(name: str, cmd: list):
-                try:
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-                    content = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
-                    zip_file.writestr(name, content.strip() + "\n")
-                except Exception as e:
-                    zip_file.writestr(name, f"Failed to run {cmd}: {e}\n")
-
-            add_cmd("docker-version.txt", ["docker", "version"])
-            add_cmd("docker-compose-version.txt", ["docker", "compose", "version"])
-            add_cmd("docker-ps.txt", ["docker", "ps", "-a"])
-            
-            # 3. Logs from Docker Containers
-            try:
-                import docker
-                client = docker.from_env()
-                containers_to_log = ['ai_engine', 'local_ai_server', 'admin_ui']
-                
-                found_logs = False
-                for container_name in containers_to_log:
-                    try:
-                        container = client.containers.get(container_name)
-                        # Capture full logs (no tail limit)
-                        logs = container.logs().decode('utf-8', errors='replace')
-                        if logs:
-                            # Strip ANSI escape codes for clean log files
-                            clean_logs = strip_ansi_codes(logs)
-                            # Redact sensitive information for privacy (AAVA-162)
-                            import re
-                            # Email addresses
-                            clean_logs = re.sub(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', '[EMAIL_REDACTED]', clean_logs)
-                            # PBX/SIP/VoIP hostnames (likely internal infrastructure)
-                            clean_logs = re.sub(r'\b(?:pbx|sip|voip|trunk|asterisk)[a-zA-Z0-9.-]*\.[a-zA-Z]{2,}\b', '[HOSTNAME_REDACTED]', clean_logs, flags=re.IGNORECASE)
-                            # API key previews (e.g., api_key_preview=AIzaSyB2..._H_M)
-                            clean_logs = re.sub(r'(api_key_preview=)[^\s\]]+', r'\1[REDACTED]', clean_logs)
-                            zip_file.writestr(f'{container_name}.log', clean_logs)
-                            found_logs = True
-                    except Exception as e:
-                        zip_file.writestr(f'{container_name}_error.txt', f"Could not fetch logs: {str(e)}")
-                
-                if not found_logs:
-                    zip_file.writestr('logs_info.txt', 'No logs retrieved from containers.')
-
-            except Exception as e:
-                 zip_file.writestr('docker_error.txt', f"Failed to connect to Docker API: {str(e)}")
-
-            # Add timestamp
-            timestamp = datetime.now().isoformat()
-            zip_file.writestr('export_info.txt', f'Debug export created: {timestamp}\n')
-        
-        zip_buffer.seek(0)
-        
-        from fastapi.responses import StreamingResponse
-        return StreamingResponse(
-            zip_buffer, 
-            media_type="application/zip",
-            headers={"Content-Disposition": f"attachment; filename=debug-logs-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"}
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return await asyncio.to_thread(
+        _system_bundle_sync,
+        SystemBundleRequest(),
+        deprecated=True,
+    )
 
 @router.post("/import")
 async def import_configuration(file: UploadFile = File(...)):
@@ -2618,7 +2785,9 @@ def _provider_instances_module():
         API_KEY_COMPATIBLE_KINDS,
         CREDENTIAL_NAME_TO_FIELD,
         FULL_AGENT_KINDS,
+        MODULAR_LLM_KINDS,
         ProviderInstanceError,
+        credential_provider_kind,
         provider_kind,
         resolve_secret_value,
         safe_secret_path,
@@ -2629,7 +2798,9 @@ def _provider_instances_module():
         "api_key_kinds": API_KEY_COMPATIBLE_KINDS,
         "credential_fields": CREDENTIAL_NAME_TO_FIELD,
         "full_agent_kinds": FULL_AGENT_KINDS,
+        "modular_llm_kinds": MODULAR_LLM_KINDS,
         "ProviderInstanceError": ProviderInstanceError,
+        "credential_provider_kind": credential_provider_kind,
         "provider_kind": provider_kind,
         "resolve_secret_value": resolve_secret_value,
         "safe_secret_path": safe_secret_path,
@@ -2650,9 +2821,12 @@ def _get_provider_block(provider_key: str) -> tuple[Dict[str, Any], Dict[str, An
     provider_cfg = providers.get(provider_key)
     if not isinstance(provider_cfg, dict):
         raise HTTPException(status_code=404, detail=f"Provider '{provider_key}' not found")
-    kind = helpers["provider_kind"](provider_key, provider_cfg)
-    if kind not in helpers["full_agent_kinds"]:
-        raise HTTPException(status_code=400, detail=f"Provider '{provider_key}' is not a full-agent provider")
+    kind = helpers["credential_provider_kind"](provider_key, provider_cfg)
+    if kind is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Provider '{provider_key}' does not support managed credentials",
+        )
     return merged, provider_cfg, kind
 
 
@@ -2809,13 +2983,19 @@ def _migrate_inline_provider_secrets(config_data: Dict[str, Any]) -> bool:
     for provider_key, provider_cfg in providers.items():
         if not isinstance(provider_cfg, dict):
             continue
-        kind = helpers["provider_kind"](provider_key, provider_cfg)
+        kind = helpers["credential_provider_kind"](provider_key, provider_cfg)
         for inline_field, credential_name, file_field in (
             ("api_key", "api-key", "api_key_file"),
             ("agent_id", "agent-id", "agent_id_file"),
         ):
             value = provider_cfg.get(inline_field)
             if not isinstance(value, str) or not value.strip() or value.strip().startswith("${"):
+                continue
+            # OpenAI-compatible endpoints that do not authenticate commonly use
+            # this documented sentinel.  It is configuration, not a credential,
+            # and moving it to /secrets would make unrelated config writes fail
+            # in environments where managed secret storage is unavailable.
+            if inline_field == "api_key" and value.strip().lower() == "not-needed":
                 continue
             if not _credential_allowed_for_kind(kind, credential_name):
                 continue
@@ -2856,19 +3036,332 @@ def _credential_metadata(provider_key: str, credential_name: str) -> Dict[str, A
     }
     if credential_name == "vertex-json":
         try:
-            import json
+            from google.oauth2 import service_account
 
-            with open(target, "r") as f:
-                creds = json.load(f)
+            creds = service_account.Credentials.from_service_account_file(str(target))
             meta.update(
                 {
-                    "project_id": creds.get("project_id"),
-                    "client_email": creds.get("client_email"),
+                    "valid": True,
+                    "project_id": creds.project_id,
+                    "client_email": creds.service_account_email,
                 }
             )
         except Exception:
-            meta["error"] = "Failed to read credentials metadata"
+            meta.update(
+                {
+                    "valid": False,
+                    "error": "Invalid Google service-account credential file",
+                }
+            )
     return meta
+
+
+def _configured_file_metadata(path: str, credential_name: str) -> Dict[str, Any]:
+    """Return secret-safe metadata for an operator-configured credential file."""
+    target = Path(str(path or "").strip())
+    meta: Dict[str, Any] = {
+        "uploaded": False,
+        "configured": False,
+        "path": str(target),
+    }
+    if not str(path or "").strip() or not target.is_file():
+        return meta
+
+    stat = target.stat()
+    meta.update({"filename": target.name, "uploaded_at": stat.st_mtime})
+    if credential_name == "vertex-json":
+        try:
+            from google.oauth2 import service_account
+
+            creds = service_account.Credentials.from_service_account_file(str(target))
+            meta.update(
+                {
+                    "configured": True,
+                    "valid": True,
+                    "project_id": creds.project_id,
+                    "client_email": creds.service_account_email,
+                }
+            )
+        except Exception:
+            meta.update(
+                {
+                    "configured": False,
+                    "valid": False,
+                    "error": "Invalid Google service-account credential file",
+                }
+            )
+    else:
+        meta["configured"] = True
+    return meta
+
+
+def _provider_legacy_api_key_env_names(provider_key: str, kind: str) -> tuple[str, ...]:
+    """Return the legacy env fallbacks used by each provider runtime."""
+    full_agent = {
+        "openai_realtime": ("OPENAI_API_KEY",),
+        "deepgram": ("DEEPGRAM_API_KEY",),
+        "google_live": ("GOOGLE_API_KEY",),
+        "elevenlabs_agent": ("ELEVENLABS_API_KEY",),
+        "grok": ("XAI_API_KEY",),
+        "fishaudio": ("FISH_AUDIO_API_KEY",),
+    }.get(kind)
+    if full_agent is not None:
+        return full_agent
+    return _llm_legacy_env_names(provider_key, kind)
+
+
+def _api_key_credential_metadata(
+    provider_key: str, provider_cfg: Dict[str, Any], kind: str
+) -> Dict[str, Any]:
+    """Describe the effective API-key source without returning the secret."""
+    helpers = _provider_instances_module()
+    meta = _credential_metadata(provider_key, "api-key")
+    config_for_resolution = dict(provider_cfg)
+    inline = str(config_for_resolution.get("api_key") or "").strip()
+    env_ref = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}", inline)
+    if env_ref:
+        config_for_resolution["api_key"] = ""
+        config_for_resolution.setdefault("api_key_env", env_ref.group(1))
+
+    def _candidate_resolves(candidate: Dict[str, Any], legacy_env_names: tuple[str, ...] = ()) -> bool:
+        """Return whether one isolated credential source resolves to a usable key."""
+        value = str(
+            helpers["resolve_secret_value"](
+                candidate,
+                file_field="api_key_file",
+                env_field="api_key_env",
+                inline_field="api_key",
+                legacy_env_names=legacy_env_names,
+            )
+            or ""
+        ).strip()
+        return bool(value) and not (value.lower() == "not-needed" and kind != "openai")
+
+    file_path = str(config_for_resolution.get("api_key_file") or "").strip()
+    env_name = str(config_for_resolution.get("api_key_env") or "").strip()
+    literal = str(config_for_resolution.get("api_key") or "").strip()
+    legacy_env_names = _provider_legacy_api_key_env_names(provider_key, kind)
+    managed_path = str(meta.get("path") or "").strip()
+    file_is_managed = bool(
+        file_path
+        and meta.get("uploaded")
+        and managed_path
+        and os.path.abspath(file_path) == os.path.abspath(managed_path)
+    )
+    if file_path and not file_is_managed:
+        meta = _configured_file_metadata(file_path, "api-key")
+
+    configured = False
+    source: Optional[str] = None
+    if file_path and _candidate_resolves({"api_key_file": file_path}):
+        configured = True
+        source = "managed_file" if file_is_managed else "configured_file"
+        meta["path"] = file_path
+    elif env_name and _candidate_resolves({"api_key_env": env_name}):
+        configured = True
+        source = "env_var"
+        meta["env_var"] = env_name
+    elif literal and _candidate_resolves({"api_key": literal}):
+        configured = True
+        source = "inline"
+    else:
+        for legacy_name in legacy_env_names:
+            if _candidate_resolves({}, (legacy_name,)):
+                configured = True
+                source = "legacy_env"
+                meta["env_var"] = legacy_name
+                break
+
+    if source is None:
+        if file_path:
+            source = "configured_file"
+            meta["path"] = file_path
+        elif env_name:
+            source = "env_var"
+            meta["env_var"] = env_name
+        elif literal:
+            source = "inline"
+
+    meta["configured"] = configured
+    meta["source"] = source
+    return meta
+
+
+def _vertex_credential_metadata(provider_key: str, provider_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Describe managed or legacy Vertex credentials without copying them."""
+    managed = _credential_metadata(provider_key, "vertex-json")
+    configured_path = str(provider_cfg.get("credentials_path") or "").strip()
+    if configured_path:
+        managed_path = str(managed.get("path") or "").strip()
+        if (
+            managed.get("uploaded")
+            and managed.get("valid")
+            and managed_path
+            and os.path.abspath(configured_path) == os.path.abspath(managed_path)
+        ):
+            managed.update(
+                {
+                    "configured": True,
+                    "source": "managed_file",
+                    "filename": Path(managed_path).name,
+                }
+            )
+            return managed
+        if (
+            managed.get("uploaded")
+            and managed_path
+            and os.path.abspath(configured_path) == os.path.abspath(managed_path)
+        ):
+            managed.update({"configured": False, "source": "managed_file"})
+            return managed
+        meta = _configured_file_metadata(configured_path, "vertex-json")
+        meta["source"] = "configured_file"
+        return meta
+
+    env_path = str(os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
+    if env_path:
+        meta = _configured_file_metadata(env_path, "vertex-json")
+        meta.update({"source": "legacy_env_file", "env_var": "GOOGLE_APPLICATION_CREDENTIALS"})
+        return meta
+
+    if Path(VERTEX_CREDENTIALS_PATH).is_file():
+        meta = _configured_file_metadata(VERTEX_CREDENTIALS_PATH, "vertex-json")
+        meta["source"] = "legacy_shared_file"
+        return meta
+
+    managed.update(
+        {
+            "configured": False,
+            "source": "orphaned_managed_file" if managed.get("uploaded") else None,
+        }
+    )
+    return managed
+
+
+def _llm_legacy_env_names(provider_key: str, kind: str) -> tuple[str, ...]:
+    prefix = provider_key.rsplit("_llm", 1)[0].upper()
+    names = [f"{prefix}_API_KEY"]
+    canonical = {
+        "google": "GOOGLE_API_KEY",
+        "telnyx": "TELNYX_API_KEY",
+        "telenyx": "TELNYX_API_KEY",
+        "minimax": "MINIMAX_API_KEY",
+    }.get(kind)
+    if canonical and canonical not in names:
+        names.append(canonical)
+    return tuple(names)
+
+
+def _summary_provider_api_key_configured(
+    provider_key: str, provider_cfg: Dict[str, Any], kind: str
+) -> bool:
+    """Resolve readiness without treating an unresolved ``${ENV}`` as a key."""
+    helpers = _provider_instances_module()
+    config_for_resolution = dict(provider_cfg)
+    inline = str(config_for_resolution.get("api_key") or "").strip()
+    env_ref = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}", inline)
+    if env_ref:
+        config_for_resolution["api_key"] = ""
+        config_for_resolution.setdefault("api_key_env", env_ref.group(1))
+    resolved = str(
+        helpers["resolve_secret_value"](
+            config_for_resolution,
+            file_field="api_key_file",
+            env_field="api_key_env",
+            inline_field="api_key",
+            legacy_env_names=_provider_legacy_api_key_env_names(provider_key, kind),
+        )
+        or ""
+    )
+    # ``not-needed`` is supported only by OpenAI-compatible endpoints that
+    # intentionally run without authentication. Vendor APIs always require a
+    # real credential and must not be advertised as ready with this sentinel.
+    if resolved.strip().lower() == "not-needed" and kind != "openai":
+        return False
+    return bool(resolved.strip())
+
+
+@router.get("/providers/llm-options")
+async def get_llm_provider_options():
+    """Return a secret-safe catalog for post-call summary selection."""
+    merged = _read_merged_config_dict()
+    providers = merged.get("providers") if isinstance(merged.get("providers"), dict) else {}
+    helpers = _provider_instances_module()
+    options: list[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for provider_key, provider_cfg in providers.items():
+        if not isinstance(provider_cfg, dict):
+            continue
+        key = str(provider_key)
+        if key.endswith("_llm"):
+            component_key = key
+            kind = str(provider_cfg.get("type") or key.rsplit("_llm", 1)[0]).lower()
+        elif key in {"openai", "google", "local", "telnyx", "telenyx", "minimax"}:
+            component_key = f"{key}_llm"
+            kind = str(provider_cfg.get("type") or key).lower()
+        else:
+            continue
+        if component_key in seen or kind not in helpers["modular_llm_kinds"]:
+            continue
+        seen.add(component_key)
+        enabled = provider_cfg.get("enabled") is not False
+
+        credential_required = kind in helpers["api_key_kinds"]
+        credential_configured = True
+        if credential_required:
+            credential_configured = _summary_provider_api_key_configured(
+                component_key, provider_cfg, kind
+            )
+        if kind == "google" and not credential_configured:
+            credential_configured = bool(
+                provider_cfg.get("credentials_path")
+                or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            )
+
+        options.append(
+            {
+                "key": component_key,
+                "label": str(provider_cfg.get("display_name") or provider_cfg.get("name") or component_key),
+                "type": kind,
+                "model": str(
+                    provider_cfg.get("chat_model")
+                    or provider_cfg.get("llm_model")
+                    or provider_cfg.get("model")
+                    or ""
+                ),
+                "enabled": enabled,
+                "credential_required": credential_required,
+                "credential_configured": credential_configured,
+                "ready": enabled and credential_configured,
+                "readiness": (
+                    "disabled"
+                    if not enabled
+                    else "ready"
+                    if credential_configured
+                    else "credential_missing"
+                ),
+            }
+        )
+    legacy_credential_configured = bool(str(os.getenv("OPENAI_API_KEY") or "").strip())
+    return {
+        "providers": sorted(options, key=lambda item: item["label"].lower()),
+        # Existing post-call webhooks without summary_provider use this exact
+        # OpenAI path.  Returning its secret-safe readiness lets upgraded UIs
+        # display the effective selection instead of a misleading blank field.
+        "legacy_provider": {
+            "key": "",
+            "label": "OpenAI (legacy default)",
+            "type": "openai",
+            "model": "gpt-4o-mini",
+            "enabled": True,
+            "credential_required": True,
+            "credential_configured": legacy_credential_configured,
+            "ready": legacy_credential_configured,
+            "readiness": "ready" if legacy_credential_configured else "credential_missing",
+            "legacy": True,
+        },
+    }
 
 
 @router.get("/providers/{provider_key}/credentials")
@@ -2880,8 +3373,19 @@ async def get_provider_credentials_status(provider_key: str):
     for credential_name, field in fields.items():
         if not _credential_allowed_for_kind(kind, credential_name):
             continue
-        credentials[credential_name] = _credential_metadata(provider_key, credential_name)
-        credentials[credential_name]["configured"] = bool(provider_cfg.get(field))
+        if credential_name == "api-key":
+            credentials[credential_name] = _api_key_credential_metadata(
+                provider_key, provider_cfg, kind
+            )
+        elif credential_name == "vertex-json":
+            credentials[credential_name] = _vertex_credential_metadata(
+                provider_key, provider_cfg
+            )
+        else:
+            credentials[credential_name] = _credential_metadata(provider_key, credential_name)
+            credentials[credential_name]["configured"] = bool(
+                provider_cfg.get(field) and credentials[credential_name].get("uploaded")
+            )
     return {
         "provider_key": provider_key,
         "type": kind,
@@ -3032,24 +3536,25 @@ async def verify_provider_credentials(provider_key: str):
 
     _merged, provider_cfg, kind = _get_provider_block(provider_key)
     helpers = _provider_instances_module()
+    legacy_env_names = {
+        "openai_realtime": ("OPENAI_API_KEY",),
+        "openai": (f"{provider_key.rsplit('_llm', 1)[0].upper()}_API_KEY", "OPENAI_API_KEY"),
+        "deepgram": ("DEEPGRAM_API_KEY",),
+        "google_live": ("GOOGLE_API_KEY",),
+        "google": ("GOOGLE_API_KEY",),
+        "telnyx": ("TELNYX_API_KEY",),
+        "telenyx": ("TELNYX_API_KEY",),
+        "minimax": ("MINIMAX_API_KEY",),
+        "elevenlabs_agent": ("ELEVENLABS_API_KEY",),
+        "grok": ("XAI_API_KEY",),
+        "fishaudio": ("FISH_AUDIO_API_KEY",),
+    }.get(kind, ())
     api_key = helpers["resolve_secret_value"](
         provider_cfg,
         file_field="api_key_file",
         env_field="api_key_env",
         inline_field="api_key",
-        legacy_env_names=(
-            ("OPENAI_API_KEY",)
-            if kind == "openai_realtime"
-            else ("DEEPGRAM_API_KEY",)
-            if kind == "deepgram"
-            else ("GOOGLE_API_KEY",)
-            if kind == "google_live"
-            else ("ELEVENLABS_API_KEY",)
-            if kind == "elevenlabs_agent"
-            else ("XAI_API_KEY",)
-            if kind == "grok"
-            else ()
-        ),
+        legacy_env_names=legacy_env_names,
     )
     try:
         if kind == "google_live" and provider_cfg.get("credentials_path"):
@@ -3127,6 +3632,74 @@ async def verify_provider_credentials(provider_key: str):
             if resp.status_code >= 400:
                 raise HTTPException(status_code=400, detail="xAI API key verification failed")
             return {"status": "success", "message": "xAI API key verified"}
+        if kind == "fishaudio":
+            if not api_key:
+                raise HTTPException(status_code=400, detail="Fish Audio API key is not configured")
+            model_url = fish_audio_verification_url(
+                str(provider_cfg.get("base_url") or "https://api.fish.audio/v1")
+            )
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    model_url,
+                    params={"page_size": 1},
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+            if resp.status_code != 200:
+                raise HTTPException(status_code=400, detail="Fish Audio API key verification failed")
+            return {"status": "success", "message": "Fish Audio API key verified"}
+        if kind == "google":
+            if not api_key:
+                raise HTTPException(status_code=400, detail="Google API key is not configured")
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    "https://generativelanguage.googleapis.com/v1beta/models",
+                    params={"key": api_key},
+                )
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=400, detail="Google API key verification failed")
+            return {"status": "success", "message": "Google API key verified"}
+        if kind in {"openai", "telnyx", "telenyx", "minimax"}:
+            if not api_key:
+                raise HTTPException(status_code=400, detail=f"{kind} API key is not configured")
+            if api_key.lower() == "not-needed":
+                if kind != "openai":
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{kind} API key is not configured",
+                    )
+                return {
+                    "status": "success",
+                    "message": "No-auth provider credential configuration accepted",
+                }
+            if kind == "openai":
+                configured_base = provider_cfg.get("chat_base_url") or provider_cfg.get("base_url") or ""
+                fallback_base = "https://api.openai.com/v1"
+                label = "OpenAI-compatible"
+            elif kind in {"telnyx", "telenyx"}:
+                configured_base = provider_cfg.get("chat_base_url") or provider_cfg.get("base_url") or ""
+                fallback_base = "https://api.telnyx.com/v2/ai"
+                label = "Telnyx"
+            else:
+                configured_base = provider_cfg.get("chat_base_url") or provider_cfg.get("base_url") or ""
+                fallback_base = "https://api.minimax.io/v1"
+                label = "MiniMax"
+            if configured_base:
+                base_url = _safe_base_url(str(configured_base), "")
+                if not base_url or _url_host(base_url) != _url_host(str(configured_base)):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{label} verification URL is not allowlisted",
+                    )
+            else:
+                base_url = fallback_base
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"{base_url}/models",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=400, detail=f"{label} API key verification failed")
+            return {"status": "success", "message": f"{label} API key verified"}
     except HTTPException:
         raise
     except Exception as exc:
@@ -3134,15 +3707,23 @@ async def verify_provider_credentials(provider_key: str):
         raise HTTPException(status_code=400, detail=f"Verification failed: {exc}")
     raise HTTPException(status_code=400, detail=f"Unsupported provider type '{kind}'")
 VERTEX_REGIONS = [
+    {"value": "us", "label": "US (multi-region)"},
+    {"value": "eu", "label": "EU (multi-region)"},
     {"value": "us-central1", "label": "US Central (Iowa)"},
     {"value": "us-east1", "label": "US East (South Carolina)"},
     {"value": "us-east4", "label": "US East (Northern Virginia)"},
+    {"value": "us-east5", "label": "US East (Ohio)"},
+    {"value": "us-south1", "label": "US South (Texas)"},
     {"value": "us-west1", "label": "US West (Oregon)"},
     {"value": "us-west4", "label": "US West (Las Vegas)"},
+    {"value": "europe-central2", "label": "Europe Central (Warsaw)"},
+    {"value": "europe-north1", "label": "Europe North (Finland)"},
+    {"value": "europe-southwest1", "label": "Europe Southwest (Madrid)"},
     {"value": "europe-west1", "label": "Europe West (Belgium)"},
     {"value": "europe-west2", "label": "Europe West (London)"},
     {"value": "europe-west3", "label": "Europe West (Frankfurt)"},
     {"value": "europe-west4", "label": "Europe West (Netherlands)"},
+    {"value": "europe-west8", "label": "Europe West (Milan)"},
     {"value": "asia-east1", "label": "Asia East (Taiwan)"},
     {"value": "asia-northeast1", "label": "Asia Northeast (Tokyo)"},
     {"value": "asia-southeast1", "label": "Asia Southeast (Singapore)"},
@@ -4505,6 +5086,31 @@ def _ms_device_flow_worker(flow_id: str, tenant_id: str, client_id: str, account
                     "message": description or error or "Microsoft device-code authorization failed.",
                 }
             return
+        # This cache is fresh for the explicitly authorized device flow. Persist
+        # its canonical MSAL username, rather than a Graph mail address/alias that
+        # will fail the runtime's strict configured-account lookup on upgrade.
+        claimed_username = str(
+            (result.get("id_token_claims") or {}).get("preferred_username") or ""
+        ).strip()
+        cached_accounts = app.get_accounts()
+        matches = [
+            item
+            for item in cached_accounts
+            if isinstance(item.get("username"), str)
+            and item["username"].casefold() == claimed_username.casefold()
+        ]
+        signed_in = None
+        if len(matches) == 1:
+            signed_in = matches[0]
+        elif len(cached_accounts) == 1:
+            signed_in = cached_accounts[0]
+        username = (signed_in or {}).get("username")
+        if not isinstance(username, str) or not username.strip():
+            raise ValueError(
+                "Cannot identify the account authorized by this device flow; "
+                "retry Connect with the intended scheduling account."
+            )
+        username = username.strip()
         _persist_ms_token_cache(cache, account_key)
         # Capture the canonical cache path for the success payload. The
         # caller surfaces this in /devices/poll so the UI can show where
@@ -4523,12 +5129,6 @@ def _ms_device_flow_worker(flow_id: str, tenant_id: str, client_id: str, account
             page = _ms_graph_request_with_token(access_token, "GET", next_url)
             calendars.extend(page.get("value") or [])
             next_url = page.get("@odata.nextLink")
-        username = (
-            (result.get("id_token_claims") or {}).get("preferred_username")
-            or me.get("userPrincipalName")
-            or me.get("mail")
-            or ""
-        )
         with _ms_flow_lock():
             _MS_DEVICE_FLOWS[flow_id]["status"] = "success"
             _MS_DEVICE_FLOWS[flow_id]["result"] = {
@@ -4748,7 +5348,9 @@ async def verify_microsoft_calendar(req: _MicrosoftVerifyRequest):
     client = MicrosoftGraphClient(account)
     try:
         me = await asyncio.to_thread(client.me)
-        calendars = await asyncio.to_thread(client.list_calendars)
+        # Graph may enumerate a different ID representation for the same calendar.
+        # The configured endpoint is authoritative; never choose a default/name match.
+        matched = await asyncio.to_thread(client.get_calendar)
     except MicrosoftGraphApiError as exc:
         raise HTTPException(
             status_code=exc.status or 400,
@@ -4757,8 +5359,7 @@ async def verify_microsoft_calendar(req: _MicrosoftVerifyRequest):
                 "message": str(exc),
             },
         )
-    matched = next((cal for cal in calendars if cal.get("id") == calendar_id), None)
-    if not matched:
+    if not isinstance(matched, dict) or not matched.get("id"):
         raise HTTPException(
             status_code=404,
             detail={
@@ -4766,8 +5367,11 @@ async def verify_microsoft_calendar(req: _MicrosoftVerifyRequest):
                 "message": "The connected Microsoft account cannot see the configured calendar_id.",
             },
         )
+    if matched.get("canEdit") is False:
+        raise HTTPException(status_code=403, detail={"error_code": "calendar_read_only", "message": "The selected calendar is read-only; choose an editable calendar."})
     return {
         "status": "ok",
+        "can_edit": matched.get("canEdit"),
         "user_principal_name": me.get("userPrincipalName") or user_principal_name,
         "display_name": me.get("displayName") or "",
         "calendar_id": calendar_id,

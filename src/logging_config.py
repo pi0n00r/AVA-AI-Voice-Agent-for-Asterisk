@@ -21,6 +21,12 @@ from logging.handlers import RotatingFileHandler
 # Context variable for correlation ID
 correlation_id_var = contextvars.ContextVar('correlation_id', default=None)
 
+# Shared with the provider-prompt producer so a heading change cannot silently
+# disable lead-context redaction in structured diagnostics.
+OUTBOUND_LEAD_CONTEXT_MARKER = "## Lead Context (read-only)"
+OUTBOUND_LEAD_CONTEXT_REDACTION = "[lead context redacted]"
+
+
 def get_correlation_id():
     """Get the current correlation ID."""
     return correlation_id_var.get()
@@ -81,6 +87,22 @@ def sanitize_secrets(logger, method_name, event_dict):
         'private_key', 'private-key', 'privatekey',
         'client_secret', 'client-secret', 'clientsecret',
     }
+
+    # Outbound lead context is intentionally appended to provider prompts so the
+    # model can use it, but it must not be copied into structured debug logs.
+    # The block is always appended at the end of the prompt by the engine.
+    def redact_lead_context(value):
+        """Remove the appended per-lead context block from logged strings."""
+        if not isinstance(value, str):
+            return value
+        marker_index = value.find(OUTBOUND_LEAD_CONTEXT_MARKER)
+        if marker_index < 0:
+            return value
+        prefix = value[:marker_index]
+        return (
+            f"{prefix}{OUTBOUND_LEAD_CONTEXT_MARKER}\n"
+            f"{OUTBOUND_LEAD_CONTEXT_REDACTION}"
+        )
     
     def redact_value(value):
         """Redact a sensitive value, preserving structure for debugging."""
@@ -105,15 +127,35 @@ def sanitize_secrets(logger, method_name, event_dict):
                     for k, v in value.items()}
         return "***REDACTED***"
     
+    def sanitize_value(value):
+        """Recursively sanitize nested logged values without mutating inputs."""
+        if isinstance(value, dict):
+            return sanitize_dict(value)
+        if isinstance(value, list):
+            return [sanitize_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(sanitize_value(item) for item in value)
+        return redact_lead_context(value)
+
     def sanitize_dict(d):
         """Recursively sanitize dictionary keys."""
         if isinstance(d, (list, tuple)):
             return [sanitize_dict(v) for v in d]
         if not isinstance(d, dict):
             return d
+
+        # ChannelVarSet encodes the variable name and value as sibling fields,
+        # so a key-only secret matcher cannot identify lead context. Apply the
+        # pair-aware check at every nesting level and normalize inherited
+        # Asterisk variable prefixes before matching.
+        variable_name = str(d.get("variable") or "").lstrip("_").upper()
         
         sanitized = {}
         for key, value in d.items():
+            if variable_name == "AAVA_CUSTOM_VARS_JSON" and key == "value":
+                sanitized[key] = OUTBOUND_LEAD_CONTEXT_REDACTION
+                continue
+
             # Normalize key for comparison (remove separators, lowercase)
             key_normalized = str(key).lower().replace('_', '').replace('-', '')
             if key_normalized in DTMF_KEYS:
@@ -135,9 +177,9 @@ def sanitize_secrets(logger, method_name, event_dict):
             elif isinstance(value, (dict, list, tuple)):
                 sanitized[key] = sanitize_dict(value)
             else:
-                sanitized[key] = value
+                sanitized[key] = sanitize_value(value)
         return sanitized
-    
+
     # Sanitize the entire event_dict
     return sanitize_dict(event_dict)
 

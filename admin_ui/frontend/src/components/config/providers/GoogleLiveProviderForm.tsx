@@ -9,7 +9,11 @@ import OutputResamplerField from './OutputResamplerField';
 import {
     GOOGLE_LIVE_MODEL_GROUPS,
     GOOGLE_LIVE_SUPPORTED_MODELS,
+    GOOGLE_LIVE_VERTEX_REGIONS,
+    getGoogleLiveVertexRegionSupport,
+    isGoogleLiveModelCompatible,
     normalizeGoogleLiveModelForUi,
+    preferredGoogleLiveVertexRegion,
 } from '../../../utils/googleLiveModels';
 
 const GOOGLE_LIVE_VOICE_OPTIONS = [
@@ -54,6 +58,9 @@ interface VertexRegion {
 
 interface CredentialsStatus {
     uploaded: boolean;
+    configured?: boolean;
+    source?: string | null;
+    path?: string;
     filename: string | null;
     project_id: string | null;
     client_email: string | null;
@@ -124,6 +131,15 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
         }
     }, [expertEnabled]);
 
+    // Match the saved form value to the AUDIO-only setup sent for Gemini 3.8.
+    // This also corrects older configurations opened directly on that model.
+    useEffect(() => {
+        if (normalizeGoogleLiveModelForUi(config.llm_model) === 'gemini-3.8-live'
+            && config.response_modalities !== 'audio') {
+            onChange({ ...config, response_modalities: 'audio' });
+        }
+    }, [config.llm_model, config.response_modalities]); // eslint-disable-line react-hooks/exhaustive-deps
+
     // Auto-switch model when API mode changes so Vertex ↔ Developer models stay in sync.
     // This useEffect is the authoritative guard — it fires whenever use_vertex_ai flips
     // and corrects the model if it belongs to the wrong API group.
@@ -133,19 +149,51 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
         // Only fire on actual toggles, not on initial mount
         if (prevVertexRef.current !== undefined && prevVertexRef.current !== useVertex) {
             const currentModel = config.llm_model || '';
-            const isModelVertex = currentModel.startsWith('gemini-live-');
-            const mismatch = useVertex ? !isModelVertex : isModelVertex;
-            if (mismatch) {
-                const newModel = useVertex
-                    ? 'gemini-live-2.5-flash-native-audio'
-                    : 'gemini-2.5-flash-native-audio-latest';
-                onChange({ ...config, llm_model: newModel });
+            const mismatch = !isGoogleLiveModelCompatible(currentModel, useVertex);
+            const newModel = mismatch
+                ? (useVertex ? 'gemini-live-2.5-flash-native-audio' : 'gemini-2.5-flash-native-audio-latest')
+                : currentModel;
+            const newRegion = useVertex
+                ? preferredGoogleLiveVertexRegion(newModel, config.vertex_location)
+                : config.vertex_location;
+            if (mismatch || (useVertex && newRegion !== config.vertex_location)) {
+                onChange({ ...config, llm_model: newModel, vertex_location: newRegion });
             }
         }
         prevVertexRef.current = useVertex;
     }, [config.use_vertex_ai]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const selectedModel = normalizeGoogleLiveModelForUi(config.llm_model);
+    const selectedRegion = config.vertex_location || 'us-central1';
+    const vertexRegionSupport = getGoogleLiveVertexRegionSupport(
+        config.llm_model,
+        Boolean(config.use_vertex_ai),
+        selectedRegion,
+    );
+    const regionOptions: VertexRegion[] = [
+        ...GOOGLE_LIVE_VERTEX_REGIONS,
+        ...regions.filter(region => !GOOGLE_LIVE_VERTEX_REGIONS.some(known => known.value === region.value)),
+    ];
+    const regionDocsUrl = selectedModel === 'gemini-3.8-live'
+        ? 'https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/3-8-live'
+        : 'https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/2-5-flash-live-api';
+    const handleModelChange = (model: string) => {
+        onChange({
+            ...config,
+            llm_model: model,
+            ...(model === 'gemini-3.8-live' ? { response_modalities: 'audio' } : {}),
+            ...(config.use_vertex_ai
+                ? { vertex_location: preferredGoogleLiveVertexRegion(model, config.vertex_location) }
+                : {}),
+        });
+    };
+    const vertexUploadLabel = uploading
+        ? 'Uploading...'
+        : credentials?.uploaded && !credentials?.configured
+          ? 'Repair Per-Instance Credential'
+          : credentials?.configured
+            ? 'Upload Per-Instance Override'
+            : 'Upload Service Account JSON';
 
     // File upload handler
     const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -164,10 +212,18 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                 headers: { 'Content-Type': 'multipart/form-data' },
             });
             await fetchVertexData();
-            // Auto-fill project ID if empty
-            if (res.data.project_id && !config.vertex_project) {
-                handleChange('vertex_project', res.data.project_id);
-            }
+            // Keep the parent's in-memory form synchronized with the backend
+            // write. Otherwise a later Save can erase credentials_path and
+            // strand the per-instance file that was just uploaded.
+            applyCredentialPatch(
+                {
+                    credentials_path: res.data.path,
+                    ...(res.data.project_id && !config.vertex_project
+                        ? { vertex_project: res.data.project_id }
+                        : {}),
+                },
+                onChange,
+            );
         } catch (e: any) {
             setUploadError(e.response?.data?.detail || 'Upload failed');
         } finally {
@@ -189,6 +245,9 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
         try {
             await axios.delete(providerKey ? `${providerCredentialsBase}/vertex-json` : `${providerCredentialsBase}/credentials`);
             setCredentials({ uploaded: false, filename: null, project_id: null, client_email: null, uploaded_at: null });
+            if (providerKey) {
+                applyCredentialPatch({ credentials_path: undefined }, onChange);
+            }
             setVerifyResult(null);
             toast.success('Service account credentials deleted');
         } catch (e: any) {
@@ -206,8 +265,13 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
             setVerifyResult({ status: 'success', message: res.data.message || 'Credentials verified!' });
             // Auto-switch to a Vertex-compatible model on successful verification
             const currentModel = config.llm_model || '';
-            if (!currentModel.startsWith('gemini-live-')) {
-                onChange({ ...config, llm_model: 'gemini-live-2.5-flash-native-audio' });
+            if (!isGoogleLiveModelCompatible(currentModel, true)) {
+                const newModel = 'gemini-live-2.5-flash-native-audio';
+                onChange({
+                    ...config,
+                    llm_model: newModel,
+                    vertex_location: preferredGoogleLiveVertexRegion(newModel, config.vertex_location),
+                });
             }
         } catch (e: any) {
             setVerifyResult({ status: 'error', message: e.response?.data?.detail || 'Verification failed' });
@@ -243,10 +307,11 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                         <>
                                             <strong>API Mode toggle</strong> — choose between Google's two Live API surfaces.
                                             <ul className="list-disc pl-4 mt-1 space-y-0.5">
-                                                <li><strong>Off (Developer API):</strong> <code>generativelanguage.googleapis.com</code> with a simple <code>GOOGLE_API_KEY</code>. Fastest setup; preview models.</li>
-                                                <li><strong>On (Vertex AI):</strong> <code>aiplatform.googleapis.com</code> with OAuth2/ADC via service-account JSON. GA models, enterprise quotas, fixed function-calling reliability.</li>
+                                                <li><strong>Off (Developer API):</strong> <code>generativelanguage.googleapis.com</code> with a <code>GOOGLE_API_KEY</code>.</li>
+                                                <li><strong>On (Vertex AI):</strong> <code>aiplatform.googleapis.com</code> with OAuth2/ADC via service-account JSON.</li>
+                                                <li><code>gemini-3.8-live</code> is available on both surfaces.</li>
                                             </ul>
-                                            Toggling auto-switches the model to the matching API group.
+                                            Toggling preserves models available on both APIs; surface-specific models switch to a compatible default.
                                         </>
                                     }
                                     link="https://ai.google.dev/gemini-api/docs/live"
@@ -255,7 +320,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             </div>
                             <p className="text-xs text-muted-foreground mt-0.5">
                                 Connects to <code>aiplatform.googleapis.com</code> using OAuth2/ADC instead of an API key.
-                                Enables GA models with fixed function calling reliability.
+                                Supports GA models and enterprise authentication.
                             </p>
                         </div>
                     </div>
@@ -283,7 +348,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                             linkText="Service accounts"
                                         />
                                     </div>
-                                    {credentials?.uploaded && (
+                                    {credentials?.uploaded && credentials?.configured && (
                                         <button
                                             type="button"
                                             onClick={handleVerifyCredentials}
@@ -296,7 +361,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                     )}
                                 </div>
 
-                                {credentials?.uploaded ? (
+                                {credentials?.uploaded && credentials?.configured ? (
                                     <div className="flex items-center gap-3 p-2 rounded border border-green-200 dark:border-green-800 bg-green-50/40 dark:bg-green-900/10">
                                         <FileJson className="w-8 h-8 text-green-600" />
                                         <div className="flex-1 min-w-0">
@@ -316,22 +381,42 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                         </button>
                                     </div>
                                 ) : (
-                                    <div className="flex items-center gap-2">
-                                        <input
-                                            ref={fileInputRef}
-                                            type="file"
-                                            accept=".json"
-                                            onChange={handleFileUpload}
-                                            className="hidden"
-                                            id="vertex-json-upload"
-                                        />
-                                        <label
-                                            htmlFor="vertex-json-upload"
-                                            className={`flex items-center gap-2 px-3 py-2 rounded border border-dashed border-input cursor-pointer hover:bg-muted/50 ${uploading ? 'opacity-50 pointer-events-none' : ''}`}
-                                        >
-                                            {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
-                                            <span className="text-sm">{uploading ? 'Uploading...' : 'Upload Service Account JSON'}</span>
-                                        </label>
+                                    <div className="space-y-2">
+                                        {credentials?.configured && (
+                                            <div className="flex items-start gap-2 p-2 rounded border border-blue-200 dark:border-blue-800 bg-blue-50/40 dark:bg-blue-900/10 text-xs text-blue-800 dark:text-blue-300">
+                                                <CheckCircle className="w-4 h-4 mt-0.5 shrink-0" />
+                                                <span>
+                                                    Using {credentials.source === 'legacy_shared_file' ? 'the legacy shared' : 'an externally configured'} service-account file
+                                                    {credentials.path && <> at <code>{credentials.path}</code></>}.
+                                                    Uploading here creates a per-instance override; the existing file is not copied or deleted.
+                                                </span>
+                                            </div>
+                                        )}
+                                        {credentials?.uploaded && !credentials?.configured && (
+                                            <div className="flex items-start gap-2 p-2 rounded border border-yellow-200 dark:border-yellow-800 bg-yellow-50/40 dark:bg-yellow-900/10 text-xs text-yellow-800 dark:text-yellow-300">
+                                                <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                                                <span>
+                                                    A per-instance service-account file exists but this provider does not reference it. Upload the credential again to repair the provider path.
+                                                </span>
+                                            </div>
+                                        )}
+                                        <div className="flex items-center gap-2">
+                                            <input
+                                                ref={fileInputRef}
+                                                type="file"
+                                                accept=".json"
+                                                onChange={handleFileUpload}
+                                                className="hidden"
+                                                id="vertex-json-upload"
+                                            />
+                                            <label
+                                                htmlFor="vertex-json-upload"
+                                                className={`flex items-center gap-2 px-3 py-2 rounded border border-dashed border-input cursor-pointer hover:bg-muted/50 ${uploading ? 'opacity-50 pointer-events-none' : ''}`}
+                                            >
+                                                {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
+                                                <span className="text-sm">{vertexUploadLabel}</span>
+                                            </label>
+                                        </div>
                                     </div>
                                 )}
 
@@ -384,15 +469,14 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 </div>
                                 <div className="space-y-2">
                                     <div className="flex items-center gap-1.5">
-                                        <label className="text-sm font-medium">GCP Region</label>
+                                        <label htmlFor="google-live-vertex-region" className="text-sm font-medium">GCP Region</label>
                                         <HelpTooltip
                                             content={
                                                 <>
                                                     <strong>Vertex AI region</strong> — which GCP region serves the Live API endpoint.
                                                     <ul className="list-disc pl-4 mt-1 space-y-0.5">
-                                                        <li><code>us-central1</code> (Iowa) is the default and has the widest model availability</li>
-                                                        <li>Pick the region closest to your Asterisk PBX for lower round-trip latency</li>
-                                                        <li>Some preview models are only available in <code>us-central1</code></li>
+                                                        <li><code>us-central1</code> (Iowa) is supported by both GA Vertex Live models</li>
+                                                        <li>Unavailable regions are shown but cannot be selected for the chosen model</li>
                                                     </ul>
                                                 </>
                                             }
@@ -401,26 +485,47 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                         />
                                     </div>
                                     <select
-                                        className="w-full p-2 rounded border border-input bg-background"
-                                        value={config.vertex_location || 'us-central1'}
+                                        id="google-live-vertex-region"
+                                        className={`w-full p-2 rounded border bg-background ${vertexRegionSupport === 'unsupported' ? 'border-red-500' : 'border-input'}`}
+                                        value={selectedRegion}
                                         onChange={(e) => handleChange('vertex_location', e.target.value)}
+                                        aria-invalid={vertexRegionSupport === 'unsupported'}
                                     >
-                                        {regions.length > 0 ? (
-                                            regions.map((region) => (
-                                                <option key={region.value} value={region.value}>
-                                                    {region.label}
-                                                </option>
-                                            ))
-                                        ) : (
-                                            <>
-                                                <option value="us-central1">US Central (Iowa)</option>
-                                                <option value="us-east1">US East (South Carolina)</option>
-                                                <option value="europe-west1">Europe West (Belgium)</option>
-                                                <option value="asia-northeast1">Asia Northeast (Tokyo)</option>
-                                            </>
+                                        {!regionOptions.some(region => region.value === selectedRegion) && (
+                                            <option value={selectedRegion} disabled>
+                                                {selectedRegion} — saved region is not in the catalog
+                                            </option>
                                         )}
+                                        {regionOptions.map((region) => {
+                                            const unsupported = getGoogleLiveVertexRegionSupport(selectedModel, true, region.value) === 'unsupported';
+                                            return (
+                                                <option key={region.value} value={region.value} disabled={unsupported}>
+                                                    {region.label}{unsupported ? ' — unavailable for selected model' : ''}
+                                                </option>
+                                            );
+                                        })}
                                     </select>
-                                    <p className="text-xs text-muted-foreground">Region for Vertex AI endpoint</p>
+                                    {vertexRegionSupport === 'unsupported' ? (
+                                        <p role="alert" className="text-xs text-red-600 flex items-start gap-1">
+                                            <AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />
+                                            <span>
+                                                The selected Live model is not listed in {selectedRegion}. Choose a supported region before saving.{' '}
+                                                <a href={regionDocsUrl} target="_blank" rel="noopener noreferrer" className="underline">Google model regions ↗</a>
+                                            </span>
+                                        </p>
+                                    ) : vertexRegionSupport === 'unknown' ? (
+                                        <p role="status" className="text-xs text-amber-600 flex items-start gap-1">
+                                            <AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />
+                                            <span>Region availability for this legacy or custom model is not verified; confirm with a Live session test.</span>
+                                        </p>
+                                    ) : vertexRegionSupport === 'supported' ? (
+                                        <p role="status" className="text-xs text-green-600 flex items-start gap-1">
+                                            <CheckCircle className="w-3 h-3 mt-0.5 shrink-0" />
+                                            <span>The selected Live model is listed in {selectedRegion}. Project access is still verified when a Live session starts.</span>
+                                        </p>
+                                    ) : (
+                                        <p className="text-xs text-muted-foreground">Region for Vertex AI endpoint</p>
+                                    )}
                                 </div>
                             </div>
                         </div>
@@ -502,15 +607,15 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div className="space-y-2">
                         <div className="flex items-center gap-1.5">
-                            <label className="text-sm font-medium">LLM Model</label>
+                            <label htmlFor="google-live-llm-model" className="text-sm font-medium">LLM Model</label>
                             <HelpTooltip
                                 content={
                                     <>
                                         <strong>Gemini Live model</strong> — pricing ~1.5¢/min, sub-second response latency, 24+ language coverage.
                                         <ul className="list-disc pl-4 mt-1 space-y-0.5">
                                             <li><code>gemini-live-2.5-flash-native-audio</code> — Vertex AI GA, recommended for production</li>
-                                            <li><code>gemini-2.5-flash-preview-native-audio-dialog</code> — Developer API preview with native-audio dialog tuning</li>
-                                            <li>Models are scoped to their API group — switching Use Vertex AI auto-swaps to a compatible model</li>
+                                            <li><code>gemini-3.8-live</code> — GA on both APIs; test calls before production use</li>
+                                            <li>Switching Use Vertex AI keeps shared models and auto-swaps incompatible models</li>
                                         </ul>
                                     </>
                                 }
@@ -519,13 +624,14 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             />
                         </div>
                         <select
+                            id="google-live-llm-model"
                             className="w-full p-2 rounded border border-input bg-background"
                             value={selectedModel}
-                            onChange={(e) => handleChange('llm_model', e.target.value)}
+                            onChange={(e) => handleModelChange(e.target.value)}
                         >
                             {GOOGLE_LIVE_MODEL_GROUPS.map((group) => {
                                 const isVertexGroup = group.label === 'Vertex AI Live API';
-                                const isActiveGroup = config.use_vertex_ai ? isVertexGroup : !isVertexGroup;
+                                const isActiveGroup = group.label === 'Both Google APIs' || (config.use_vertex_ai ? isVertexGroup : !isVertexGroup);
                                 return (
                                     <optgroup key={group.label} label={group.label}>
                                         {group.options.map((modelOption) => (
@@ -613,8 +719,8 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             type="number"
                             step="0.1"
                             className="w-full p-2 rounded border border-input bg-background"
-                            value={config.llm_temperature || 0.7}
-                            onChange={(e) => handleChange('llm_temperature', parseFloat(e.target.value))}
+                            value={config.llm_temperature ?? 0.7}
+                            onChange={(e) => handleChange('llm_temperature', e.target.value ? parseFloat(e.target.value) : 0.7)}
                         />
                         <p className="text-xs text-muted-foreground">
                             Controls randomness (0.0-2.0). Lower = more focused, higher = more creative.
@@ -640,7 +746,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             type="number"
                             className="w-full p-2 rounded border border-input bg-background"
                             value={config.llm_max_output_tokens || 8192}
-                            onChange={(e) => handleChange('llm_max_output_tokens', parseInt(e.target.value))}
+                            onChange={(e) => handleChange('llm_max_output_tokens', e.target.value ? parseInt(e.target.value) : 8192)}
                         />
                         <p className="text-xs text-muted-foreground">
                             Maximum tokens in response. Higher allows longer answers but increases latency.
@@ -670,8 +776,8 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 type="number"
                                 step="0.01"
                                 className="w-full p-2 rounded border border-input bg-background"
-                                value={config.llm_top_p || 0.95}
-                                onChange={(e) => handleChange('llm_top_p', parseFloat(e.target.value))}
+                                value={config.llm_top_p ?? 0.95}
+                                onChange={(e) => handleChange('llm_top_p', e.target.value ? parseFloat(e.target.value) : 0.95)}
                             />
                             <p className="text-xs text-muted-foreground">
                                 Nucleus sampling (0.0-1.0). Considers tokens comprising top P probability mass.
@@ -697,7 +803,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 type="number"
                                 className="w-full p-2 rounded border border-input bg-background"
                                 value={config.llm_top_k || 40}
-                                onChange={(e) => handleChange('llm_top_k', parseInt(e.target.value))}
+                                onChange={(e) => handleChange('llm_top_k', e.target.value ? parseInt(e.target.value) : 40)}
                             />
                             <p className="text-xs text-muted-foreground">
                                 Limits to top K most likely tokens. Lower = more focused responses.
@@ -757,7 +863,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 type="number"
                                 className="w-full p-2 rounded border border-input bg-background"
                                 value={config.input_sample_rate_hz || 8000}
-                                onChange={(e) => handleChange('input_sample_rate_hz', parseInt(e.target.value))}
+                                onChange={(e) => handleChange('input_sample_rate_hz', e.target.value ? parseInt(e.target.value) : 8000)}
                             />
                             <p className="text-xs text-muted-foreground">
                                 Sample rate from Asterisk. Standard telephony uses 8000 Hz.
@@ -811,7 +917,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 type="number"
                                 className="w-full p-2 rounded border border-input bg-background"
                                 value={config.output_sample_rate_hz || 24000}
-                                onChange={(e) => handleChange('output_sample_rate_hz', parseInt(e.target.value))}
+                                onChange={(e) => handleChange('output_sample_rate_hz', e.target.value ? parseInt(e.target.value) : 24000)}
                             />
                             <p className="text-xs text-muted-foreground">
                                 Sample rate from Google. 24000 Hz is native for Gemini audio.
@@ -864,7 +970,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 type="number"
                                 className="w-full p-2 rounded border border-input bg-background"
                                 value={config.target_sample_rate_hz || 8000}
-                                onChange={(e) => handleChange('target_sample_rate_hz', parseInt(e.target.value))}
+                                onChange={(e) => handleChange('target_sample_rate_hz', e.target.value ? parseInt(e.target.value) : 8000)}
                             />
                             <p className="text-xs text-muted-foreground">
                                 Final sample rate for playback. 8000 Hz for standard telephony.
@@ -924,7 +1030,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 type="number"
                                 className="w-full p-2 rounded border border-input bg-background"
                                 value={config.provider_input_sample_rate_hz || 16000}
-                                onChange={(e) => handleChange('provider_input_sample_rate_hz', parseInt(e.target.value))}
+                                onChange={(e) => handleChange('provider_input_sample_rate_hz', e.target.value ? parseInt(e.target.value) : 16000)}
                             />
                             <p className="text-xs text-muted-foreground">
                                 Sample rate for Google API input. 16000 Hz is optimal for Gemini STT.
@@ -962,7 +1068,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                         </div>
                         <div className="space-y-2">
                             <div className="flex items-center gap-1.5">
-                                <label className="text-sm font-medium">Response Modalities</label>
+                                <label htmlFor="google_live_response_modalities" className="text-sm font-medium">Response Modalities</label>
                                 <HelpTooltip
                                     content={
                                         <>
@@ -971,6 +1077,7 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                                 <li><strong>Audio Only</strong> (default for voice) — TTS is generated server-side</li>
                                                 <li><strong>Text Only</strong> — no TTS; useful for chat-style integrations or external TTS pipelines</li>
                                                 <li><strong>Audio &amp; Text</strong> — both streams; enables real-time transcript display alongside playback</li>
+                                                <li><strong>Gemini 3.8 Live</strong> supports Audio Only; enable output transcription below for text.</li>
                                             </ul>
                                         </>
                                     }
@@ -979,14 +1086,21 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                                 />
                             </div>
                             <select
+                                id="google_live_response_modalities"
                                 className="w-full p-2 rounded border border-input bg-background"
-                                value={config.response_modalities || 'audio'}
+                                value={selectedModel === 'gemini-3.8-live' ? 'audio' : (config.response_modalities || 'audio')}
                                 onChange={(e) => handleChange('response_modalities', e.target.value)}
+                                disabled={selectedModel === 'gemini-3.8-live'}
                             >
                                 <option value="audio">Audio Only</option>
                                 <option value="text">Text Only</option>
                                 <option value="audio_text">Audio & Text</option>
                             </select>
+                            {selectedModel === 'gemini-3.8-live' && (
+                                <p className="text-xs text-muted-foreground">
+                                    Gemini 3.8 Live requires Audio Only. Enable output transcription below for text.
+                                </p>
+                            )}
                         </div>
                         <div className="flex items-center space-x-2">
                             <input
@@ -1077,8 +1191,8 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             <input
                                 type="number"
                                 className="w-full p-2 rounded border border-input bg-background"
-                                value={config.input_gain_target_rms || 0}
-                                onChange={(e) => handleChange('input_gain_target_rms', parseInt(e.target.value))}
+                                value={config.input_gain_target_rms ?? 0}
+                                onChange={(e) => handleChange('input_gain_target_rms', e.target.value ? parseInt(e.target.value) : 0)}
                             />
                             <p className="text-xs text-muted-foreground">Optional normalization target for inbound audio.</p>
                         </div>
@@ -1101,38 +1215,10 @@ const GoogleLiveProviderForm: React.FC<GoogleLiveProviderFormProps> = ({ config,
                             <input
                                 type="number"
                                 className="w-full p-2 rounded border border-input bg-background"
-                                value={config.input_gain_max_db || 0}
-                                onChange={(e) => handleChange('input_gain_max_db', parseInt(e.target.value))}
+                                value={config.input_gain_max_db ?? 0}
+                                onChange={(e) => handleChange('input_gain_max_db', e.target.value ? parseFloat(e.target.value) : 0)}
                             />
                             <p className="text-xs text-muted-foreground">Optional max gain applied during normalization.</p>
-                        </div>
-                        <div className="space-y-2">
-                            <div className="flex items-center gap-1.5">
-                                <label className="text-sm font-medium">Farewell Hangup Delay (seconds)</label>
-                                <HelpTooltip
-                                    content={
-                                        <>
-                                            <strong>Grace period after farewell audio</strong> finishes playing before AAVA actually hangs up the SIP channel.
-                                            <ul className="list-disc pl-4 mt-1 space-y-0.5">
-                                                <li>Prevents Asterisk from cutting off the last syllable of "Goodbye."</li>
-                                                <li>Leave blank to inherit the global default (2.5s)</li>
-                                                <li>Set to 0 only if you control exactly when audio ends</li>
-                                            </ul>
-                                        </>
-                                    }
-                                />
-                            </div>
-                            <input
-                                type="number"
-                                step="0.5"
-                                className="w-full p-2 rounded border border-input bg-background"
-                                value={config.farewell_hangup_delay_sec ?? ''}
-                                onChange={(e) => handleChange('farewell_hangup_delay_sec', e.target.value ? parseFloat(e.target.value) : null)}
-                                placeholder="Use global default (2.5s)"
-                            />
-                            <p className="text-xs text-muted-foreground">
-                                Seconds to wait after farewell audio before hanging up. Leave empty to use global default.
-                            </p>
                         </div>
                     </div>
                 </div>

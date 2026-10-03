@@ -45,6 +45,7 @@ const ProvidersPage: React.FC = () => {
     const [editingProvider, setEditingProvider] = useState<string | null>(null);
     const editingProviderRef = useRef<string | null>(null);
     const [providerForm, setProviderForm] = useState<any>({});
+    const deletedProviderFieldsRef = useRef<Set<string>>(new Set());
     const [isNewProvider, setIsNewProvider] = useState(false);
     const [testingProvider, setTestingProvider] = useState<string | null>(null);
     const [testResults, setTestResults] = useState<{ [key: string]: { success: boolean; message: string } | undefined }>({});
@@ -110,6 +111,7 @@ const ProvidersPage: React.FC = () => {
     };
 
     const updateEditingProvider = (providerKey: string | null) => {
+        deletedProviderFieldsRef.current.clear();
         editingProviderRef.current = providerKey;
         setEditingProvider(providerKey);
     };
@@ -183,7 +185,9 @@ const ProvidersPage: React.FC = () => {
             await refetch();
         } catch (err) {
             console.error('Failed to save config', err);
-            toast.error('Failed to save configuration');
+            toast.error('Failed to save configuration', {
+                description: err instanceof Error ? err.message : undefined,
+            });
         }
     };
 
@@ -355,6 +359,14 @@ const ProvidersPage: React.FC = () => {
                 local_llm: { type: 'local', capabilities: ['llm'], enabled: false, auth_token: '${LOCAL_WS_AUTH_TOKEN:-}' },
                 local_tts: { type: 'local', capabilities: ['tts'], enabled: false, ws_url: '${LOCAL_WS_URL:-ws://127.0.0.1:8765}', auth_token: '${LOCAL_WS_AUTH_TOKEN:-}' }
             },
+            google_llm: {
+                enabled: false,
+                type: 'google',
+                capabilities: ['llm'],
+                api_key_env: 'GOOGLE_API_KEY',
+                llm_base_url: 'https://generativelanguage.googleapis.com/v1',
+                llm_model: 'gemini-2.5-flash',
+            },
             telnyx_llm: {
                 enabled: false,
                 type: 'telnyx',
@@ -363,6 +375,17 @@ const ProvidersPage: React.FC = () => {
                 api_key: '${TELNYX_API_KEY}',
                 chat_model: 'Qwen/Qwen3-235B-A22B',
                 temperature: 0.7,
+                response_timeout_sec: 30.0,
+            },
+            deepseek_llm: {
+                enabled: false,
+                type: 'openai',
+                capabilities: ['llm'],
+                chat_base_url: 'https://api.deepseek.com',
+                api_key_env: 'DEEPSEEK_API_KEY',
+                chat_model: 'deepseek-v4-flash',
+                temperature: 0.3,
+                max_tokens: 200,
                 response_timeout_sec: 30.0,
             },
             azure_stt: {
@@ -638,6 +661,9 @@ const ProvidersPage: React.FC = () => {
 
         const existingData = !isNewProvider && editingProvider ? (config.providers?.[editingProvider] || {}) : {};
         let providerData = { ...existingData, ...providerForm, name: finalName, capabilities };
+        for (const field of deletedProviderFieldsRef.current) {
+            delete providerData[field];
+        }
         if (fullAgentKind === 'openai_realtime') {
             // Normalize again at the persistence boundary. Async form updates
             // (for example credential operations) can otherwise reintroduce a
@@ -754,18 +780,23 @@ const ProvidersPage: React.FC = () => {
         // a stale `providerForm` captured at render time.
         //
         // Delete semantics: a key set to `undefined` in `newValues` is treated
-        // as "remove this key from the form state". This is how the credential
-        // card signals deletion of `api_key_file` / `agent_id_file` after the
-        // user clicks Delete — without this, a shallow merge would preserve
-        // the prior path and a later form Save would write that stale
-        // reference back to YAML, pointing at a file that was just removed.
+        // as "remove this key from the form state" and retained as a tombstone
+        // until Save. This is how the credential card signals deletion of
+        // `api_key_file` / `agent_id_file` / `credentials_path` after the user
+        // clicks Delete — without the tombstone, merging with the persisted
+        // provider would restore the stale path to the file that was removed.
         // (Reported in PR #395 review.)
         const updateForm = (newValues: any) =>
             setProviderForm((prev: any) => {
                 const next: any = { ...prev };
                 for (const [k, v] of Object.entries(newValues)) {
-                    if (v === undefined) delete next[k];
-                    else next[k] = v;
+                    if (v === undefined) {
+                        delete next[k];
+                        deletedProviderFieldsRef.current.add(k);
+                    } else {
+                        next[k] = v;
+                        deletedProviderFieldsRef.current.delete(k);
+                    }
                 }
                 return next;
             });
@@ -1045,7 +1076,8 @@ const ProvidersPage: React.FC = () => {
                                         <button
                                             onClick={() => handleSetAsDefault(name)}
                                             className="p-1.5 hover:bg-accent rounded-md text-muted-foreground hover:text-foreground transition-colors"
-                                            title="Set as Default"
+                                            aria-label={`Set as default for ${name}`}
+                                            title={`Set as default for ${name}`}
                                         >
                                             <Star className="w-4 h-4" />
                                         </button>
@@ -1054,7 +1086,8 @@ const ProvidersPage: React.FC = () => {
                                         onClick={() => handleTestConnection(name, providerData)}
                                         disabled={testingProvider === name}
                                         className="p-1.5 hover:bg-accent rounded-md text-muted-foreground hover:text-foreground disabled:opacity-50 transition-colors"
-                                        title="Test Connection"
+                                        aria-label={`Test connection for ${name}`}
+                                        title={`Test connection for ${name}`}
                                     >
                                         {testingProvider === name ? (
                                             <Loader2 className="w-4 h-4 animate-spin" />
@@ -1069,14 +1102,16 @@ const ProvidersPage: React.FC = () => {
                                     <button
                                         onClick={() => handleEditProvider(name)}
                                         className="p-1.5 hover:bg-accent rounded-md text-muted-foreground hover:text-foreground transition-colors"
-                                        title="Settings"
+                                        aria-label={`Settings for ${name}`}
+                                        title={`Settings for ${name}`}
                                     >
                                         <Settings className="w-4 h-4" />
                                     </button>
                                     <button
                                         onClick={() => handleDeleteProvider(name)}
                                         className="p-1.5 hover:bg-destructive/10 rounded-md text-destructive transition-colors"
-                                        title="Delete"
+                                        aria-label={`Delete provider ${name}`}
+                                        title={`Delete provider ${name}`}
                                     >
                                         <Trash2 className="w-4 h-4" />
                                     </button>
@@ -1145,7 +1180,8 @@ const ProvidersPage: React.FC = () => {
                                         onClick={() => handleTestConnection(name, providerData)}
                                         disabled={testingProvider === name}
                                         className="p-1.5 hover:bg-accent rounded-md text-muted-foreground hover:text-foreground disabled:opacity-50 transition-colors"
-                                        title="Test Connection"
+                                        aria-label={`Test connection for ${name}`}
+                                        title={`Test connection for ${name}`}
                                     >
                                         {testingProvider === name ? (
                                             <Loader2 className="w-4 h-4 animate-spin" />
@@ -1160,14 +1196,16 @@ const ProvidersPage: React.FC = () => {
                                     <button
                                         onClick={() => handleEditProvider(name)}
                                         className="p-1.5 hover:bg-accent rounded-md text-muted-foreground hover:text-foreground transition-colors"
-                                        title="Settings"
+                                        aria-label={`Settings for ${name}`}
+                                        title={`Settings for ${name}`}
                                     >
                                         <Settings className="w-4 h-4" />
                                     </button>
                                     <button
                                         onClick={() => handleDeleteProvider(name)}
                                         className="p-1.5 hover:bg-destructive/10 rounded-md text-destructive transition-colors"
-                                        title="Delete"
+                                        aria-label={`Delete provider ${name}`}
+                                        title={`Delete provider ${name}`}
                                     >
                                         <Trash2 className="w-4 h-4" />
                                     </button>
@@ -1664,6 +1702,23 @@ const ProvidersPage: React.FC = () => {
                         <h4 className="text-sm font-medium">Modular Providers (Cloud)</h4>
                         {[
                             {
+                                id: 'google_llm',
+                                name: 'Google Gemini LLM',
+                                desc: 'Gemini models through the native Google Generative Language API',
+                                doc: 'https://ai.google.dev/gemini-api/docs',
+                                tooltip: (
+                                    <>
+                                        <strong>Google Gemini LLM</strong> — modular LLM slot for post-call summaries and pipelines.
+                                        <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                            <li>Native Google <code>generateContent</code> API</li>
+                                            <li>Default model: <code>gemini-2.5-flash</code></li>
+                                            <li>Free-tier availability depends on Google account, region, and quota</li>
+                                            <li>Requires <code>GOOGLE_API_KEY</code></li>
+                                        </ul>
+                                    </>
+                                ),
+                            },
+                            {
                                 id: 'telnyx_llm',
                                 name: 'Telnyx LLM',
                                 desc: 'Telnyx AI Inference (OpenAI-compatible /chat/completions)',
@@ -1676,6 +1731,23 @@ const ProvidersPage: React.FC = () => {
                                             <li>Default model: <code>Qwen/Qwen3-235B-A22B</code></li>
                                             <li>Pay per token (~$0.40 / 1M input)</li>
                                             <li>Requires <code>TELNYX_API_KEY</code></li>
+                                        </ul>
+                                    </>
+                                ),
+                            },
+                            {
+                                id: 'deepseek_llm',
+                                name: 'DeepSeek LLM',
+                                desc: 'DeepSeek V4 via the official OpenAI-compatible API',
+                                doc: 'https://api-docs.deepseek.com/quick_start/pricing/',
+                                tooltip: (
+                                    <>
+                                        <strong>DeepSeek LLM</strong> — modular LLM slot for post-call summaries and pipelines.
+                                        <ul className="list-disc pl-4 mt-1 space-y-0.5">
+                                            <li>Official OpenAI-compatible <code>/chat/completions</code> endpoint</li>
+                                            <li>Default model: <code>deepseek-v4-flash</code></li>
+                                            <li>Also supports <code>deepseek-v4-pro</code></li>
+                                            <li>Requires <code>DEEPSEEK_API_KEY</code></li>
                                         </ul>
                                     </>
                                 ),

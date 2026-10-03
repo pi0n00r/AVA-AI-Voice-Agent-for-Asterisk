@@ -343,6 +343,56 @@ async def test_retries_append_with_same_stable_tool_call_id_and_leave_transcript
 
 
 @pytest.mark.asyncio
+async def test_deferred_transfer_result_binds_first_tool_history_origin(monkeypatch):
+    store = SessionStore()
+    legacy_append = AsyncMock(
+        side_effect=AssertionError("combined append-and-bind helper must be used")
+    )
+    monkeypatch.setattr(store, "append_tool_call_if_active", legacy_append)
+    session = CallSession(
+        call_id="call-deferred-origin",
+        caller_channel_id="caller-deferred-origin",
+    )
+    session.pending_deferred_transfer = {
+        "id": "action-deferred-origin",
+        "kind": "transfer",
+        "source_tool": "blind_transfer",
+        "target": "6000",
+    }
+    await store.upsert_call(session)
+    result = {
+        "status": "success",
+        "message": "Transferring you now.",
+        "destination": "6000",
+        "deferred_transfer": dict(session.pending_deferred_transfer),
+    }
+
+    await record_in_call_tool_result(
+        session_store=store,
+        call_id=session.call_id,
+        tool_call_id="provider-transfer-origin",
+        tool_name="blind_transfer",
+        parameters={"destination": "support"},
+        result=result,
+    )
+    await record_in_call_tool_result(
+        session_store=store,
+        call_id=session.call_id,
+        tool_call_id="provider-transfer-duplicate",
+        tool_name="blind_transfer",
+        parameters={"destination": "support"},
+        result=result,
+    )
+
+    assert session.pending_deferred_transfer["_tool_history_origin"] == {
+        "tool_call_id": "provider-transfer-origin",
+        "name": "blind_transfer",
+        "params": {"destination": "***REDACTED***"},
+    }
+    legacy_append.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_record_construction_failure_is_best_effort():
     store = SimpleNamespace(
         get_by_call_id=AsyncMock(),
@@ -415,3 +465,12 @@ async def test_late_tool_result_does_not_resurrect_removed_session():
     assert recorded is None
     assert await store.get_by_call_id("ended") is None
     assert session.tool_calls == []
+
+
+def test_microsoft_attendee_list_and_booking_notes_are_redacted():
+    parameters = {"action": "create_event", "attendee_emails": ["caller@example.com"], "meeting_purpose": "Private reason", "confirmed_notes": "Private details"}
+    record = build_in_call_tool_record(call_id="synthetic", tool_call_id="synthetic-operation", tool_name="microsoft_calendar", parameters=parameters, result={"status": "success"})
+    assert record["params"]["attendee_emails"] == "***REDACTED***"
+    assert record["params"]["meeting_purpose"] == "***REDACTED***"
+    assert record["params"]["confirmed_notes"] == "***REDACTED***"
+    assert parameters["attendee_emails"] == ["caller@example.com"]

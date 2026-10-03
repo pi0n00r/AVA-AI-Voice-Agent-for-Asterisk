@@ -928,31 +928,6 @@ const OpenAIRealtimeProviderForm: React.FC<OpenAIRealtimeProviderFormProps> = ({
                             onChange={(e) => handleChange('input_gain_max_db', parseFloat(e.target.value))}
                         />
                     </div>
-                    <div className="space-y-2">
-                        <div className="flex items-center gap-1.5">
-                            <label className="text-sm font-medium">Farewell Hangup Delay (seconds)</label>
-                            <HelpTooltip
-                                content={
-                                    <>
-                                        <strong>Farewell Hangup Delay</strong> — how long the engine waits after the agent's final words before tearing down the call.
-                                        <ul className="list-disc pl-4 mt-1 space-y-0.5">
-                                            <li>Leave blank to inherit the global default (<code>2.5s</code>)</li>
-                                            <li><code>1.5</code>–<code>2.5</code>s — typical; covers the tail of TTS plus a beat of silence</li>
-                                            <li>Too low: caller hears their last word clipped; too high: awkward dead air before disconnect</li>
-                                        </ul>
-                                    </>
-                                }
-                            />
-                        </div>
-                        <input
-                            type="number"
-                            step="0.5"
-                            className="w-full p-2 rounded border border-input bg-background"
-                            value={config.farewell_hangup_delay_sec ?? ''}
-                            onChange={(e) => handleChange('farewell_hangup_delay_sec', e.target.value ? parseFloat(e.target.value) : null)}
-                            placeholder="Use global default (2.5s)"
-                        />
-                    </div>
                 </div>
             </div>
         </div>

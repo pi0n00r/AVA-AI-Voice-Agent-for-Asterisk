@@ -16,10 +16,13 @@ from pydantic import (
     model_validator,
 )
 from typing import Dict, Any, Literal, Optional, List
+import ipaddress
 import re
 import structlog
 
 from src.utils.diagnostic_paths import DEFAULT_DIAGNOSTIC_TAP_DIR
+from src.media_transport_capabilities import supports_media_websocket, resolve_media_websocket_control
+from src.fish_audio_url import validate_fish_audio_base_url, validate_fish_audio_ws_url
 
 # Import configuration helpers (AAVA-40 refactor)
 from src.config.loaders import resolve_config_path, load_yaml_with_env_expansion, load_yaml_with_local_override
@@ -97,6 +100,152 @@ class AudioSocketConfig(BaseModel):
     format: str = Field(default="ulaw")  # 'ulaw' or 'slin16'
 
 
+def media_websocket_capability_reason(version: Optional[str], requested: str = "json") -> str:
+    """Give a safe, operator-facing explanation of a websocket version gate."""
+    mode = resolve_media_websocket_control(version, requested)
+    if mode == "plain":
+        return "Experimental plain controls selected for Asterisk 20.17.0; provider/pipeline live qualification is required."
+    if mode == "json":
+        return "Asterisk release meets the JSON Media WebSocket compatibility floor."
+    if not str(version or "").strip():
+        return "Asterisk version is unavailable; WebSocket activation must fail closed."
+    if requested != "json":
+        return "Requested WebSocket protocol is unsupported on this version. Auto permits JSON on 20.18+/22.8+/23.2+ or experimental plain on exactly 20.17.0; plain is restricted to 20.17.0."
+    return (
+        "WebSocket requires JSON-control support: Asterisk 20.18+, 22.8+, or "
+        "23.2+. Asterisk 21.x and un-certified release lines are not supported."
+    )
+
+
+class WebSocketMediaAuthConfig(BaseModel):
+    """Credential reference only; the secret is always supplied by ai_engine env."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    required: bool = Field(default=True)
+    username: str = Field(
+        default="aava_media",
+        min_length=1,
+        max_length=128,
+        pattern=r"^[^\s:\x00-\x1f\x7f]+$",
+    )
+    password_env: str = Field(
+        default="ASTERISK_MEDIA_WS_PASSWORD",
+        pattern=r"^[A-Z_][A-Z0-9_]*$",
+        max_length=128,
+    )
+
+
+class WebSocketMediaTLSConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(default=False)
+    cert_file: Optional[str] = Field(default=None, max_length=1024)
+    key_file: Optional[str] = Field(default=None, max_length=1024)
+
+    @model_validator(mode="after")
+    def _validate_certificate_pair(self) -> "WebSocketMediaTLSConfig":
+        if self.enabled and (not self.cert_file or not self.key_file):
+            raise ValueError("websocket_media.tls requires cert_file and key_file when enabled")
+        if not self.enabled and (self.cert_file or self.key_file):
+            raise ValueError("websocket_media.tls cert_file/key_file require tls.enabled=true")
+        return self
+
+
+class WebSocketMediaConfig(BaseModel):
+    """Asterisk-outbound Media WebSocket listener configuration for v1.
+
+    This model is intentionally strict independently of the project-wide config
+    schema: a typo in an inactive listener block must not become a surprising
+    active listener after a later transport switch.  It contains an env-var
+    reference, never a password value.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    connection_mode: Literal["asterisk_outbound"] = "asterisk_outbound"
+    connection_name: str = Field(
+        default="aava_media",
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
+    bind_host: str = Field(default="127.0.0.1", min_length=1, max_length=255)
+    advertise_host: str = Field(default="127.0.0.1", min_length=1, max_length=255)
+    port: int = Field(default=8787, ge=1024, le=65535)
+    path: str = Field(default="/media", min_length=1, max_length=256)
+    format_policy: Literal["profile"] = "profile"
+    fallback_format: Literal["ulaw", "alaw", "slin", "slin16"] = "ulaw"
+    control_format: Literal["json", "auto", "plain"] = "json"
+    direction: Literal["both"] = "both"
+    handshake_timeout_ms: int = Field(default=5000, ge=100, le=60000)
+    media_start_timeout_ms: int = Field(default=5000, ge=100, le=60000)
+    drain_timeout_ms: int = Field(default=30000, ge=1000, le=120000)
+    pre_start_buffer_ms: int = Field(default=200, ge=0, le=5000)
+    max_connections: int = Field(default=100, ge=1, le=10000)
+    # These two limits keep the listener bounded even while Asterisk is under
+    # backpressure. They are intentionally not exposed in the v1 UI.
+    max_input_queue_frames: int = Field(default=32, ge=1, le=1000)
+    max_message_bytes: int = Field(default=65500, ge=160, le=65500)
+    allowed_remote_hosts: List[str] = Field(default_factory=lambda: ["127.0.0.1"])
+    auth: WebSocketMediaAuthConfig = Field(default_factory=WebSocketMediaAuthConfig)
+    tls: WebSocketMediaTLSConfig = Field(default_factory=WebSocketMediaTLSConfig)
+
+    @field_validator("path")
+    @classmethod
+    def _validate_path(cls, value: str) -> str:
+        if (
+            not value.startswith("/")
+            or "?" in value
+            or "#" in value
+            or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value)
+        ):
+            raise ValueError("websocket_media.path must be an absolute path without query or fragment")
+        return value
+
+    @field_validator("bind_host", "advertise_host")
+    @classmethod
+    def _validate_listener_host(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized or any(char.isspace() or char in "/?#@" for char in normalized):
+            raise ValueError("websocket_media listener hosts must be bare hostnames or IP literals")
+        return normalized
+
+    @field_validator("allowed_remote_hosts")
+    @classmethod
+    def _validate_allowed_hosts(cls, value: List[str]) -> List[str]:
+        normalized = [str(host).strip() for host in value if str(host).strip()]
+        if not normalized:
+            raise ValueError("websocket_media.allowed_remote_hosts must contain at least one host")
+        for host in normalized:
+            try:
+                ipaddress.ip_address(host)
+            except ValueError:
+                if host.lower() != "localhost":
+                    raise ValueError(
+                        "websocket_media.allowed_remote_hosts must contain IP literals or localhost"
+                    )
+        return normalized
+
+    @model_validator(mode="after")
+    def _validate_network_security(self) -> "WebSocketMediaConfig":
+        def is_loopback(host: str) -> bool:
+            if host.lower() == "localhost":
+                return True
+            try:
+                return ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                # A hostname may resolve to a remote endpoint, so treat it as
+                # non-loopback for the authentication requirement.
+                return False
+
+        if (not is_loopback(self.bind_host) or not is_loopback(self.advertise_host)) and not self.auth.required:
+            raise ValueError(
+                "websocket_media.auth.required must be true for non-loopback listener addresses"
+            )
+        return self
+
+
 class LocalProviderConfig(BaseModel):
     enabled: bool = Field(default=True)
     # base_url is preferred for full agent mode (consistent with other providers)
@@ -126,10 +275,12 @@ class LocalProviderConfig(BaseModel):
     # Set based on your hardware speed (see LLM warmup time in logs)
     # Fast hardware: 5-10s, Slow hardware: 30-60s
     farewell_timeout_sec: float = Field(default=30.0)
-    # Farewell hangup delay - seconds to wait after farewell audio completes before hangup
-    # Ensures farewell message fully plays through RTP pipeline before disconnecting
-    # Increase if farewell gets cut off (typical farewells need 2-4 seconds)
-    farewell_hangup_delay_sec: float = Field(default=5.0)
+    # Deprecated compatibility field; terminal hangup uses audio drain instead.
+    farewell_hangup_delay_sec: float = Field(
+        default=5.0,
+        description="Deprecated and ignored; farewell hangup waits for caller-facing audio drain.",
+        deprecated=True,
+    )
     # Local tool-call handling policy:
     # - auto: derive from local_ai_server LLM capability probe
     # - strict: enforce full structured tool instructions
@@ -232,8 +383,12 @@ class DeepgramProviderConfig(BaseModel):
     voice_agent_base_url: str = Field(
         default="wss://agent.deepgram.com/v1/agent/converse"
     )
-    # Provider-specific farewell hangup delay (overrides global)
-    farewell_hangup_delay_sec: Optional[float] = None
+    # Deprecated compatibility field; ignored by terminal audio drain.
+    farewell_hangup_delay_sec: Optional[float] = Field(
+        default=None,
+        description="Deprecated and ignored; farewell hangup waits for caller-facing audio drain.",
+        deprecated=True,
+    )
 
     @model_validator(mode="after")
     def _validate_flux_thresholds(self) -> "DeepgramProviderConfig":
@@ -262,6 +417,8 @@ class DeepgramProviderConfig(BaseModel):
 class OpenAIProviderConfig(BaseModel):
     """# Milestone7: Canonical defaults for OpenAI pipeline adapters."""
     api_key: Optional[str] = None
+    api_key_file: Optional[str] = None
+    api_key_env: Optional[str] = None
     organization: Optional[str] = None
     project: Optional[str] = None
     tools_enabled: bool = Field(default=True)
@@ -298,8 +455,12 @@ class OpenAIProviderConfig(BaseModel):
     output_resampler: Literal["inherit", "linear", "bandlimited"] = Field(default="inherit")
     chunk_size_ms: int = Field(default=20)
     response_timeout_sec: float = Field(default=5.0)
-    # Provider-specific farewell hangup delay (overrides global)
-    farewell_hangup_delay_sec: Optional[float] = None
+    # Deprecated compatibility field; ignored by terminal audio drain.
+    farewell_hangup_delay_sec: Optional[float] = Field(
+        default=None,
+        description="Deprecated and ignored; farewell hangup waits for caller-facing audio drain.",
+        deprecated=True,
+    )
 
 
 class TelnyxLLMProviderConfig(BaseModel):
@@ -315,6 +476,8 @@ class TelnyxLLMProviderConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     api_key: Optional[str] = None
+    api_key_file: Optional[str] = None
+    api_key_env: Optional[str] = None
     api_key_ref: Optional[str] = None
 
     chat_base_url: str = Field(default="https://api.telnyx.com/v2/ai")
@@ -343,6 +506,8 @@ class MiniMaxLLMProviderConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     api_key: Optional[str] = None
+    api_key_file: Optional[str] = None
+    api_key_env: Optional[str] = None
 
     chat_base_url: str = Field(default="https://api.minimax.io/v1")
     chat_model: str = Field(default="MiniMax-M3")
@@ -387,6 +552,9 @@ class GoogleProviderConfig(BaseModel):
     vad_start_of_speech_sensitivity: Optional[str] = Field(default="START_SENSITIVITY_HIGH")
     vad_prefix_padding_ms: int = Field(default=20, ge=0)
     vad_silence_duration_ms: int = Field(default=500, ge=0)
+    # Gemini 3.8 Live: let its server-side VAD hear the caller during playback.
+    # Disable to restore the legacy silence-gated behavior without changing 2.5.
+    full_duplex_barge_in_3_8: bool = Field(default=True)
 
     # Google Live response configuration
     response_modalities: str = Field(default="audio")  # "audio", "text", or "audio_text"
@@ -411,8 +579,12 @@ class GoogleProviderConfig(BaseModel):
     websocket_endpoint: str = Field(
         default="wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
     )
-    # Provider-specific farewell hangup delay (overrides global)
-    farewell_hangup_delay_sec: Optional[float] = None
+    # Deprecated compatibility field; ignored by terminal audio drain.
+    farewell_hangup_delay_sec: Optional[float] = Field(
+        default=None,
+        description="Deprecated and ignored; farewell hangup waits for caller-facing audio drain.",
+        deprecated=True,
+    )
     # Fallback watchdog tuning (Google Live only)
     hangup_fallback_audio_idle_sec: float = Field(default=1.25)
     hangup_fallback_min_armed_sec: float = Field(default=0.8)
@@ -496,8 +668,12 @@ class ElevenLabsProviderConfig(BaseModel):
     similarity_boost: float = Field(default=0.75)
     style: float = Field(default=0.0)
     use_speaker_boost: bool = Field(default=True)
-    # Provider-specific farewell hangup delay (overrides global)
-    farewell_hangup_delay_sec: Optional[float] = None
+    # Deprecated compatibility field; ignored by terminal audio drain.
+    farewell_hangup_delay_sec: Optional[float] = Field(
+        default=None,
+        description="Deprecated and ignored; farewell hangup waits for caller-facing audio drain.",
+        deprecated=True,
+    )
 
 
 class CambAiProviderConfig(BaseModel):
@@ -517,8 +693,79 @@ class CambAiProviderConfig(BaseModel):
     # Output format for streaming TTS
     output_format: str = Field(default="pcm_s16le")  # pcm_s16le for raw PCM
     output_resampler: Literal["inherit", "linear", "bandlimited"] = Field(default="inherit")
-    # Provider-specific farewell hangup delay (overrides global)
-    farewell_hangup_delay_sec: Optional[float] = None
+    # Deprecated compatibility field; ignored by terminal audio drain.
+    farewell_hangup_delay_sec: Optional[float] = Field(
+        default=None,
+        description="Deprecated and ignored; farewell hangup waits for caller-facing audio drain.",
+        deprecated=True,
+    )
+
+
+class FishAudioProviderConfig(BaseModel):
+    """Fish Audio TTS provider configuration.
+
+    Fish Audio streams raw PCM at a requested sample rate, so a telephone call
+    can be served at 8 kHz without an intermediate resample.
+
+    API Reference: https://docs.fish.audio/api-reference/endpoint/openapi-v1/text-to-speech
+    """
+    enabled: bool = Field(default=True)
+    api_key: Optional[str] = None
+    api_key_file: Optional[str] = None
+    api_key_env: Optional[str] = None
+    base_url: str = Field(default="https://api.fish.audio/v1")
+    # http posts one request per fragment; websocket keeps one realtime session
+    # per turn and receives the text as the engine produces it.
+    transport: Literal["http", "websocket"] = Field(default="http")
+    # Defaults to base_url with a ws/wss scheme; override to reach a local mock.
+    ws_base_url: Optional[str] = None
+    # Speech model, sent as the `model` request header.
+    model: str = Field(default="s2.1-pro")  # also: s1, s2-pro, s2.1-pro-free, drama-3-preview
+    # Voice model id from the Fish Audio library. The adapter supports the
+    # reference_id request form, so a value is required before synthesis.
+    reference_id: Optional[str] = None
+    # Raw PCM streams chunk by chunk; wav is buffered and decoded.
+    audio_format: Literal["pcm", "wav"] = Field(default="pcm")
+    # None follows the call: 8 kHz on telephony, 16 kHz on wideband transports.
+    sample_rate: Optional[int] = None
+    latency: Literal["low", "normal", "balanced"] = Field(default="low")
+    chunk_length: int = Field(default=200, ge=100, le=300)
+    normalize: bool = Field(default=True)
+    temperature: float = Field(default=0.7, ge=0.0, le=1.0)
+    top_p: float = Field(default=0.7, ge=0.0, le=1.0)
+    # Prosody overrides; None leaves the model default.
+    speed: Optional[float] = None
+    volume: Optional[float] = None
+    output_resampler: Literal["inherit", "linear", "bandlimited"] = Field(default="inherit")
+    # Connection establishment and inter-chunk budgets. There is deliberately
+    # no whole-request deadline: a healthy synthesis may stream longer than the
+    # read budget in aggregate as long as audio continues arriving.
+    connect_timeout_sec: float = Field(default=10.0, gt=0)
+    read_timeout_sec: float = Field(default=30.0, gt=0)
+    # Deprecated compatibility field; ignored by terminal audio drain.
+    farewell_hangup_delay_sec: Optional[float] = Field(
+        default=None,
+        description="Deprecated and ignored; farewell hangup waits for caller-facing audio drain.",
+        deprecated=True,
+    )
+
+    @field_validator("base_url")
+    @classmethod
+    def _validate_base_url(cls, value: str) -> str:
+        try:
+            return validate_fish_audio_base_url(value)
+        except RuntimeError as exc:
+            raise ValueError(str(exc)) from exc
+
+    @field_validator("ws_base_url")
+    @classmethod
+    def _validate_ws_base_url(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            return validate_fish_audio_ws_url(value)
+        except RuntimeError as exc:
+            raise ValueError(str(exc)) from exc
 
 
 _AZURE_REGION_RE = re.compile(r"^[a-z][a-z0-9-]{0,48}[a-z0-9]$")
@@ -1087,10 +1334,13 @@ class AppConfig(BaseModel):
     providers: Dict[str, Any]
     asterisk: AsteriskConfig
     llm: LLMConfig
-    audio_transport: str = Field(default="externalmedia")  # 'externalmedia' | 'legacy'
+    audio_transport: Literal["externalmedia", "audiosocket", "websocket"] = Field(
+        default="externalmedia"
+    )
     downstream_mode: str = Field(default="stream")  # 'file' | 'stream'
     external_media: Optional[ExternalMediaConfig] = Field(default_factory=ExternalMediaConfig)
     audiosocket: Optional[AudioSocketConfig] = Field(default_factory=AudioSocketConfig)
+    websocket_media: WebSocketMediaConfig = Field(default_factory=WebSocketMediaConfig)
     vad: Optional[VADConfig] = Field(default_factory=VADConfig)
     no_input: Optional[NoInputConfig] = Field(default_factory=NoInputConfig)
     streaming: Optional[StreamingConfig] = Field(default_factory=StreamingConfig)
@@ -1109,10 +1359,12 @@ class AppConfig(BaseModel):
     in_call_tools: Dict[str, Any] = Field(default_factory=dict)
     # MCP tool configuration (experimental)
     mcp: Optional[MCPConfig] = None
-    # Farewell hangup delay - seconds to wait after farewell audio completes before hangup
-    # Ensures farewell message fully plays through RTP pipeline before disconnecting
-    # Increase if farewell gets cut off (typical farewells need 2-4 seconds)
-    farewell_hangup_delay_sec: float = Field(default=5.0)
+    # Deprecated compatibility field; terminal hangup uses audio drain instead.
+    farewell_hangup_delay_sec: float = Field(
+        default=5.0,
+        description="Deprecated and ignored; farewell hangup waits for caller-facing audio drain.",
+        deprecated=True,
+    )
 
     # HIGH-3: behavior when the AI provider fails to start a session on an
     # already-answered channel. "announce_hangup" (default) plays a short error
@@ -1553,6 +1805,37 @@ def validate_production_config(config: AppConfig) -> tuple[list[str], list[str]]
             format_val = getattr(config.audiosocket, 'format', None)
             if format_val and format_val not in ['slin', 'slin16', 'slin24', 'ulaw', 'alaw']:
                 errors.append(f"Invalid audiosocket format: {format_val} (must be slin, slin16, slin24, ulaw, or alaw)")
+
+        # The inactive WebSocket block is deliberately allowed to exist without
+        # an injected secret. Once selected, the ai_engine process must have the
+        # referenced credential; do not look for it during Admin-UI YAML saves.
+        if getattr(config, "audio_transport", None) == "websocket":
+            websocket_media = getattr(config, "websocket_media", None)
+            auth = getattr(websocket_media, "auth", None)
+            password_env = str(getattr(auth, "password_env", "") or "").strip()
+            if bool(getattr(auth, "required", True)) and (
+                not password_env or not os.getenv(password_env, "").strip()
+            ):
+                errors.append(
+                    "audio_transport=websocket requires the ai_engine environment "
+                    f"variable {password_env or 'ASTERISK_MEDIA_WS_PASSWORD'}"
+                )
+
+            tls = getattr(websocket_media, "tls", None)
+            bind_host = str(getattr(websocket_media, "bind_host", "") or "")
+            advertise_host = str(getattr(websocket_media, "advertise_host", "") or "")
+            try:
+                non_loopback = any(
+                    host.lower() != "localhost" and not ipaddress.ip_address(host).is_loopback
+                    for host in (bind_host, advertise_host)
+                )
+            except ValueError:
+                non_loopback = True
+            if non_loopback and not bool(getattr(tls, "enabled", False)):
+                warnings.append(
+                    "WebSocket listener uses a non-loopback address without TLS; "
+                    "use wss with a trusted certificate for routed or untrusted networks"
+                )
         
         # Provider API keys validation (non-blocking for local-only setups)
         has_openai = bool(os.getenv('OPENAI_API_KEY'))
@@ -1694,8 +1977,6 @@ def validate_production_config(config: AppConfig) -> tuple[list[str], list[str]]
                         allowed = getattr(config.external_media, "allowed_remote_hosts", None)
                         allowed_list = [str(x).strip() for x in (allowed or []) if str(x).strip()]
                         asterisk_host = str(getattr(getattr(config, "asterisk", None), "host", "") or "").strip()
-
-                        import ipaddress  # local import to avoid global dependency assumptions
 
                         asterisk_host_is_ip = False
                         try:

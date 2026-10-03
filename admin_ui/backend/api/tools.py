@@ -4,7 +4,7 @@ Tools API endpoints for testing HTTP tools before saving.
 import asyncio
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 from typing import Dict, Any, Optional, List, Literal
 import httpx
 import json
@@ -16,6 +16,7 @@ import time
 import ipaddress
 import socket
 import yaml
+from string import Formatter
 from urllib.parse import urlparse, urljoin
 from settings import get_setting
 from . import config as config_api
@@ -912,6 +913,7 @@ BUILTIN_RESERVED_TOOL_NAMES = frozenset({
     "transfer", "attended_transfer", "cancel_transfer", "hangup_call",
     "leave_voicemail", "check_extension_status",
     "send_email_summary", "request_transcript",
+    "update_call_metadata",
     "google_calendar", "microsoft_calendar",
     # Engine-registered tool names the AI calls (may differ from config keys).
     "transfer_call", "transfer_to_queue", "live_agent_transfer",
@@ -941,10 +943,14 @@ _PASSTHROUGH_FIELDS = (
     "body_template",
     "payload_template",
     "output_variables",
+    "call_metadata_fields",
     "hold_audio_file",
     "hold_audio_threshold_ms",
     "generate_summary",
+    "summary_provider",
     "summary_max_words",
+    "summary_timeout_ms",
+    "summary_prompt",
     "description",
     "return_raw_json",
     "direct_response_json_path",
@@ -1001,6 +1007,25 @@ class ManagedToolParameter(BaseModel):
     required: bool = False
 
 
+class ManagedCallMetadataField(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    persist: StrictBool = False
+    correctable: StrictBool = False
+    description: str = ""
+    max_length: int = 1024
+
+    @model_validator(mode="after")
+    def validate_policy(self):
+        if self.correctable and not self.persist:
+            raise ValueError("correctable requires persist=true")
+        if len(self.description) > 240:
+            raise ValueError("description must be 240 characters or fewer")
+        if not 1 <= self.max_length <= 1024:
+            raise ValueError("max_length must be between 1 and 1024")
+        return self
+
+
 class ManagedToolWrite(BaseModel):
     """Body for create (POST) and full replace (PUT)."""
     name: Optional[str] = None  # required for POST; taken from path on PUT
@@ -1016,10 +1041,14 @@ class ManagedToolWrite(BaseModel):
     body_template: Optional[str] = None
     payload_template: Optional[str] = None
     output_variables: Optional[Dict[str, str]] = None
+    call_metadata_fields: Optional[Dict[str, ManagedCallMetadataField]] = None
     hold_audio_file: Optional[str] = None
     hold_audio_threshold_ms: Optional[int] = None
     generate_summary: Optional[bool] = None
+    summary_provider: Optional[str] = None
     summary_max_words: Optional[int] = None
+    summary_timeout_ms: Optional[int] = None
+    summary_prompt: Optional[str] = None
     description: Optional[str] = None
     parameters: Optional[List[ManagedToolParameter]] = None
     return_raw_json: Optional[bool] = None
@@ -1043,6 +1072,45 @@ class ManagedToolWrite(BaseModel):
     def validate_timeout(cls, value: Optional[int]) -> Optional[int]:
         return _validate_managed_tool_timeout(value)
 
+    @field_validator("summary_max_words")
+    @classmethod
+    def validate_summary_words(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None and not 10 <= value <= 1000:
+            raise ValueError("summary_max_words must be between 10 and 1000")
+        return value
+
+    @field_validator("summary_timeout_ms")
+    @classmethod
+    def validate_summary_timeout(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None and not 1000 <= value <= 120000:
+            raise ValueError("summary_timeout_ms must be between 1000 and 120000")
+        return value
+
+    @field_validator("summary_provider")
+    @classmethod
+    def validate_summary_provider(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}_llm", normalized):
+            raise ValueError("summary_provider must reference a configured *_llm component")
+        return normalized
+
+    @field_validator("summary_prompt")
+    @classmethod
+    def validate_summary_prompt(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if not value.strip() or len(value) > 8000:
+            raise ValueError("summary_prompt must be between 1 and 8000 characters")
+        try:
+            fields = {name for _, name, _, _ in Formatter().parse(value) if name is not None}
+        except ValueError as exc:
+            raise ValueError("summary_prompt contains invalid braces") from exc
+        if fields - {"max_words"}:
+            raise ValueError("summary_prompt only supports the {max_words} placeholder")
+        return value
+
 
 class ManagedToolPatch(BaseModel):
     """Body for partial update (PATCH). All fields optional."""
@@ -1058,10 +1126,14 @@ class ManagedToolPatch(BaseModel):
     body_template: Optional[str] = None
     payload_template: Optional[str] = None
     output_variables: Optional[Dict[str, str]] = None
+    call_metadata_fields: Optional[Dict[str, ManagedCallMetadataField]] = None
     hold_audio_file: Optional[str] = None
     hold_audio_threshold_ms: Optional[int] = None
     generate_summary: Optional[bool] = None
+    summary_provider: Optional[str] = None
     summary_max_words: Optional[int] = None
+    summary_timeout_ms: Optional[int] = None
+    summary_prompt: Optional[str] = None
     description: Optional[str] = None
     parameters: Optional[List[ManagedToolParameter]] = None
     return_raw_json: Optional[bool] = None
@@ -1086,6 +1158,26 @@ class ManagedToolPatch(BaseModel):
     @classmethod
     def validate_timeout(cls, value: Optional[int]) -> Optional[int]:
         return _validate_managed_tool_timeout(value)
+
+    @field_validator("summary_max_words")
+    @classmethod
+    def validate_summary_words(cls, value: Optional[int]) -> Optional[int]:
+        return ManagedToolWrite.validate_summary_words(value)
+
+    @field_validator("summary_timeout_ms")
+    @classmethod
+    def validate_summary_timeout(cls, value: Optional[int]) -> Optional[int]:
+        return ManagedToolWrite.validate_summary_timeout(value)
+
+    @field_validator("summary_provider")
+    @classmethod
+    def validate_summary_provider(cls, value: Optional[str]) -> Optional[str]:
+        return ManagedToolWrite.validate_summary_provider(value)
+
+    @field_validator("summary_prompt")
+    @classmethod
+    def validate_summary_prompt(cls, value: Optional[str]) -> Optional[str]:
+        return ManagedToolWrite.validate_summary_prompt(value)
 
     @model_validator(mode="after")
     def reject_null_required_fields(self):
@@ -1283,6 +1375,19 @@ def _build_tool_doc(data: Dict[str, Any], phase: str) -> Dict[str, Any]:
         doc["parameters"] = [
             p if isinstance(p, dict) else p.model_dump() for p in params
         ]
+    raw_metadata_fields = doc.get("call_metadata_fields")
+    if raw_metadata_fields is not None:
+        if phase != "pre_call":
+            raise HTTPException(status_code=422, detail="call_metadata_fields is only valid for pre-call tools")
+        from src.core.call_metadata import CallMetadataValidationError, normalize_call_metadata_policy
+
+        try:
+            doc["call_metadata_fields"] = normalize_call_metadata_policy(
+                raw_metadata_fields,
+                output_variables=doc.get("output_variables") or {},
+            )
+        except CallMetadataValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     return doc
 
 
@@ -1348,6 +1453,38 @@ def _to_out(
     )
 
 
+async def _validate_summary_provider_selection(doc: Dict[str, Any]) -> None:
+    """Reject an explicit summary provider that cannot run before persistence."""
+    if not doc.get("generate_summary"):
+        return
+    provider_key = str(doc.get("summary_provider") or "").strip()
+    if not provider_key:
+        # Preserve the legacy OpenAI fallback for existing API-managed configs.
+        return
+
+    catalog = await config_api.get_llm_provider_options()
+    options = catalog.get("providers", []) if isinstance(catalog, dict) else []
+    selected = next(
+        (item for item in options if isinstance(item, dict) and item.get("key") == provider_key),
+        None,
+    )
+    if selected is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Summary provider '{provider_key}' is not configured or enabled",
+        )
+    if not selected.get("enabled", True):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Summary provider '{provider_key}' is disabled",
+        )
+    if not selected.get("ready"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Summary provider '{provider_key}' has no usable credentials",
+        )
+
+
 @router.get("/managed", response_model=List[ManagedToolOut])
 async def list_managed_tools():
     """List operator-managed HTTP tools (pre_call lookups, in_call tools, post_call webhooks)."""
@@ -1367,6 +1504,7 @@ async def create_managed_tool(body: ManagedToolWrite):
 
     block = _block_for_phase(body.phase)
     doc = _build_tool_doc(body.model_dump(exclude_none=True), body.phase)
+    await _validate_summary_provider_selection(doc)
 
     section = cfg.setdefault(block, {})
     if not isinstance(section, dict):
@@ -1398,6 +1536,7 @@ async def replace_managed_tool(name: str, body: ManagedToolWrite):
 
     target_block = _block_for_phase(body.phase)
     doc = _build_tool_doc(body.model_dump(exclude_none=True), body.phase)
+    await _validate_summary_provider_selection(doc)
 
     _remove_tool_everywhere(cfg, name)
     section = cfg.setdefault(target_block, {})
@@ -1445,6 +1584,22 @@ async def patch_managed_tool(name: str, body: ManagedToolPatch):
     if merged["method"] not in _BODY_CAPABLE_HTTP_METHODS:
         merged.pop("body_template", None)
         merged.pop("payload_template", None)
+
+    raw_metadata_fields = merged.get("call_metadata_fields")
+    if raw_metadata_fields is not None:
+        if new_phase != "pre_call":
+            raise HTTPException(status_code=422, detail="call_metadata_fields is only valid for pre-call tools")
+        from src.core.call_metadata import CallMetadataValidationError, normalize_call_metadata_policy
+
+        try:
+            merged["call_metadata_fields"] = normalize_call_metadata_policy(
+                raw_metadata_fields,
+                output_variables=merged.get("output_variables") or {},
+            )
+        except CallMetadataValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    await _validate_summary_provider_selection(merged)
 
     target_block = _block_for_phase(new_phase)
     _remove_tool_everywhere(cfg, name)
@@ -1503,7 +1658,7 @@ BUILTIN_TOOL_NAMES = (
 )
 _BUILTIN_TOOL_SET = frozenset(BUILTIN_TOOL_NAMES)
 
-# Root-level config key the Admin UI exposes in the built-in tools section.
+# Deprecated root-level key retained for existing API clients and saved YAML.
 _FAREWELL_DELAY_KEY = "farewell_hangup_delay_sec"
 
 
@@ -1516,7 +1671,11 @@ class BuiltinToolOut(BaseModel):
 
 class ToolsSettingsOut(BaseModel):
     """Tools-block scalar/structural settings that are not individual tools."""
-    farewell_hangup_delay_sec: Optional[float] = None
+    farewell_hangup_delay_sec: Optional[float] = Field(
+        default=None,
+        description="Deprecated and ignored by the engine; retained for compatibility.",
+        deprecated=True,
+    )
     settings: Dict[str, Any]  # remaining tools-block keys (extensions, default_action_timeout, ...)
 
 
@@ -1627,7 +1786,7 @@ async def replace_builtin_tool(name: str, body: Dict[str, Any]):
 async def get_tools_settings():
     """Read tools-block settings that are not individual tools.
 
-    Includes the root-level ``farewell_hangup_delay_sec`` and any tools-block
+    Includes the deprecated, runtime-ignored root-level ``farewell_hangup_delay_sec`` and any tools-block
     keys that are neither built-in nor managed HTTP tools (e.g. ``extensions``,
     ``default_action_timeout``).
     """
@@ -1643,7 +1802,8 @@ async def get_tools_settings():
 async def patch_tools_settings(body: Dict[str, Any]):
     """Update tools-block settings.
 
-    ``farewell_hangup_delay_sec`` (if present) is written at config root; all
+    ``farewell_hangup_delay_sec`` is deprecated and ignored by the engine.
+    For compatibility, it is still written at config root when present; all
     other keys are deep-merged into the tools block. Set a key to ``null`` to
     remove it.
     """

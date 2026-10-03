@@ -4,10 +4,13 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 import { describe, expect, it, vi } from 'vitest';
 
+import GoogleLiveProviderForm from './GoogleLiveProviderForm';
 import DeepgramProviderForm from './DeepgramProviderForm';
 import ElevenLabsProviderForm from './ElevenLabsProviderForm';
 import OpenAIRealtimeProviderForm from './OpenAIRealtimeProviderForm';
 import { enforceOpenAIRealtimeGaAudioContract } from '../../../utils/providerAudioContracts';
+
+vi.mock('axios', () => ({ default: { get: vi.fn().mockResolvedValue({ data: {} }) } }));
 
 vi.mock('../../../hooks/useConfirmDialog', () => ({
     useConfirmDialog: () => ({ confirm: vi.fn() }),
@@ -104,5 +107,24 @@ describe('provider audio displayed defaults', () => {
             output_sample_rate_hz: 8000,
         };
         expect(enforceOpenAIRealtimeGaAudioContract(beta)).toBe(beta);
+    });
+});
+
+
+describe('legacy farewell delay controls (issue #677)', () => {
+    it.each([
+        ['Google Live', GoogleLiveProviderForm],
+        ['Deepgram', DeepgramProviderForm],
+        ['ElevenLabs', ElevenLabsProviderForm],
+        ['OpenAI Realtime', OpenAIRealtimeProviderForm],
+    ])('omits the inactive control in %s and preserves legacy values on unrelated edits', (_name, Form) => {
+        const onChange = vi.fn();
+        const config = { farewell_hangup_delay_sec: 4 };
+        render(<Form config={config} onChange={onChange} />);
+        expect(screen.queryByText('Farewell Hangup Delay (seconds)')).not.toBeInTheDocument();
+        const control = document.querySelector('input[type="text"]:not([disabled]), input[type="password"]:not([disabled])');
+        expect(control).not.toBeNull();
+        fireEvent.change(control!, { target: { value: 'test-value' } });
+        expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ farewell_hangup_delay_sec: 4 }));
     });
 });

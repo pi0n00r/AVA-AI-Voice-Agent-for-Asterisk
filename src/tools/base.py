@@ -28,6 +28,21 @@ class ToolCategory(Enum):
     HYBRID = "hybrid"         # May use both telephony and business logic
 
 
+class ToolExecutionBehavior(str, Enum):
+    """Live-provider execution policy; new tools fail closed to blocking."""
+
+    BLOCKING = "BLOCKING"
+    NON_BLOCKING = "NON_BLOCKING"
+
+
+class ToolResponseScheduling(str, Enum):
+    """When a Live model should surface a non-blocking tool result."""
+
+    WHEN_IDLE = "WHEN_IDLE"
+    INTERRUPT = "INTERRUPT"
+    SILENT = "SILENT"
+
+
 @dataclass
 class ToolParameter:
     """Definition of a tool parameter."""
@@ -73,6 +88,8 @@ class ToolDefinition:
     input_schema: Optional[Dict[str, Any]] = None
     requires_channel: bool = False  # Needs active call channel
     max_execution_time: int = 30    # Timeout in seconds
+    execution_behavior: ToolExecutionBehavior = ToolExecutionBehavior.BLOCKING
+    response_scheduling: ToolResponseScheduling = ToolResponseScheduling.WHEN_IDLE
     
     # Phase system fields (Milestone 24)
     phase: ToolPhase = ToolPhase.IN_CALL  # Default to in-call for backward compatibility
