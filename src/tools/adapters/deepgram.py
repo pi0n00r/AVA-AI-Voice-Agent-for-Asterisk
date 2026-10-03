@@ -124,11 +124,13 @@ class DeepgramToolAdapter:
         try:
             parameters = json.loads(arguments_str) if isinstance(arguments_str, str) else arguments_str
         except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse function arguments: {e}", arguments=arguments_str)
+            logger.error(f"Failed to parse function arguments: {e}", argument_length=len(arguments_str) if isinstance(arguments_str, str) else 0)
             parameters = {}
         
         logger.info(
-            f"🔧 Deepgram tool call: {function_name}({parameters})",
+            "Deepgram tool call",
+            tool=function_name,
+            parameter_keys=sorted(parameters) if isinstance(parameters, dict) else [],
             call_id=context.get("call_id"),
             function_call_id=function_call_id,
         )
@@ -228,7 +230,11 @@ class DeepgramToolAdapter:
             return
         
         # Build response per actual Deepgram spec
-        safe_result = sanitize_tool_result_for_json_string(result, max_bytes=12000)
+        safe_result = sanitize_tool_result_for_json_string(
+            result,
+            max_bytes=12000,
+            tool_name=function_name,
+        )
         response = {
             "type": "FunctionCallResponse",
             "id": function_call_id,

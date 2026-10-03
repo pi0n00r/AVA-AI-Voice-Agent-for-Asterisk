@@ -151,12 +151,13 @@ class TestUnifiedTransferTool:
         assert tool_context.session_store.get_by_call_id.return_value.current_action["type"] == "predial_transfer"
         call_args = mock_ari_client.send_command.call_args.kwargs
         assert call_args["resource"] == "channels"
-        assert "data" not in call_args or call_args["data"] is None
         assert call_args["params"]["endpoint"] == "Local/6000@from-support"
         assert call_args["params"]["callerId"] == '"WIRELESS CALLER" <13164619284>'
         assert call_args["params"]["timeout"] == 12
         assert call_args["params"]["appArgs"].startswith("predial-transfer,test_call_123,support_agent")
-        assert call_args["params"]["channelVars"]["AGENT_ACTION"] == "predial_transfer"
+        assert "channelVars" not in call_args["params"]
+        assert call_args["data"]["variables"]["AGENT_ACTION"] == "predial_transfer"
+        assert call_args["data"]["variables"]["AGENT_CALL_ID"] == "test_call_123"
         engine.register_predial_transfer_channel.assert_called_once_with("test_call_123", "SIP/6000-00000001")
 
     @pytest.mark.asyncio
@@ -170,6 +171,11 @@ class TestUnifiedTransferTool:
             "target": "6000",
             "description": "Support Agent",
             "dialplan_context": "from-internal",
+            "_tool_history_origin": {
+                "tool_call_id": "provider-transfer-origin",
+                "name": "blind_transfer",
+                "params": {"destination": "***REDACTED***"},
+            },
         }
         tool_context.session_store.get_by_call_id.return_value.pending_deferred_transfer = existing_action
         tool_context.config["tools"]["transfer"] = {
@@ -188,7 +194,12 @@ class TestUnifiedTransferTool:
 
         assert result["status"] == "success"
         assert result["duplicate_suppressed"] is True
-        assert result[DEFERRED_TRANSFER_RESULT_KEY] == existing_action
+        assert result[DEFERRED_TRANSFER_RESULT_KEY] == {
+            key: value
+            for key, value in existing_action.items()
+            if not key.startswith("_")
+        }
+        assert "_tool_history_origin" not in result[DEFERRED_TRANSFER_RESULT_KEY]
         mock_ari_client.send_command.assert_not_called()
 
     @pytest.mark.asyncio

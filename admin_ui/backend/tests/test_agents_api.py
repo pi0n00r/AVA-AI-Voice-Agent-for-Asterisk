@@ -94,6 +94,47 @@ def test_invalid_tool_configs_rejected(client, raw):
     )
     assert response.status_code == 422
 
+
+def test_agent_hangup_policy_is_validated_and_canonicalized(client):
+    response = client.post(
+        "/api/agents",
+        json={
+            "display_name": "Russian Confirmation",
+            "provider": "local",
+            "prompt": "p",
+            "hangup_policy_json": __import__("json").dumps(
+                {"strategy": "extend", "end_call": [" Да ", "нет", "да"]}
+            ),
+        },
+    )
+    assert response.status_code == 201, response.text
+    assert __import__("json").loads(response.json()["hangup_policy_json"]) == {
+        "strategy": "extend",
+        "end_call": ["да", "нет"],
+    }
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "not-json",
+        '{"strategy":"all","end_call":["bye"]}',
+        '{"strategy":"extend","end_call":[]}',
+        '{"strategy":"inherit","end_call":["bye"]}',
+    ],
+)
+def test_invalid_agent_hangup_policy_is_rejected(client, raw):
+    response = client.post(
+        "/api/agents",
+        json={
+            "display_name": "Bad Hangup Policy",
+            "provider": "local",
+            "prompt": "p",
+            "hangup_policy_json": raw,
+        },
+    )
+    assert response.status_code == 422
+
 def test_delete_default_with_others_promotes(client):
     client.post("/api/agents", json={"display_name": "A", "provider": "x", "prompt": "p"})
     client.post("/api/agents", json={"display_name": "B", "provider": "x", "prompt": "p"})
@@ -679,7 +720,7 @@ def _load_backend_main():
 def test_main_app_openapi_version_and_tag():
     """version literal + agents tag description live in admin_ui/backend/main.py."""
     main = _load_backend_main()
-    assert main.app.version == "7.5.4"
+    assert main.app.version == "7.6.2"
     spec = main.app.openapi()
     tags = {t["name"]: t.get("description", "") for t in spec.get("tags", [])}
     assert tags.get("agents")  # present with a non-empty description

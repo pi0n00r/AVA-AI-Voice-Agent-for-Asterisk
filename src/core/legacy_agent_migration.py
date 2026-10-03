@@ -27,6 +27,10 @@ from src.tools.runtime_config import (
     merge_legacy_tool_overrides,
     normalize_agent_tool_configs,
 )
+from src.tools.telephony.hangup_policy import (
+    HangupPolicyConfigError,
+    dump_agent_hangup_policy,
+)
 
 
 DB_DEFAULT = "/app/data/operator/agents.db"
@@ -38,7 +42,8 @@ _BUNDLED_DEMO_DESCRIPTION = (
 _SLUG_RE = re.compile(r"[^a-z0-9_]+")
 _FIRST_CLASS = {
     "provider", "voice", "greeting", "prompt", "audio_profile", "profile",
-    "tools", "tool_configs", "tool_overrides", "email_recipient", "email_from", "email_enabled",
+    "tools", "tool_configs", "tool_overrides", "hangup_policy",
+    "email_recipient", "email_from", "email_enabled",
     "extension", "role_label",
 }
 
@@ -47,6 +52,7 @@ CREATE TABLE agents (
     id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL,
     extension TEXT, role_label TEXT, provider TEXT NOT NULL, voice TEXT,
     greeting TEXT, prompt TEXT NOT NULL, tools_json TEXT, tool_configs_json TEXT,
+    hangup_policy_json TEXT,
     mcp_json TEXT, audio_profile TEXT, extra_json TEXT,
     is_operator_managed INTEGER NOT NULL DEFAULT 1,
     is_active INTEGER NOT NULL DEFAULT 1, is_default INTEGER NOT NULL DEFAULT 0,
@@ -342,6 +348,36 @@ def _prepare_existing_database_for_replace(db_path: str) -> None:
             pass
 
 
+def _upgrade_existing_agent_schema(db_path: str) -> bool:
+    """Add call-safety columns when Engine starts before the Admin UI."""
+    if not os.path.exists(db_path):
+        return False
+    try:
+        connection = sqlite3.connect(db_path, timeout=5.0)
+        try:
+            table_exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='agents'"
+            ).fetchone()
+            if not table_exists:
+                return False
+            columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(agents)")
+            }
+            if "hangup_policy_json" in columns:
+                return False
+            with connection:
+                connection.execute(
+                    "ALTER TABLE agents ADD COLUMN hangup_policy_json TEXT"
+                )
+            return True
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        raise LegacyAgentMigrationError(
+            f"existing agents.db schema upgrade failed: {exc}"
+        ) from exc
+
+
 def _upgrade_existing_resource_policies(db_path: str) -> int:
     """Promote calendar bindings left in extra_json by early v7.4 builds.
 
@@ -427,6 +463,9 @@ def ensure_legacy_contexts_imported(
     os.makedirs(parent, exist_ok=True)
 
     with _migration_lock(target):
+        # The Engine may be the first service to open an older Agent store.
+        # Ensure it gets the same additive safety column as Admin startup.
+        _upgrade_existing_agent_schema(target)
         # The durable migration marker wins even if the operator later deletes
         # every Agent. Legacy YAML remains on disk for rollback diagnostics and
         # must not resurrect deleted Agents on the next engine restart.
@@ -477,7 +516,10 @@ def ensure_legacy_contexts_imported(
                 tool_configs = merge_legacy_tool_overrides(
                     context.get("tool_configs"), context.get("tool_overrides")
                 )
-            except ValueError as exc:
+                hangup_policy_json = dump_agent_hangup_policy(
+                    context.get("hangup_policy")
+                )
+            except (ValueError, HangupPolicyConfigError) as exc:
                 errors.append(f"{original_name}: {exc}")
                 continue
             base = _slugify(str(original_name)) or "agent"
@@ -493,7 +535,7 @@ def ensure_legacy_contexts_imported(
                 context.get("role_label"), context.get("provider") or "", context.get("voice"),
                 context.get("greeting"), prompt, json.dumps(context.get("tools")) if context.get("tools") is not None else None,
                 json.dumps(tool_configs, sort_keys=True) if tool_configs else None,
-                None, context.get("audio_profile") or context.get("profile"),
+                hangup_policy_json, None, context.get("audio_profile") or context.get("profile"),
                 json.dumps(extra) if extra else None, 0, 1, 0, "legacy YAML Context",
                 now, now, "Imported automatically during the v7.4 Agent migration",
                 context.get("email_recipient"), context.get("email_from"),
@@ -515,10 +557,10 @@ def ensure_legacy_contexts_imported(
                 connection.executemany(
                     """INSERT INTO agents (
                        id,slug,display_name,extension,role_label,provider,voice,greeting,prompt,
-                       tools_json,tool_configs_json,mcp_json,audio_profile,extra_json,
+                       tools_json,tool_configs_json,hangup_policy_json,mcp_json,audio_profile,extra_json,
                        is_operator_managed,is_active,is_default,source_file,created_at,updated_at,
                        notes,email_recipient,email_from,email_enabled
-                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     rows,
                 )
                 connection.execute(

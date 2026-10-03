@@ -246,6 +246,13 @@ def test_google_live_model_extraction_strips_models_prefix():
     assert select_google_live_model(live_models) == "gemini-3.1-flash-live-preview"
 
 
+def test_google_live_validation_selects_3_8_when_it_is_the_only_live_model():
+    result = build_google_key_validation_result([
+        {"name": "models/gemini-3.8-live", "supportedGenerationMethods": ["bidiGenerateContent"]}
+    ])
+    assert result["selected_model"] == "gemini-3.8-live"
+
+
 @pytest.mark.asyncio
 async def test_google_validate_key_route_accepts_200_without_live_models(monkeypatch):
     """The wizard route should accept valid keys with inconclusive discovery."""

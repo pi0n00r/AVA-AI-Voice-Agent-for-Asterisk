@@ -131,7 +131,7 @@ class OpenAIToolAdapter:
         try:
             parameters = json.loads(arguments_str) if isinstance(arguments_str, str) else arguments_str
         except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse function arguments: {e}", arguments=arguments_str)
+            logger.error(f"Failed to parse function arguments: {e}", argument_length=len(arguments_str) if isinstance(arguments_str, str) else 0)
             parameters = {}
         
         parameter_keys: List[str] = []
@@ -150,7 +150,7 @@ class OpenAIToolAdapter:
             call_id=context.get("call_id"),
             function_call_id=function_call_id,
             tool=function_name,
-            parameters=parameters,
+            parameter_keys=parameter_keys,
         )
         
         # Get tool from registry
@@ -192,7 +192,7 @@ class OpenAIToolAdapter:
         # Execute tool
         try:
             result = await tool.execute(parameters, exec_context)
-            sanitized = sanitize_tool_result_for_json_string(result)
+            sanitized = sanitize_tool_result_for_json_string(result, tool_name=function_name)
             logger.info(
                 "Tool executed",
                 call_id=context.get("call_id"),
@@ -205,7 +205,7 @@ class OpenAIToolAdapter:
                 call_id=context.get("call_id"),
                 function_call_id=function_call_id,
                 tool=function_name,
-                result=sanitized,
+                result_keys=sorted(sanitized),
             )
             result['call_id'] = function_call_id
             result['function_name'] = function_name
@@ -263,7 +263,7 @@ class OpenAIToolAdapter:
         
         try:
             # Step 1: Send function_call_output
-            safe_result = sanitize_tool_result_for_json_string(result, max_bytes=12000)
+            safe_result = sanitize_tool_result_for_json_string(result, max_bytes=12000, tool_name=function_name)
             output_event = {
                 "type": "conversation.item.create",
                 "item": {

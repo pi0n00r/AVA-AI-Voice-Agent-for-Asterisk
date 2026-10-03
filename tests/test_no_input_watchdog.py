@@ -453,6 +453,39 @@ async def test_no_input_provider_output_drains_without_resetting_policy_state():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider_name,drained,expected_state", [
+    ("google_live", True, "listening"),
+    ("google_live", False, "greeting"),
+    ("openai_realtime", True, "greeting"),
+])
+async def test_google_greeting_state_ends_only_after_first_drained_segment(
+    provider_name, drained, expected_state,
+):
+    engine = Engine.__new__(Engine)
+    engine.session_store = SessionStore()
+    engine.conversation_coordinator = ConversationCoordinator(engine.session_store)
+    engine.provider_kinds = {}
+    engine._provider_output_drain_tasks = {"call-greeting": asyncio.current_task()}
+    engine._agent_output_active_calls = {"call-greeting"}
+    engine._wait_for_call_audio_drain = AsyncMock(return_value=drained)
+    engine._terminal_transport_quiet_sec = lambda: 0.0
+    engine.no_input_watchdog = SimpleNamespace(note_agent_output_end=AsyncMock())
+    session = CallSession(
+        call_id="call-greeting", caller_channel_id="channel-greeting",
+        provider_name=provider_name, conversation_state="greeting",
+    )
+    await engine.session_store.upsert_call(session)
+
+    await engine._finish_provider_output_after_drain(
+        session.call_id, reset_timer=True, preserve_policy_state=False,
+    )
+
+    saved = await engine.session_store.get_by_call_id(session.call_id)
+    assert saved.conversation_state == expected_state
+    engine.no_input_watchdog.note_agent_output_end.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_openai_greeting_gating_is_released_only_after_transport_drain():
     engine = Engine.__new__(Engine)
     engine.session_store = SessionStore()
@@ -775,20 +808,28 @@ def test_terminal_quiet_tail_covers_audiosocket_and_externalmedia():
 
 
 @pytest.mark.asyncio
-async def test_terminal_hangup_is_idempotent_and_uses_shared_drain():
+@pytest.mark.parametrize("legacy_delay", [0, 4, 300])
+async def test_terminal_hangup_is_idempotent_and_uses_shared_drain(legacy_delay):
     engine = Engine.__new__(Engine)
-    engine.config = SimpleNamespace(audio_transport="audiosocket")
+    engine.config = SimpleNamespace(
+        audio_transport="audiosocket",
+        farewell_hangup_delay_sec=legacy_delay,
+        providers={"google_live": {"farewell_hangup_delay_sec": 300}},
+    )
     engine.session_store = SessionStore()
     engine.conversation_coordinator = None
     engine.ari_client = SimpleNamespace(hangup_channel=AsyncMock())
     engine._wait_for_call_audio_drain = AsyncMock(return_value=True)
-    session = CallSession(call_id="terminal-call", caller_channel_id="channel-terminal")
+    session = CallSession(
+        call_id="terminal-call", caller_channel_id="channel-terminal", provider_name="google_live"
+    )
     await engine.session_store.upsert_call(session)
 
-    assert await engine._terminate_call_after_audio(
-        "terminal-call",
-        reason="test",
-        call_outcome="agent_hangup",
+    assert await asyncio.wait_for(
+        engine._terminate_call_after_audio(
+            "terminal-call", reason="test", call_outcome="agent_hangup"
+        ),
+        timeout=0.5,
     ) is True
     assert await engine._terminate_call_after_audio("terminal-call", reason="duplicate") is False
     updated = await engine.session_store.get_by_call_id("terminal-call")

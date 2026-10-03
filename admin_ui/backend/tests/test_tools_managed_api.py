@@ -121,6 +121,71 @@ def test_crud_roundtrip_pre_call(client):
     assert client.get("/api/tools/managed/crm_lookup").status_code == 404
 
 
+def test_pre_call_metadata_policy_round_trip_and_validation(client):
+    response = client.post("/api/tools/managed", json={
+        "name": "crm_metadata", "phase": "pre_call",
+        "url": "https://api.example.com/lookup",
+        "output_variables": {"customer_tier": "contact.tier"},
+        "call_metadata_fields": {
+            "customer_tier": {
+                "persist": True,
+                "correctable": True,
+                "description": "Confirmed tier",
+                "max_length": 64,
+            }
+        },
+    })
+    assert response.status_code == 201, response.text
+    policy = response.json()["config"]["call_metadata_fields"]["customer_tier"]
+    assert policy == {
+        "persist": True,
+        "correctable": True,
+        "description": "Confirmed tier",
+        "max_length": 64,
+    }
+
+    orphan = client.patch("/api/tools/managed/crm_metadata", json={
+        "output_variables": {"account_region": "contact.region"},
+    })
+    assert orphan.status_code == 422
+    assert "not a configured output variable" in orphan.json()["detail"]
+
+    empty_outputs = client.patch("/api/tools/managed/crm_metadata", json={
+        "output_variables": {},
+    })
+    assert empty_outputs.status_code == 422
+    assert "not a configured output variable" in empty_outputs.json()["detail"]
+
+    unknown_policy_key = client.post("/api/tools/managed", json={
+        "name": "typo_metadata", "phase": "pre_call",
+        "url": "https://api.example.com/lookup",
+        "output_variables": {"customer_tier": "contact.tier"},
+        "call_metadata_fields": {
+            "customer_tier": {"persist": True, "max_lenght": 64},
+        },
+    })
+    assert unknown_policy_key.status_code == 422
+    assert "Extra inputs are not permitted" in unknown_policy_key.text
+
+    string_flag = client.post("/api/tools/managed", json={
+        "name": "string_flag_metadata", "phase": "pre_call",
+        "url": "https://api.example.com/lookup",
+        "output_variables": {"customer_tier": "contact.tier"},
+        "call_metadata_fields": {"customer_tier": {"persist": "true"}},
+    })
+    assert string_flag.status_code == 422
+    assert "Input should be a valid boolean" in string_flag.text
+
+    reserved = client.post("/api/tools/managed", json={
+        "name": "unsafe_metadata", "phase": "pre_call",
+        "url": "https://api.example.com/lookup",
+        "output_variables": {"caller_number": "contact.phone"},
+        "call_metadata_fields": {"caller_number": {"persist": True}},
+    })
+    assert reserved.status_code == 422
+    assert "authoritative call state" in reserved.json()["detail"]
+
+
 def test_in_call_tool_goes_to_in_call_block(client):
     r = client.post("/api/tools/managed", json={
         "name": "check_availability", "phase": "in_call",
@@ -147,6 +212,51 @@ def test_post_call_webhook(client):
     assert r.json()["kind"] == "generic_webhook"
     assert r.json()["is_global"] is True
     assert r.json()["config"]["method"] == "POST"
+
+
+def test_post_call_rejects_unavailable_explicit_summary_provider(client, monkeypatch):
+    async def fake_options():
+        return {
+            "providers": [
+                {"key": "deepseek_llm", "ready": False},
+            ]
+        }
+
+    monkeypatch.setattr(config_api, "get_llm_provider_options", fake_options)
+    response = client.post("/api/tools/managed", json={
+        "name": "post_hook",
+        "phase": "post_call",
+        "url": "https://hooks.example.com/x",
+        "generate_summary": True,
+        "summary_provider": "deepseek_llm",
+        "summary_prompt": "Summarize in {max_words} words.",
+    })
+
+    assert response.status_code == 422
+    assert "no usable credentials" in response.json()["detail"]
+    assert "post_hook" not in client.cfg_state["cfg"]["tools"]
+
+
+def test_post_call_accepts_ready_explicit_summary_provider(client, monkeypatch):
+    async def fake_options():
+        return {
+            "providers": [
+                {"key": "deepseek_llm", "ready": True},
+            ]
+        }
+
+    monkeypatch.setattr(config_api, "get_llm_provider_options", fake_options)
+    response = client.post("/api/tools/managed", json={
+        "name": "post_hook",
+        "phase": "post_call",
+        "url": "https://hooks.example.com/x",
+        "generate_summary": True,
+        "summary_provider": "deepseek_llm",
+        "summary_prompt": "Summarize in {max_words} words.",
+    })
+
+    assert response.status_code == 201, response.text
+    assert response.json()["config"]["summary_provider"] == "deepseek_llm"
 
 
 def test_bodyless_methods_clear_hidden_request_templates(client):
@@ -480,6 +590,10 @@ def test_builtin_patch_unknown_404(client):
 def test_settings_get_and_patch_farewell_delay(client):
     assert client.get("/api/tools/settings").json()["farewell_hangup_delay_sec"] is None
     r = client.patch("/api/tools/settings", json={"farewell_hangup_delay_sec": 4})
+    assert r.status_code == 200
+    assert r.json()["farewell_hangup_delay_sec"] == 4.0
+    assert client.cfg_state["cfg"]["farewell_hangup_delay_sec"] == 4.0
+    r = client.patch("/api/tools/settings", json={"default_action_timeout": 30})
     assert r.status_code == 200
     assert r.json()["farewell_hangup_delay_sec"] == 4.0
     assert client.cfg_state["cfg"]["farewell_hangup_delay_sec"] == 4.0

@@ -54,8 +54,20 @@ API_KEY_COMPATIBLE_KINDS = frozenset(
         "google_live",
         "elevenlabs_agent",
         "grok",
+        "openai",
+        "google",
+        "telnyx",
+        "telenyx",
+        "minimax",
+        "fishaudio",
     }
 )
+
+MODULAR_LLM_KINDS = frozenset(
+    {"openai", "google", "ollama", "local", "telnyx", "telenyx", "minimax"}
+)
+
+MODULAR_TTS_KINDS = frozenset({"fishaudio"})
 
 CREDENTIAL_NAME_TO_FIELD = {
     "api-key": "api_key_file",
@@ -89,6 +101,29 @@ def provider_kind(provider_key: str, provider_cfg: Any) -> Optional[str]:
             return raw_type
     if provider_key in FULL_AGENT_KINDS:
         return provider_key
+    return None
+
+
+def credential_provider_kind(provider_key: str, provider_cfg: Any) -> Optional[str]:
+    """Return the credential implementation kind for full or modular providers."""
+    kind = provider_kind(provider_key, provider_cfg)
+    if kind:
+        return kind
+    if not isinstance(provider_cfg, Mapping):
+        return None
+    raw_type = str(provider_cfg.get("type") or "").strip().lower()
+    if raw_type:
+        modular_kinds = MODULAR_LLM_KINDS | MODULAR_TTS_KINDS
+        return raw_type if raw_type in modular_kinds else None
+    key = str(provider_key).lower()
+    if key.endswith("_llm"):
+        inferred = key.rsplit("_llm", 1)[0]
+        return inferred if inferred in MODULAR_LLM_KINDS else None
+    if key.endswith("_tts"):
+        inferred = key.rsplit("_tts", 1)[0]
+        return inferred if inferred in MODULAR_TTS_KINDS else None
+    if key in MODULAR_LLM_KINDS | MODULAR_TTS_KINDS:
+        return key
     return None
 
 
@@ -412,12 +447,14 @@ def resolve_secret_value(
     file_path = str(provider_cfg.get(file_field) or "").strip()
     if file_path:
         try:
-            return read_secret_file(file_path)
+            value = read_secret_file(file_path)
+            if value:
+                return value
         except (OSError, UnicodeError, ProviderInstanceError):
             # Treat missing / permission-denied / undecodable files as
             # "no credentials" so the caller can fall back to env/inline.
             # Don't swallow programmer errors (CodeRabbit on PR #396).
-            return ""
+            pass
 
     env_name = str(provider_cfg.get(env_field) or "").strip()
     if env_name:

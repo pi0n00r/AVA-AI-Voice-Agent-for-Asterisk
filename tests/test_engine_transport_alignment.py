@@ -4,6 +4,8 @@ import pytest
 
 from src.engine import Engine, _CODEC_ALIGNMENT
 from src.core.models import CallSession, LegacyTransportProfile
+from src.config import GoogleProviderConfig
+from src.providers.google_live import GoogleLiveProvider
 
 
 def _make_session(call_id: str, fmt: str, rate: int) -> CallSession:
@@ -119,6 +121,27 @@ def test_externalmedia_keeps_google_silence_gating_during_output():
         capabilities,
         audio_capture_enabled=False,
     ) == "silence"
+
+
+@pytest.mark.parametrize("model,enabled,expected", [
+    ("gemini-3.8-live", True, "forward"),
+    ("gemini-3.8-live", False, "silence"),
+    ("gemini-live-2.5-flash-native-audio", True, "silence"),
+])
+def test_externalmedia_google_barge_in_mode_is_model_scoped(model, enabled, expected):
+    engine = _make_engine()
+    provider = GoogleLiveProvider(
+        config=GoogleProviderConfig(llm_model=model, full_duplex_barge_in_3_8=enabled),
+        on_event=lambda event: None,
+    )
+    capabilities = types.SimpleNamespace(
+        requires_continuous_audio=True,
+        has_native_vad=True,
+        has_native_barge_in=True,
+    )
+    assert engine._externalmedia_continuous_input_mode(
+        "google_live", capabilities, audio_capture_enabled=False, provider=provider,
+    ) == expected
 
 
 def test_externalmedia_drops_gated_audio_without_native_barge_in():

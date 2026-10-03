@@ -1,10 +1,12 @@
 import React, { useEffect, useRef, useState } from 'react';
 import axios from 'axios';
 import { toast } from 'sonner';
-import { Plus, Trash2, Settings, Loader2 } from 'lucide-react';
+import { Plus, Trash2, Settings, Loader2, X } from 'lucide-react';
 import { FormInput, FormSwitch, FormSelect, FormLabel } from '../ui/FormComponents';
 import { Modal } from '../ui/Modal';
 import { EmailTemplateModal } from './EmailTemplateModal';
+import HelpTooltip from '../ui/HelpTooltip';
+import { MicrosoftBookingSettings } from './MicrosoftBookingSettings';
 
 interface ToolFormProps {
     config: any;
@@ -24,6 +26,8 @@ interface VoicemailMailboxConfig {
     name?: string;
     extension?: string;
 }
+
+type DeviceStateRow = { id?: string; status?: string };
 
 const DEFAULT_ATTENDED_ANNOUNCEMENT_TEMPLATE =
     "Hi, this is Ava. I'm transferring {caller_display} regarding {context_name}.";
@@ -55,6 +59,33 @@ const DEFAULT_HANGUP_ASSISTANT_FAREWELL_MARKERS = [
     "take care",
 ];
 
+type CheckExtensionStateBucket = 'free' | 'busy' | 'unavailable';
+const DEFAULT_CHECK_EXTENSION_STATE_MAPPING: Record<CheckExtensionStateBucket, string[]> = {
+    free: ['NOT_INUSE'],
+    busy: ['INUSE', 'BUSY', 'RINGING', 'RINGINUSE', 'ONHOLD'],
+    unavailable: ['UNAVAILABLE', 'INVALID', 'UNKNOWN'],
+};
+
+// Space-or-comma separated device-state tokens -> uppercase, trimmed, de-duped list.
+const parseStateTokens = (value: string): string[] => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    (value || '')
+        .split(/[\s,]+/)
+        .map((token) => token.trim().toUpperCase())
+        .filter((token) => token.length > 0)
+        .forEach((token) => {
+            if (!seen.has(token)) {
+                seen.add(token);
+                out.push(token);
+            }
+        });
+    return out;
+};
+
+const stateTokensEqual = (a: string[], b: string[]) =>
+    a.length === b.length && a.every((token) => b.includes(token));
+
 const HANGUP_EXPERT_STORAGE_KEY = 'aava.ui.tools.hangupExpertSettings';
 
 const parseMarkerList = (value: string) =>
@@ -72,8 +103,16 @@ const hasLiveAgentExpertSettings = (ext: any) => {
     const aliases = Array.isArray(ext?.aliases)
         ? ext.aliases.map((item: any) => String(item || '').trim()).filter(Boolean)
         : [];
-    return actionType !== 'transfer' || deviceStateTech !== 'auto' || aliases.length > 0;
+    const deviceStates = Array.isArray(ext?.device_states) ? ext.device_states : [];
+    return actionType !== 'transfer' || deviceStateTech !== 'auto' || aliases.length > 0 || deviceStates.length > 0;
 };
+
+const DEVICE_STATE_STATUS_OPTIONS: { value: string; label: string }[] = [
+    { value: 'busy', label: 'Busy' },
+    { value: 'dnd', label: 'Do Not Disturb' },
+    { value: 'away', label: 'Away' },
+    { value: 'unavailable', label: 'Unavailable' },
+];
 
 const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, onSaveNow }: ToolFormProps) => {
     // Migrate calendar key references in all contexts' selected_calendars
@@ -1072,6 +1111,75 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
     const [endCallMarkerDraft, setEndCallMarkerDraft] = useState<string>(endCallMarkerText);
     const [assistantFarewellMarkerDraft, setAssistantFarewellMarkerDraft] = useState<string>(assistantFarewellMarkerText);
 
+    // ─── Check Extension Status: device-state value mapping ───────────────
+    const [showStateMappingAdvanced, setShowStateMappingAdvanced] = useState(false);
+    const stateMappingBucketText = (bucket: CheckExtensionStateBucket) => {
+        const configured = config.check_extension_status?.state_mapping?.[bucket];
+        const tokens = Array.isArray(configured)
+            ? configured
+            : DEFAULT_CHECK_EXTENSION_STATE_MAPPING[bucket];
+        return tokens.join(' ');
+    };
+    const stateMappingFreeText = stateMappingBucketText('free');
+    const stateMappingBusyText = stateMappingBucketText('busy');
+    const stateMappingUnavailableText = stateMappingBucketText('unavailable');
+    const [stateMappingFreeDraft, setStateMappingFreeDraft] = useState<string>(stateMappingFreeText);
+    const [stateMappingBusyDraft, setStateMappingBusyDraft] = useState<string>(stateMappingBusyText);
+    const [stateMappingUnavailableDraft, setStateMappingUnavailableDraft] = useState<string>(stateMappingUnavailableText);
+
+    useEffect(() => {
+        setStateMappingFreeDraft(stateMappingFreeText);
+    }, [stateMappingFreeText]);
+
+    useEffect(() => {
+        setStateMappingBusyDraft(stateMappingBusyText);
+    }, [stateMappingBusyText]);
+
+    useEffect(() => {
+        setStateMappingUnavailableDraft(stateMappingUnavailableText);
+    }, [stateMappingUnavailableText]);
+
+    const commitStateMappingBucket = (bucket: CheckExtensionStateBucket, rawText: string) => {
+        const tokens = parseStateTokens(rawText);
+        const current = config.check_extension_status?.state_mapping || {};
+        const next: Record<CheckExtensionStateBucket, string[]> = {
+            free: Array.isArray(current.free) ? current.free : DEFAULT_CHECK_EXTENSION_STATE_MAPPING.free,
+            busy: Array.isArray(current.busy) ? current.busy : DEFAULT_CHECK_EXTENSION_STATE_MAPPING.busy,
+            unavailable: Array.isArray(current.unavailable) ? current.unavailable : DEFAULT_CHECK_EXTENSION_STATE_MAPPING.unavailable,
+        };
+        next[bucket] = tokens.length > 0 ? tokens : DEFAULT_CHECK_EXTENSION_STATE_MAPPING[bucket];
+        const selectedTokens = new Set(next[bucket]);
+        (['free', 'busy', 'unavailable'] as CheckExtensionStateBucket[]).forEach((other) => {
+            if (other !== bucket) {
+                next[other] = next[other].filter((t) => !selectedTokens.has(t));
+            }
+        });
+
+        const isDefault = (['free', 'busy', 'unavailable'] as CheckExtensionStateBucket[]).every((b) =>
+            stateTokensEqual(next[b], DEFAULT_CHECK_EXTENSION_STATE_MAPPING[b])
+        );
+
+        const restCheckExtensionStatus = { ...(config.check_extension_status || {}) };
+        delete restCheckExtensionStatus.state_mapping;
+        if (isDefault) {
+            onChange({ ...config, check_extension_status: restCheckExtensionStatus });
+        } else {
+            onChange({
+                ...config,
+                check_extension_status: { ...restCheckExtensionStatus, state_mapping: next },
+            });
+        }
+    };
+
+    const resetStateMappingToDefaults = () => {
+        const restCheckExtensionStatus = { ...(config.check_extension_status || {}) };
+        delete restCheckExtensionStatus.state_mapping;
+        onChange({ ...config, check_extension_status: restCheckExtensionStatus });
+        setStateMappingFreeDraft(DEFAULT_CHECK_EXTENSION_STATE_MAPPING.free.join(' '));
+        setStateMappingBusyDraft(DEFAULT_CHECK_EXTENSION_STATE_MAPPING.busy.join(' '));
+        setStateMappingUnavailableDraft(DEFAULT_CHECK_EXTENSION_STATE_MAPPING.unavailable.join(' '));
+    };
+
     useEffect(() => {
         setEndCallMarkerDraft(endCallMarkerText);
     }, [endCallMarkerText]);
@@ -1340,6 +1448,40 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                                             value={config.transfer?.predial_timeout_seconds ?? 30}
                                             onChange={(e) => updateNestedConfig('transfer', 'predial_timeout_seconds', parseInt(e.target.value) || 30)}
                                             tooltip="How long Asterisk should keep ringing the pre-dialed destination leg."
+                                        />
+                                    </div>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                        <FormInput
+                                            label="Deferred Audio Drain Timeout (seconds)"
+                                            type="number"
+                                            min={0}
+                                            max={30}
+                                            value={config.transfer?.deferred_audio_drain_timeout_sec ?? 15}
+                                            onChange={(e) => {
+                                                const parsed = parseFloat(e.target.value);
+                                                updateNestedConfig(
+                                                    'transfer',
+                                                    'deferred_audio_drain_timeout_sec',
+                                                    Number.isFinite(parsed) ? Math.max(0, Math.min(30, parsed)) : 15,
+                                                );
+                                            }}
+                                            tooltip="Maximum time to wait for caller-facing transfer audio to finish. If it does not drain, the transfer is cancelled and the AI apologizes instead."
+                                        />
+                                        <FormInput
+                                            label="Deferred Audio Quiet Period (ms)"
+                                            type="number"
+                                            min={0}
+                                            max={5000}
+                                            value={config.transfer?.deferred_audio_drain_quiet_ms ?? 500}
+                                            onChange={(e) => {
+                                                const parsed = parseInt(e.target.value, 10);
+                                                updateNestedConfig(
+                                                    'transfer',
+                                                    'deferred_audio_drain_quiet_ms',
+                                                    Number.isFinite(parsed) ? Math.max(0, Math.min(5000, parsed)) : 500,
+                                                );
+                                            }}
+                                            tooltip="How long the caller-facing audio path must remain empty before the deferred transfer can commit."
                                         />
                                     </div>
                                     <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -1686,6 +1828,55 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                             onChange={(e) => updateNestedConfig('check_extension_status', 'restrict_to_configured_extensions', e.target.checked)}
                             className="mb-0 border-0 p-0 bg-transparent"
                         />
+
+                        <div className="border-t border-border pt-3 mt-3">
+                            <button
+                                type="button"
+                                onClick={() => setShowStateMappingAdvanced(!showStateMappingAdvanced)}
+                                className="text-sm font-medium text-primary hover:underline"
+                            >
+                                {showStateMappingAdvanced ? 'Hide' : 'Show'} State Value Mapping
+                            </button>
+
+                            {showStateMappingAdvanced && (
+                                <div className="mt-4 space-y-4">
+                                    <p className="text-xs text-muted-foreground">
+                                        Maps raw Asterisk device-state values to Free / Busy / Not available. Any value not listed in Free or Busy is treated as not available.
+                                    </p>
+                                    <FormInput
+                                        label="Free"
+                                        tooltip="Space- or comma-separated Asterisk device-state values that mean the extension is free (default: NOT_INUSE)."
+                                        value={stateMappingFreeDraft}
+                                        onChange={(e) => setStateMappingFreeDraft(e.target.value)}
+                                        onBlur={() => commitStateMappingBucket('free', stateMappingFreeDraft)}
+                                        placeholder={DEFAULT_CHECK_EXTENSION_STATE_MAPPING.free.join(' ')}
+                                    />
+                                    <FormInput
+                                        label="Busy"
+                                        tooltip="Space- or comma-separated Asterisk device-state values that mean the extension is busy."
+                                        value={stateMappingBusyDraft}
+                                        onChange={(e) => setStateMappingBusyDraft(e.target.value)}
+                                        onBlur={() => commitStateMappingBucket('busy', stateMappingBusyDraft)}
+                                        placeholder={DEFAULT_CHECK_EXTENSION_STATE_MAPPING.busy.join(' ')}
+                                    />
+                                    <FormInput
+                                        label="Not available"
+                                        tooltip="Space- or comma-separated Asterisk device-state values that mean the extension is not available. Any value not listed anywhere also falls into this bucket (fail-closed)."
+                                        value={stateMappingUnavailableDraft}
+                                        onChange={(e) => setStateMappingUnavailableDraft(e.target.value)}
+                                        onBlur={() => commitStateMappingBucket('unavailable', stateMappingUnavailableDraft)}
+                                        placeholder={DEFAULT_CHECK_EXTENSION_STATE_MAPPING.unavailable.join(' ')}
+                                    />
+                                    <button
+                                        type="button"
+                                        onClick={resetStateMappingToDefaults}
+                                        className="text-xs text-muted-foreground hover:text-foreground underline"
+                                    >
+                                        Reset to defaults
+                                    </button>
+                                </div>
+                            )}
+                        </div>
                     </div>
                 </div>
 
@@ -1700,20 +1891,15 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                     />
                     {config.hangup_call?.enabled !== false && (
                         <div className="mt-4 pl-4 border-l-2 border-border ml-2 space-y-4">
+                            <p className="text-xs text-muted-foreground">
+                                Farewell audio drains before hangup. The legacy farewell_hangup_delay_sec setting is deprecated and ignored.
+                            </p>
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 <FormInput
                                     label="Default Farewell Message"
                                     value={config.hangup_call?.farewell_message || ''}
                                     onChange={(e) => updateNestedConfig('hangup_call', 'farewell_message', e.target.value)}
                                     tooltip="Used when the AI calls hangup_call without specifying a farewell. The AI typically provides its own message."
-                                />
-                                <FormInput
-                                    label="Farewell Hangup Delay (seconds)"
-                                    type="number"
-                                    step="0.5"
-                                    value={config.farewell_hangup_delay_sec ?? 2.5}
-                                    onChange={(e) => updateConfig('farewell_hangup_delay_sec', parseFloat(e.target.value) || 2.5)}
-                                    tooltip="Time to wait after farewell audio before hanging up. Increase if farewell gets cut off."
                                 />
                                 <FormSelect
                                     label="On Provider Start Failure"
@@ -2269,6 +2455,90 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                                                     disabled={!showLiveAgentsExpert}
                                                 />
                                             </div>
+                                        </div>
+
+                                        {/* Availability signals (issue #577) */}
+                                        <div className="mt-4 pt-4 border-t border-border/50">
+                                            <div className="flex items-center gap-1.5 mb-2">
+                                                <label className="block text-[11px] font-medium text-muted-foreground uppercase tracking-wider">Availability Signals</label>
+                                                <HelpTooltip content="Custom Asterisk device states (e.g. DND feature codes) that report this agent's availability, in addition to auto-detection." />
+                                            </div>
+                                            <p className="text-xs text-muted-foreground mb-3">
+                                                Auto (over ARI): native device state + active calls
+                                            </p>
+                                            <div className="space-y-2">
+                                                {(Array.isArray(ext.device_states) ? ext.device_states : []).map((ds: DeviceStateRow, dsIdx: number) => (
+                                                    <div key={dsIdx} className="flex items-center gap-2">
+                                                        <input
+                                                            aria-label={`Custom device state ${dsIdx + 1} identifier`}
+                                                            className="flex-1 border border-input rounded-md px-3 py-2 text-sm bg-background focus:ring-1 focus:ring-ring focus:outline-none transition-shadow disabled:cursor-not-allowed disabled:opacity-50"
+                                                            placeholder="e.g. Custom:DND102"
+                                                            value={ds?.id || ''}
+                                                            onChange={(e) => {
+                                                                const updated = { ...(config.extensions?.internal || {}) };
+                                                                const list = Array.isArray(ext.device_states) ? [...ext.device_states] : [];
+                                                                list[dsIdx] = { ...list[dsIdx], id: e.target.value };
+                                                                updated[key] = { ...ext, device_states: list };
+                                                                updateNestedConfig('extensions', 'internal', updated);
+                                                            }}
+                                                            title="Device state id (e.g. Custom:DND102)"
+                                                            disabled={!showLiveAgentsExpert}
+                                                        />
+                                                        <select
+                                                            aria-label={`Custom device state ${dsIdx + 1} status`}
+                                                            className="border border-input rounded-md px-3 py-2 text-sm bg-background focus:ring-1 focus:ring-ring focus:outline-none transition-shadow disabled:cursor-not-allowed disabled:opacity-50"
+                                                            value={ds?.status || 'busy'}
+                                                            onChange={(e) => {
+                                                                const updated = { ...(config.extensions?.internal || {}) };
+                                                                const list = Array.isArray(ext.device_states) ? [...ext.device_states] : [];
+                                                                list[dsIdx] = { ...list[dsIdx], status: e.target.value };
+                                                                updated[key] = { ...ext, device_states: list };
+                                                                updateNestedConfig('extensions', 'internal', updated);
+                                                            }}
+                                                            title="Availability status reported by this device state"
+                                                            disabled={!showLiveAgentsExpert}
+                                                        >
+                                                            {DEVICE_STATE_STATUS_OPTIONS.map((opt) => (
+                                                                <option key={opt.value} value={opt.value}>{opt.label}</option>
+                                                            ))}
+                                                        </select>
+                                                        <button
+                                                            type="button"
+                                                            aria-label={`Remove custom device state ${dsIdx + 1}`}
+                                                            onClick={() => {
+                                                                const updated = { ...(config.extensions?.internal || {}) };
+                                                                const list = (Array.isArray(ext.device_states) ? ext.device_states : []).filter((_: DeviceStateRow, i: number) => i !== dsIdx);
+                                                                const nextExt = { ...ext };
+                                                                if (list.length > 0) {
+                                                                    nextExt.device_states = list;
+                                                                } else {
+                                                                    delete nextExt.device_states;
+                                                                }
+                                                                updated[key] = nextExt;
+                                                                updateNestedConfig('extensions', 'internal', updated);
+                                                            }}
+                                                            className="h-[38px] w-[38px] flex items-center justify-center text-muted-foreground hover:text-destructive hover:bg-destructive/10 rounded-md transition-colors shrink-0 disabled:cursor-not-allowed disabled:opacity-50"
+                                                            title="Remove device state"
+                                                            disabled={!showLiveAgentsExpert}
+                                                        >
+                                                            <X className="w-4 h-4" />
+                                                        </button>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    const updated = { ...(config.extensions?.internal || {}) };
+                                                    const list = Array.isArray(ext.device_states) ? ext.device_states : [];
+                                                    updated[key] = { ...ext, device_states: [...list, { id: '', status: 'busy' }] };
+                                                    updateNestedConfig('extensions', 'internal', updated);
+                                                }}
+                                                className="mt-2 text-xs flex items-center bg-secondary px-2 py-1 rounded hover:bg-secondary/80 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                                                disabled={!showLiveAgentsExpert}
+                                            >
+                                                <Plus className="w-3 h-3 mr-1" /> Add custom state
+                                            </button>
                                         </div>
                                     </div>
                                 )}
@@ -3310,7 +3580,7 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                             <div>
                                 <div className="text-sm font-medium mb-1">Availability defaults</div>
                                 <div className="text-xs text-muted-foreground mb-3">
-                                    Blank Free prefix uses Microsoft Graph free/busy plus working hours (Mon-Fri 09:00-17:00 by default).
+                                    Blank Free prefix checks events in the selected calendar plus the configured working hours.
                                     Set Free prefix only if you want title-prefix "Open" events instead.
                                 </div>
                                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
@@ -3318,8 +3588,8 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                                         label="Free prefix"
                                         value={config.microsoft_calendar?.free_prefix ?? ''}
                                         onChange={(e) => updateNestedConfig('microsoft_calendar', 'free_prefix', e.target.value)}
-                                        placeholder="(blank = use Microsoft free/busy)"
-                                        tooltip="Leave blank for native Microsoft free/busy mode. Set a value only for title-prefix availability windows."
+                                        placeholder="(blank = selected calendar availability)"
+                                        tooltip="Leave blank to check busy events in the selected calendar. Set a value only for title-prefix availability windows."
                                     />
                                     <FormInput
                                         label="Busy prefix"
@@ -3354,6 +3624,11 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                                     />
                                 </div>
                             </div>
+
+                            <MicrosoftBookingSettings config={config.microsoft_calendar || {}} onChange={patch => onChange({
+                                ...config,
+                                microsoft_calendar: { ...(config.microsoft_calendar || {}), ...patch },
+                            })} />
 
                             <div>
                                 <div className="text-sm font-medium mb-1">Microsoft 365 account</div>

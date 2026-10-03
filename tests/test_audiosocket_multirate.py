@@ -575,6 +575,8 @@ async def test_streaming_manager_keeps_audiosocket_framing_per_call():
         audio_transport="audiosocket",
         audiosocket_server=audio_server,
     )
+    manager.active_streams["call-8k"] = {"stream_id": "stream-8k"}
+    manager.active_streams["call-16k"] = {"stream_id": "stream-16k"}
 
     assert await manager._send_audio_chunk(
         "call-8k", "stream-8k", b"a" * 320, target_fmt="slin", target_rate=8000
@@ -841,6 +843,9 @@ async def test_engine_originates_wideband_channel_from_call_profile():
     await Engine._originate_audiosocket_channel_hybrid(engine, "caller-channel")
 
     params = engine.ari_client.send_command.await_args.kwargs["params"]
+    data = engine.ari_client.send_command.await_args.kwargs["data"]
     assert params["endpoint"].startswith("AudioSocket/127.0.0.1:8090/")
     assert params["endpoint"].endswith("/c(slin16)")
+    assert "channelVars" not in params
+    assert data["variables"]["AUDIOSOCKET_UUID"]
     assert engine.pending_audiosocket_channels["audiosocket-channel"] == "caller-channel"

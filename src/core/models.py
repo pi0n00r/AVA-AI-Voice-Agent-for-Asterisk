@@ -63,6 +63,26 @@ class CallSession:
     audiosocket_channel_id: Optional[str] = None
     audiosocket_conn_id: Optional[str] = None
     audiosocket_uuid: Optional[str] = None
+    # Transport-neutral media identity.  The legacy RTP/AudioSocket fields above
+    # remain as compatibility projections while all three transports migrate to
+    # this common lifecycle.
+    media_transport_kind: Optional[str] = None
+    media_channel_id: Optional[str] = None
+    media_channel_pending: bool = False
+    media_connection_id: Optional[str] = None
+    media_connection_state: str = "disconnected"
+    negotiated_encoding: Optional[str] = None
+    negotiated_sample_rate: Optional[int] = None
+    media_packetization_ms: Optional[int] = None
+    media_optimal_frame_size: Optional[int] = None
+    media_output_segment: Optional[str] = None
+    media_output_generation: int = 0
+    media_pending_drain_id: Optional[str] = None
+    media_pending_buffering_id: Optional[str] = None
+    media_flow_writable: bool = True
+    media_flow_transition_ts: float = 0.0
+    media_last_error: Optional[str] = None
+    websocket_input_rejections: Dict[str, int] = field(default_factory=dict)
     provider_session_active: bool = False
     bridge_id: Optional[str] = None
     
@@ -100,6 +120,7 @@ class CallSession:
     tool_generation_id: Optional[int] = None
     tool_config_hash: Optional[str] = None
     tool_policy: Dict[str, Any] = field(default_factory=dict)
+    hangup_marker_policy: Dict[str, Any] = field(default_factory=dict)
     
     # Conversation tracking for email tools
     conversation_history: List[Dict[str, Any]] = field(default_factory=list)
@@ -174,6 +195,10 @@ class CallSession:
     codec_alignment_ok: bool = True
     codec_alignment_message: Optional[str] = None
     audio_diagnostics: Dict[str, Any] = field(default_factory=dict)
+    # Immutable, secret-free settings captured after Agent/provider/pipeline and
+    # Audio Profile resolution.  The support-package workflow persists this
+    # snapshot so later config reloads cannot rewrite the evidence for a call.
+    diagnostics_snapshot: Dict[str, Any] = field(default_factory=dict)
     
     # Agent action tracking (transfers, hangup, etc.)
     pending_actions: list = field(default_factory=list)  # Queue of pending actions
@@ -193,6 +218,14 @@ class CallSession:
     
     # Pre-call tool results (Milestone 24) - CRM lookup data injected into prompts
     pre_call_results: Dict[str, str] = field(default_factory=dict)  # {variable_name: value}
+
+    # Opt-in, bounded enrichment fields. These never control caller identity,
+    # routing, consent, transfer, disposition, or external-dialer state.
+    call_metadata: Dict[str, str] = field(default_factory=dict)
+    call_metadata_policy: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Audit contains field/source/timestamp only; values remain in the bounded
+    # final metadata object and are not duplicated into tool diagnostics.
+    call_metadata_updates: List[Dict[str, Any]] = field(default_factory=list)
 
     # Pre-call tool execution metadata for the call history UI.
     # Same per-entry shape as the post_call_tool_calls JSON column on CallRecord.

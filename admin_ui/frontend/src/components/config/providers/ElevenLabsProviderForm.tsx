@@ -428,35 +428,6 @@ const ElevenLabsProviderForm: React.FC<ElevenLabsProviderFormProps> = ({ config,
                 />
             </div>
 
-            <div className="space-y-2">
-                <div className="flex items-center gap-1.5">
-                    <label className="text-sm font-medium">Farewell Hangup Delay (seconds)</label>
-                    <HelpTooltip
-                        content={
-                            <>
-                                <strong>Farewell Hangup Delay</strong> — how long to wait after the agent's final goodbye finishes playing before tearing down the call.
-                                <ul className="list-disc pl-4 mt-1 space-y-0.5">
-                                    <li>Too short — Asterisk cuts off the last syllable of the farewell.</li>
-                                    <li>Too long — caller sits in silence wondering if the line dropped.</li>
-                                    <li><strong>2.5 s</strong> (global default) — works for most voices; ElevenLabs is slightly slower than realtime engines so 2.5-3.5 s is often safer here.</li>
-                                    <li>Leave empty to inherit the global default from System settings.</li>
-                                </ul>
-                            </>
-                        }
-                    />
-                </div>
-                <input
-                    type="number"
-                    step="0.5"
-                    className="w-full p-2 rounded border border-input bg-background"
-                    value={config.farewell_hangup_delay_sec ?? ''}
-                    onChange={(e) => handleChange('farewell_hangup_delay_sec', e.target.value ? parseFloat(e.target.value) : null)}
-                    placeholder="Use global default (2.5s)"
-                />
-                <p className="text-xs text-muted-foreground">
-                    Seconds to wait after farewell audio before hanging up. Leave empty to use global default.
-                </p>
-            </div>
         </div>
     );
 };
