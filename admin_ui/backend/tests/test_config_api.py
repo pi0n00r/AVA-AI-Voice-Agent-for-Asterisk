@@ -48,6 +48,9 @@ def _provider_test_client(monkeypatch, *, failure=False):
     calls = []
 
     class FakeAsyncClient:
+        def __init__(self, **_kwargs):
+            pass
+
         async def __aenter__(self):
             return self
 
@@ -70,7 +73,7 @@ def _provider_test_client(monkeypatch, *, failure=False):
 
 def test_openai_provider_endpoint_uses_configured_base_exactly(monkeypatch):
     client, calls = _provider_test_client(monkeypatch)
-    configured = "  http://validation-api.future.example:9443/tenant/v9///  "
+    configured = "  http://[fd00::1234]:9443/tenant/v9///  "
 
     response = client.post(
         "/api/config/providers/test",
@@ -86,7 +89,7 @@ def test_openai_provider_endpoint_uses_configured_base_exactly(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["success"] is True
-    assert calls == ["http://validation-api.future.example:9443/tenant/v9/models"]
+    assert calls == ["http://[fd00::1234]:9443/tenant/v9/models"]
 
 
 def test_openai_provider_endpoint_connection_failure_never_calls_default(monkeypatch):
@@ -99,14 +102,14 @@ def test_openai_provider_endpoint_connection_failure_never_calls_default(monkeyp
             "config": {
                 "type": "openai",
                 "api_key": "test-only",
-                "chat_base_url": "http://unavailable.future.example:9555/api/v2",
+                "chat_base_url": "http://10.0.0.50:9555/api/v2",
             },
         },
     )
 
     assert response.status_code == 200
     assert response.json()["success"] is False
-    assert calls == ["http://unavailable.future.example:9555/api/v2/models"]
+    assert calls == ["http://10.0.0.50:9555/api/v2/models"]
     assert all("api.openai.com" not in url for url in calls)
 
 
