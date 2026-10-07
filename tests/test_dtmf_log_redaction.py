@@ -304,3 +304,18 @@ def test_unrelated_existing_secret_and_context_redaction_remains_unchanged():
     sanitized = sanitize_secrets(None, 'info', event)
     _check(sanitized['api_key'] == 'fi***REDACTED***', 'unrelated secret policy changed')
     _check(sanitized['duration_ms'] == 120 and sanitized['passthrough'], 'unrelated log context changed')
+def test_dtmf_nested_under_sensitive_dictionary_is_not_logged():
+    event = {"credentials": {"digit": "987654", "label": "test"}}
+    before = copy.deepcopy(event)
+    sanitized = sanitize_secrets(None, "info", event)
+
+    _check(event == before, 'redaction changed caller-owned credential data')
+    _check(sanitized["credentials"]["digit"] == "***REDACTED***", 'nested DTMF value leaked')
+    _check(sanitized["credentials"]["label"] == "test", 'non-sensitive context changed')
+    stream = io.StringIO()
+    render = structlog.wrap_logger(
+        structlog.PrintLogger(stream),
+        processors=[sanitize_secrets, structlog.processors.JSONRenderer()],
+    )
+    render.info("call", credentials=event["credentials"])
+    _check("987654" not in stream.getvalue(), 'nested DTMF value leaked in rendered log')
