@@ -926,6 +926,8 @@ class MCPServerConfig(BaseModel):
     enabled: bool = Field(default=True)
     transport: str = Field(default="stdio")  # currently: stdio
     command: List[str] = Field(default_factory=list)  # e.g., ["python3", "-m", "my_mcp_server"]
+    url: Optional[str] = None  # streamable-http endpoint
+    headers: Dict[str, str] = Field(default_factory=dict)  # env-expanded; never logged
     cwd: Optional[str] = None
     env: Dict[str, str] = Field(default_factory=dict)
     restart: MCPServerRestartConfig = Field(default_factory=MCPServerRestartConfig)
