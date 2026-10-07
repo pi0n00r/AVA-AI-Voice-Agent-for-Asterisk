@@ -2,7 +2,7 @@ import asyncio
 
 from src.config import MCPConfig, MCPServerConfig
 from src.mcp.manager import MCPClientManager
-from src.mcp.streamable_http_client import MCPStreamableHttpClient
+from src.mcp.streamable_http_client import MCPStreamableHTTPClient
 
 
 def test_manager_builds_streamable_http_client(monkeypatch):
@@ -23,9 +23,9 @@ def test_manager_builds_streamable_http_client(monkeypatch):
     async def fake_stop(self):
         return None
 
-    monkeypatch.setattr(MCPStreamableHttpClient, "start", fake_start)
-    monkeypatch.setattr(MCPStreamableHttpClient, "list_tools", fake_list_tools)
-    monkeypatch.setattr(MCPStreamableHttpClient, "stop", fake_stop)
+    monkeypatch.setattr(MCPStreamableHTTPClient, "start", fake_start)
+    monkeypatch.setattr(MCPStreamableHTTPClient, "list_tools", fake_list_tools)
+    monkeypatch.setattr(MCPStreamableHTTPClient, "stop", fake_stop)
 
     config = MCPConfig(
         enabled=True,
@@ -43,6 +43,7 @@ def test_manager_builds_streamable_http_client(monkeypatch):
     assert calls == [
         ("isla", "https://isla.example/mcp/codex", {"Authorization": "Bearer fixture"})
     ]
+    assert manager._clients["isla"]._resolve_headers() == {"Authorization": "Bearer fixture"}
     status = manager.get_status()
     assert status["servers"]["isla"]["up"] is True
     assert status["servers"]["isla"]["transport"] == "streamable-http"

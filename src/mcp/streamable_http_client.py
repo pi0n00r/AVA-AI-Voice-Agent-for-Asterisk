@@ -1,20 +1,40 @@
 from __future__ import annotations
 
-import json
-import socket
-from typing import Any, Dict, List, Optional
+import asyncio
+import os
+import re
+from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar
 from urllib.parse import urlsplit
 
-import aiohttp
+import httpx2
 import structlog
+from mcp.client import Client
+from mcp.client.streamable_http import streamable_http_client
+from mcp.types import CallToolResult, Implementation
 
 from .errors import MCPError, MCPProtocolError, MCPServerExited
 
 logger = structlog.get_logger(__name__)
 
+_T = TypeVar("_T")
+_ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_HEADER_NAME = re.compile(r"^[A-Za-z0-9-]+$")
+_SECRET_HEADERS = {"authorization", "proxy-authorization", "x-api-key", "api-key"}
+_PROTOCOL_HEADERS = {
+    "accept",
+    "content-type",
+    "mcp-protocol-version",
+    "mcp-session-id",
+    "host",
+}
 
-class MCPStreamableHttpClient:
-    """Minimal MCP Streamable HTTP client with session reconciliation."""
+
+class MCPStreamableHTTPClient:
+    """Official MCP SDK transport for explicitly configured remote servers.
+
+    Each operation owns a fresh negotiated session. A failed tools/call is never
+    automatically replayed, even if the server accepted it before the link failed.
+    """
 
     def __init__(
         self,
@@ -23,61 +43,76 @@ class MCPStreamableHttpClient:
         url: str,
         headers: Dict[str, str],
         default_timeout_ms: int = 10000,
+        allow_resolved_auth_headers: bool = False,
     ):
         self.server_id = server_id
         self.url = str(url or "").strip()
-        self.headers = {str(k): str(v) for k, v in (headers or {}).items()}
+        self.headers = dict(headers or {})
         self.default_timeout_ms = int(default_timeout_ms)
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._session_id: Optional[str] = None
-        self._next_id = 1
-        self._initialized = False
+        self.allow_resolved_auth_headers = allow_resolved_auth_headers
         self._closing = False
         self._validate_url()
 
     def _validate_url(self) -> None:
-        parsed = urlsplit(self.url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise MCPError(f"MCP server '{self.server_id}' has an invalid HTTP URL")
-        if parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise MCPError(
-                f"MCP server '{self.server_id}' URL must not contain credentials, "
-                "query, or fragment"
+        try:
+            parsed = urlsplit(self.url)
+            _ = parsed.port  # Reject malformed port syntax.
+            valid = (
+                len(self.url) <= 2048
+                and parsed.scheme in {"http", "https"}
+                and bool(parsed.hostname)
             )
+        except ValueError:
+            valid = False
+            parsed = None
+        if (
+            not valid
+            or parsed is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise MCPError(f"MCP server '{self.server_id}' has an invalid HTTP URL")
+
+    def _resolve_headers(self) -> Dict[str, str]:
+        resolved: Dict[str, str] = {}
+        for name, template in self.headers.items():
+            if (
+                not _HEADER_NAME.fullmatch(name)
+                or name.lower() in _PROTOCOL_HEADERS
+                or not isinstance(template, str)
+            ):
+                raise MCPError(f"MCP server '{self.server_id}' has an invalid header configuration")
+            if (
+                name.lower() in _SECRET_HEADERS
+                and not self.allow_resolved_auth_headers
+                and not _ENV_REFERENCE.search(template)
+            ):
+                raise MCPError(f"MCP server '{self.server_id}' requires an environment reference for authentication")
+
+            def expand(match: re.Match[str]) -> str:
+                value = os.environ.get(match.group(1))
+                if not value:
+                    raise MCPError(f"MCP server '{self.server_id}' is missing a header environment variable")
+                return value
+
+            value = _ENV_REFERENCE.sub(expand, template)
+            if "\r" in value or "\n" in value or "${" in value:
+                raise MCPError(f"MCP server '{self.server_id}' has an invalid header value")
+            resolved[name] = value
+        return resolved
 
     async def start(self) -> None:
-        await self._ensure_session()
-        await self.initialize()
+        if self._closing:
+            raise MCPServerExited(f"MCP server '{self.server_id}' is shutting down")
+        # Discovery is performed by the manager immediately after start.
 
     async def stop(self) -> None:
         self._closing = True
-        session = self._session
-        self._session = None
-        self._initialized = False
-        if session and not session.closed:
-            await session.close()
-
-    async def initialize(self) -> None:
-        if self._initialized:
-            return
-        await self._ensure_session()
-        await self.request(
-            "initialize",
-            {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "Asterisk-AI-Voice-Agent", "version": "dev"},
-            },
-            _skip_initialize=True,
-        )
-        self._initialized = True
-        await self.notify("notifications/initialized", {})
 
     async def list_tools(self) -> List[Dict[str, Any]]:
-        await self.initialize()
-        result = await self.request("tools/list", {})
-        tools = result.get("tools", [])
-        return tools if isinstance(tools, list) else []
+        return await self._execute("tools/list", self.default_timeout_ms, self._list_all)
 
     async def call_tool(
         self,
@@ -86,141 +121,73 @@ class MCPStreamableHttpClient:
         arguments: Dict[str, Any],
         timeout_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
-        await self.initialize()
-        return await self.request(
-            "tools/call",
-            {"name": name, "arguments": arguments or {}},
-            timeout_ms=timeout_ms,
-        )
-
-    async def notify(self, method: str, params: Dict[str, Any]) -> None:
-        await self._ensure_session()
-        payload = {"jsonrpc": "2.0", "method": method, "params": params or {}}
-        await self._post(payload, timeout_ms=self.default_timeout_ms, notification=True)
-
-    async def request(
-        self,
-        method: str,
-        params: Dict[str, Any],
-        timeout_ms: Optional[int] = None,
-        *,
-        _skip_initialize: bool = False,
-    ) -> Dict[str, Any]:
-        if not _skip_initialize:
-            await self.initialize()
-        request_id = self._next_id
-        self._next_id += 1
-        payload = {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": method,
-            "params": params or {},
-        }
-        response = await self._post(
-            payload,
-            timeout_ms=self.default_timeout_ms
-            if timeout_ms is None
-            else int(timeout_ms),
-            notification=False,
-        )
-        if not isinstance(response, dict):
-            raise MCPProtocolError(
-                f"Invalid MCP response type: {type(response).__name__}"
+        async def invoke(client: Client) -> Dict[str, Any]:
+            # The modern protocol can mirror schema-annotated arguments into
+            # headers; absorb all listing pages before the low-level call.
+            tools = await self._list_all(client)
+            if not any(tool["name"] == name for tool in tools):
+                raise MCPProtocolError(f"MCP server '{self.server_id}' did not advertise tool '{name}'")
+            result = await client.session.call_tool(
+                name,
+                arguments or {},
+                read_timeout_seconds=max(0.001, float(timeout_ms or self.default_timeout_ms) / 1000.0),
             )
-        if response.get("id") not in {request_id, str(request_id)}:
-            raise MCPProtocolError("MCP response ID did not match the request")
-        if response.get("error"):
-            raise MCPError(str(response["error"]))
-        result = response.get("result")
-        return result if isinstance(result, dict) else {"value": result}
+            if not isinstance(result, CallToolResult):
+                raise MCPProtocolError(f"MCP server '{self.server_id}' returned an unsupported tool result")
+            return result.model_dump(by_alias=True, exclude_none=True)
 
-    async def _ensure_session(self) -> None:
+        return await self._execute("tools/call", timeout_ms or self.default_timeout_ms, invoke)
+
+    async def _list_all(self, client: Client) -> List[Dict[str, Any]]:
+        tools: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+        seen: set[str] = set()
+        for _ in range(100):
+            page = await client.list_tools(cursor=cursor)
+            tools.extend(tool.model_dump(by_alias=True, exclude_none=True) for tool in page.tools)
+            cursor = page.next_cursor
+            if not cursor:
+                return tools
+            if cursor in seen:
+                raise MCPProtocolError(f"MCP server '{self.server_id}' repeated a tool-list cursor")
+            seen.add(cursor)
+        raise MCPProtocolError(f"MCP server '{self.server_id}' exceeded the tool-list page limit")
+
+    async def _execute(
+        self,
+        operation: str,
+        timeout_ms: int,
+        action: Callable[[Client], Awaitable[_T]],
+    ) -> _T:
         if self._closing:
             raise MCPServerExited(f"MCP server '{self.server_id}' is shutting down")
-        if self._session and not self._session.closed:
-            return
-        connector = aiohttp.TCPConnector(
-            family=socket.AF_UNSPEC,
-            happy_eyeballs_delay=0.25,
-        )
-        self._session = aiohttp.ClientSession(connector=connector)
-
-    def _request_headers(self) -> Dict[str, str]:
-        headers = {
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json",
-        }
-        headers.update(self.headers)
-        if self._session_id:
-            headers["MCP-Session-Id"] = self._session_id
-        return headers
-
-    async def _post(
-        self,
-        payload: Dict[str, Any],
-        *,
-        timeout_ms: int,
-        notification: bool,
-    ) -> Optional[Dict[str, Any]]:
-        await self._ensure_session()
-        if not self._session:
-            raise MCPServerExited(
-                f"MCP server '{self.server_id}' HTTP client is unavailable"
+        headers = self._resolve_headers()
+        try:
+            async with asyncio.timeout(max(0.001, float(timeout_ms) / 1000.0)):
+                async with httpx2.AsyncClient(
+                    headers=headers,
+                    timeout=httpx2.Timeout(300.0, connect=5.0, write=5.0, pool=5.0),
+                    follow_redirects=False,
+                ) as http_client:
+                    transport = streamable_http_client(self.url, http_client=http_client)
+                    async with Client(
+                        transport,
+                        mode="auto",
+                        cache=None,
+                        client_info=Implementation(name="Asterisk-AI-Voice-Agent", version="dev"),
+                    ) as client:
+                        return await action(client)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "MCP HTTP operation failed",
+                server=self.server_id,
+                operation=operation,
+                error_type=type(exc).__name__,
             )
-        timeout = aiohttp.ClientTimeout(total=max(0.001, float(timeout_ms) / 1000.0))
-        try:
-            async with self._session.post(
-                self.url,
-                json=payload,
-                headers=self._request_headers(),
-                timeout=timeout,
-                allow_redirects=False,
-            ) as response:
-                if response.status in {202, 204} and notification:
-                    return None
-                if response.status < 200 or response.status >= 300:
-                    raise MCPError(
-                        f"MCP server '{self.server_id}' returned HTTP {response.status}"
-                    )
-                new_session_id = response.headers.get("MCP-Session-Id")
-                if new_session_id:
-                    self._session_id = new_session_id
-                body = await response.text()
-                if notification and not body.strip():
-                    return None
-                return self._decode_response(body, response.content_type)
-        except (aiohttp.ClientError, TimeoutError) as exc:
-            raise MCPError(
-                f"MCP server '{self.server_id}' request failed: {type(exc).__name__}"
-            ) from exc
-
-    @staticmethod
-    def _decode_response(body: str, content_type: str) -> Dict[str, Any]:
-        if content_type == "text/event-stream" or body.lstrip().startswith(
-            ("event:", "data:")
-        ):
-            events: List[Dict[str, Any]] = []
-            data_lines: List[str] = []
-            for line in body.splitlines() + [""]:
-                if line.startswith("data:"):
-                    data_lines.append(line[5:].lstrip())
-                elif line == "" and data_lines:
-                    try:
-                        value = json.loads("\n".join(data_lines))
-                    except json.JSONDecodeError as exc:
-                        raise MCPProtocolError(
-                            "Invalid JSON in MCP SSE response"
-                        ) from exc
-                    if isinstance(value, dict):
-                        events.append(value)
-                    data_lines = []
-            if not events:
-                raise MCPProtocolError("MCP SSE response contained no JSON-RPC event")
-            return events[-1]
-        try:
-            value = json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise MCPProtocolError("Invalid JSON in MCP HTTP response") from exc
-        if not isinstance(value, dict):
-            raise MCPProtocolError("MCP HTTP response was not a JSON object")
-        return value
+            if operation == "tools/call":
+                raise MCPError(
+                    f"MCP server '{self.server_id}' tool outcome unknown; do not retry without reconciliation"
+                ) from exc
+            raise MCPError(f"MCP server '{self.server_id}' discovery failed ({type(exc).__name__})") from exc

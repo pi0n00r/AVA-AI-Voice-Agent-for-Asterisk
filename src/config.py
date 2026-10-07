@@ -924,7 +924,7 @@ class MCPServerConfig(BaseModel):
     """Configuration for a single MCP server."""
 
     enabled: bool = Field(default=True)
-    transport: str = Field(default="stdio")  # currently: stdio
+    transport: str = Field(default="stdio")  # stdio or streamable_http/streamable-http
     command: List[str] = Field(default_factory=list)  # e.g., ["python3", "-m", "my_mcp_server"]
     url: Optional[str] = None  # streamable-http endpoint
     headers: Dict[str, str] = Field(default_factory=dict)  # env-expanded; never logged

@@ -32,9 +32,13 @@ mcp:
       defaults: {timeout_ms: 15000}
 ```
 
-The HTTP client accepts JSON and SSE JSON-RPC responses, preserves
-`MCP-Session-Id`, uses bounded IPv6/IPv4 connection racing, rejects credentials
-or query data in URLs, never reports configured headers, and refuses redirects.
+The SDK-backed HTTP client negotiates the current MCP protocol, accepts JSON and
+SSE responses, and owns a fresh session per operation. It does not replay an
+unknown-result tool call. The existing `streamable-http` configuration spelling
+remains supported alongside `streamable_http`. URLs reject embedded credentials
+and query data; configured headers are not reported, and redirects are refused.
+The protected YAML loader expands header environment references before handing
+the config to the client; the maintained manager accepts that resolved form.
 
 MCP tools remain in-call tools. Global discovery does not expose a tool to a
 caller: select provider-safe `mcp_<server>_<tool>` names explicitly on the
