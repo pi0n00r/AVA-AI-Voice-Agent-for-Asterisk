@@ -1,7 +1,8 @@
 # Fleet MCP servers
 
-AVA can connect directly to fleet Streamable HTTP MCP servers. Credentials are
-environment-expanded at configuration load and must remain in the protected
+AVA can connect directly to fleet Streamable HTTP MCP servers. Authentication
+headers retain their environment references until the MCP client resolves them
+for each operation. Credentials must remain in the protected
 deployment environment, never in YAML, logs, source, or Admin UI receipts.
 
 ```yaml
@@ -33,12 +34,19 @@ mcp:
 ```
 
 The SDK-backed HTTP client negotiates the current MCP protocol, accepts JSON and
-SSE responses, and owns a fresh session per operation. It does not replay an
-unknown-result tool call. The existing `streamable-http` configuration spelling
+SSE responses, and owns a fresh session per operation. It rejects an SSE reply
+whose JSON-RPC ID does not match the request and does not replay an
+unknown-result tool call. Discovery/setup failures before `tools/call` are
+reported as not invoked, not unknown. The existing `streamable-http` configuration spelling
 remains supported alongside `streamable_http`. URLs reject embedded credentials
 and query data; configured headers are not reported, and redirects are refused.
-The protected YAML loader expands header environment references before handing
-the config to the client; the maintained manager accepts that resolved form.
+The protected YAML loader preserves header templates while expanding other
+configuration fields. Every configured custom header must be an entire
+environment reference; Authorization may prefix that reference with an HTTP
+scheme. Literal headers and defaults such as `${TOKEN:-literal}` are rejected,
+including through the manager path. SDK
+message/session logs are suppressed; AVA retains only metadata-only failure
+diagnostics.
 
 MCP tools remain in-call tools. Global discovery does not expose a tool to a
 caller: select provider-safe `mcp_<server>_<tool>` names explicitly on the

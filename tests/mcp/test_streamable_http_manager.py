@@ -7,6 +7,7 @@ from src.mcp.streamable_http_client import MCPStreamableHTTPClient
 
 def test_manager_builds_streamable_http_client(monkeypatch):
     calls = []
+    monkeypatch.setenv("MCP_TEST_AUTH", "fixture")
 
     async def fake_start(self):
         calls.append((self.server_id, self.url, dict(self.headers)))
@@ -33,7 +34,7 @@ def test_manager_builds_streamable_http_client(monkeypatch):
             "isla": MCPServerConfig(
                 transport="streamable-http",
                 url="https://isla.example/mcp/codex",
-                headers={"Authorization": "Bearer fixture"},
+                headers={"Authorization": "Bearer ${MCP_TEST_AUTH}"},
             )
         },
     )
@@ -41,7 +42,7 @@ def test_manager_builds_streamable_http_client(monkeypatch):
     asyncio.run(manager.start())
 
     assert calls == [
-        ("isla", "https://isla.example/mcp/codex", {"Authorization": "Bearer fixture"})
+        ("isla", "https://isla.example/mcp/codex", {"Authorization": "Bearer ${MCP_TEST_AUTH}"})
     ]
     assert manager._clients["isla"]._resolve_headers() == {"Authorization": "Bearer fixture"}
     status = manager.get_status()
