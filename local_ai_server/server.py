@@ -3880,6 +3880,7 @@ class LocalAIServer:
         session: SessionContext,
         *,
         backend_name: str,
+        idle_elapsed: bool = False,
     ) -> List[Dict[str, Any]]:
         """Decode a buffered Whisper utterance once its per-session endpoint is due."""
         if backend_name == "faster_whisper":
@@ -3912,7 +3913,9 @@ class LocalAIServer:
         now = monotonic()
         since_voice_ms = (now - last_voice) * 1000.0 if last_voice > 0.0 else 0.0
 
-        end_due_to_silence = buf_ms >= min_ms and since_voice_ms >= silence_ms
+        end_due_to_silence = idle_elapsed or (
+            buf_ms >= min_ms and since_voice_ms >= silence_ms
+        )
         end_due_to_max = buf_ms >= max_ms
         if not (end_due_to_silence or end_due_to_max):
             return []
@@ -4325,6 +4328,7 @@ class LocalAIServer:
             if not task.done():
                 task.cancel()
                 cancelled += 1
+            session.response_tasks.discard(task)
         if cancelled:
             logging.info(
                 "🛑 SESSION OUTPUT CANCEL - call_id=%s reason=%s tasks=%d generation=%d",
@@ -6302,6 +6306,7 @@ class LocalAIServer:
                     events = await self._finalize_whisper_segment_if_due(
                         session,
                         backend_name=self.stt_backend,
+                        idle_elapsed=True,
                     )
                     if session.closed:
                         return
@@ -6310,7 +6315,7 @@ class LocalAIServer:
                             continue
                         if event.get("_segment_cancel_generation") != session.stt_segment_cancel_generation:
                             continue
-                        await self._handle_final_transcript(
+                        final_coro = self._handle_final_transcript(
                             websocket,
                             session,
                             request_id,
@@ -6320,6 +6325,12 @@ class LocalAIServer:
                             idle_promoted=True,
                             segment_generation=event.get("_segment_generation"),
                         )
+                        if mode == "stt":
+                            await final_coro
+                        else:
+                            self._start_session_response_task(
+                                session, final_coro, reason="idle-final-transcript"
+                            )
                     return
                 try:
                     result = json.loads(recognizer.FinalResult() or "{}")

@@ -23,7 +23,8 @@ class SessionContext:
     last_final_text: str = ""
     last_final_norm: str = ""
     last_final_at: float = 0.0
-    # An identical phrase in a new Whisper segment is a new utterance.
+    # Whisper segment identity for deduplicating one final without dropping a
+    # later, separate utterance that happens to have the same words.
     last_final_segment_generation: Optional[int] = None
     llm_user_turns: List[str] = field(default_factory=list)
     llm_messages: List[Dict[str, str]] = field(default_factory=list)

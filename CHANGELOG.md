@@ -25,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Whisper idle finalization:** Faster-Whisper and Whisper.cpp now finalize a
+  sufficiently long buffered utterance when its per-session silence deadline
+  expires, even if no later audio frame arrives. Idle-promoted LLM and full
+  turns use the normal session-owned response-task path, and segment-aware
+  deduplication preserves two distinct utterances that contain identical words
+  while suppressing duplicate finals from one segment.
+
 - **Maintained Ava runtime corrections:** distinct Whisper speech segments that
   happen to contain identical words are no longer suppressed as duplicates;
   repeated finals from one segment remain deduplicated. YAML environment
