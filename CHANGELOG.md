@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **DTMF log privacy:** omit raw ARI/AudioSocket digits and payload-bearing exception bodies from structured logs while preserving native digit delivery to attended-transfer and AudioSocket handlers. Nested DTMF fields are fully redacted rather than retaining a prefix.
+
 - **Whisper idle finalization:** Faster-Whisper and Whisper.cpp now finalize a
   sufficiently long buffered utterance when its per-session silence deadline
   expires, even if no later audio frame arrives. Idle-promoted LLM and full
