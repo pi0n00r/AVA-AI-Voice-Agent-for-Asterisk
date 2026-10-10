@@ -230,6 +230,7 @@ async def test_session_response_task_can_be_cancelled_without_waiting_for_work()
     instance._cancel_session_response_tasks(session, reason="barge_in")
     await asyncio.wait_for(cancelled.wait(), timeout=0.2)
     assert task.cancelled()
+    await asyncio.sleep(0)
     assert task not in session.response_tasks
 
 
