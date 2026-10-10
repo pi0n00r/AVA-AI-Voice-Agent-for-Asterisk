@@ -4328,7 +4328,6 @@ class LocalAIServer:
             if not task.done():
                 task.cancel()
                 cancelled += 1
-            session.response_tasks.discard(task)
         if cancelled:
             logging.info(
                 "🛑 SESSION OUTPUT CANCEL - call_id=%s reason=%s tasks=%d generation=%d",

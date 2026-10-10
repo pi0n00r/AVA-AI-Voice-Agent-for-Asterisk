@@ -234,6 +234,40 @@ async def test_session_response_task_can_be_cancelled_without_waiting_for_work()
 
 
 @pytest.mark.asyncio
+async def test_cancelled_response_stays_tracked_until_worker_exits():
+    server_mod = _load("server")
+    session_mod = _load("session")
+    instance = object.__new__(server_mod.LocalAIServer)
+    session = session_mod.SessionContext(call_id="cancel-cleanup")
+    started = asyncio.Event()
+    cancelling = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_cleanup():
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelling.set()
+            await release.wait()
+            raise
+
+    task = instance._start_session_response_task(
+        session, slow_cleanup(), reason="cleanup-test"
+    )
+    await started.wait()
+    instance._cancel_session_response_tasks(session, reason="barge_in")
+    await asyncio.wait_for(cancelling.wait(), timeout=0.2)
+    assert task in session.response_tasks
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0)
+    assert task not in session.response_tasks
+
+
+@pytest.mark.asyncio
 async def test_streaming_llm_lock_is_held_until_cancelled_worker_exits():
     server_mod = _load("server")
     instance = object.__new__(server_mod.LocalAIServer)
