@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Streamable HTTP MCP backend draft:** explicit YAML endpoint and environment-referenced authentication headers use the official Python MCP SDK for protocol negotiation, session headers, JSON/SSE responses and paginated tool discovery. Existing stdio and Agent filtering remain intact. A timed-out tool call is not automatically replayed; its effect may require server-side reconciliation. Admin UI creation/editing and live-call validation remain outside this draft slice.
+- **Streamable HTTP MCP backend:** explicit YAML endpoint and environment-referenced authentication headers use the official Python MCP SDK for protocol negotiation, session headers, JSON/SSE responses and paginated tool discovery. Existing stdio and Agent filtering remain intact. A timed-out tool call is not automatically replayed; its effect may require server-side reconciliation. Live in-call allowed/denied acceptance is complete; Admin UI creation/editing remains follow-up #703.
 
 - **Opt-in cloud provider startup connection recovery** ([#676](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/676)): Google Live/Vertex, OpenAI Realtime, Grok, Deepgram Agent, and ElevenLabs Agent can retry transient initial connection failures with configurable opening and total connection deadlines. Provider forms expose the controls under Expert settings. Upgrades retain a 10-second opening timeout, zero retries, and no added aggregate deadline; setup, mid-call recovery, keepalive, terminal failure routing, and Local behavior are unchanged. Reported and supported with production evidence by [@MVECoder](https://github.com/MVECoder).
 
@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve expanded YAML compatibility when raw flow-style environment references cannot be parsed for MCP header restoration; credentialed HTTP servers fail closed without exposing expanded header values.
+- **Streamable HTTP MCP diagnostics:** suppress SDK/HTTP wire traces that can include session headers or endpoint URLs, and keep remote RPC error text out of application traceback logs. Tool-outcome classification and no-replay behavior are unchanged.
 - **Whisper idle finalization:** finalize buffered speech after per-session silence without requiring another audio frame, while preserving newer speech that arrives during a slow decode or backend-lock wait. Repeated words in distinct speech segments remain separate turns; duplicate finalization of one segment stays suppressed.
 - **DTMF log privacy:** omit raw ARI/AudioSocket digits and payload-bearing exception bodies from structured logs while preserving native digit delivery to attended-transfer and AudioSocket handlers. Nested DTMF fields are fully redacted rather than retaining a prefix.
 
