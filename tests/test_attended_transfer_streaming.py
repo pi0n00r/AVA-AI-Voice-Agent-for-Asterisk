@@ -559,6 +559,7 @@ async def test_deferred_transfer_commit_waits_for_audio_drain(monkeypatch):
         context_name="support",
     )
     session.pending_deferred_transfer = {
+        "id": "action-deferred",
         "kind": "transfer",
         "commit_tool": "blind_transfer",
         "transfer_type": "extension",
@@ -1056,8 +1057,9 @@ async def test_agent_audio_done_defers_transfer_commit_outside_provider_callback
     async def fake_note_output_end(*args, **kwargs):
         return None
 
-    async def controlled_commit(target_call_id, target_session):
+    async def controlled_commit(target_call_id, target_session, *, expected_action_id=None):
         assert target_call_id == call_id
+        assert expected_action_id == "action-provider-callback"
         assert target_session.pending_deferred_transfer["id"] == "action-provider-callback"
         commit_started.set()
         await allow_commit.wait()
@@ -1436,6 +1438,7 @@ async def test_deferred_transfer_deepgram_plays_local_handoff_before_commit(monk
         provider_name="deepgram",
     )
     session.pending_deferred_transfer = {
+        "id": "action-deepgram-handoff",
         "kind": "transfer",
         "commit_tool": "blind_transfer",
         "transfer_type": "extension",
