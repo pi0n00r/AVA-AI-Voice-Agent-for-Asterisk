@@ -8,7 +8,7 @@ AI-NOTICE:Scope=Fleet-authored fork notice; retained upstream source remains MIT
 
 # Ava for Asterisk
 
-This is an independent, source-only maintained fork of
+This is an independent maintained fork of
 [AVA AI Voice Agent for Asterisk](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk).
 It does not provide hosting, commercial services, managed deployment, a public
 demo, or a support program.
@@ -30,12 +30,35 @@ Not every inherited provider, optional integration, sample, or UI path is
 qualified by the maintainers. Validate the intended provider and call path
 before deployment.
 
+## Docker quick start
+
+The supported public package has two profiles built from the same images:
+
+- `starter` includes a sandbox Asterisk server, WebUI, voice engine, and local
+  speech stack for evaluation and customization.
+- `external-pbx` connects that same WebUI and engine to an existing Asterisk or
+  FreePBX server over ARI and AudioSocket.
+
+Operators configure `.env`; the package supplies versioned safe defaults and
+generates the remaining runtime files. Start with:
+
+```bash
+cd deploy/docker
+cp .env.example .env
+./install.sh starter
+```
+
+Open `http://HOST:3003`. For an existing PBX, set its ARI connection in `.env`
+and run `./install.sh external-pbx`. See
+[`deploy/docker/README.md`](deploy/docker/README.md) for the exact boundary,
+first-login process, and upgrade commands.
+
 ## Deployment boundary
 
-This repository contains source, tests, and public documentation. Credentials,
-live configuration, recordings, models, databases, and private deployment
-assembly are intentionally excluded. Cloning it does not reproduce any running
-installation.
+This repository contains source, tests, public documentation, and a generic
+Docker package. Credentials, live configuration, recordings, downloaded models,
+databases, and private deployment assembly remain excluded. The package starts
+a new generic installation; it does not reproduce any private installation.
 
 The maintained branch is `bajaj/maintained`. Review [`CHANGELOG.md`](CHANGELOG.md),
 [`DEPLOY.md`](DEPLOY.md), and [`SECURITY.md`](SECURITY.md) before use. Upgrades

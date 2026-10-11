@@ -1,0 +1,143 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Project=Ava
+# AI-NOTICE:Repository=https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk
+# AI-NOTICE:Author=Gary Bajaj
+
+name: ava
+
+x-common: &common
+  env_file:
+    - .env
+  restart: unless-stopped
+  networks:
+    - ava
+
+services:
+  ai_engine:
+    <<: *common
+    image: ${AVA_ENGINE_IMAGE:-ghcr.io/pi0n00r/ava-ai-engine}:${AVA_IMAGE_TAG:-maintained}
+    container_name: ava-ai-engine
+    depends_on:
+      local_ai_server:
+        condition: service_healthy
+      starter_asterisk:
+        condition: service_healthy
+        required: false
+    volumes:
+      - ./config:/app/config:ro
+      - ava-data:/app/data
+      - ava-logs:/app/logs
+      - ava-media:/app/asterisk_media
+    environment:
+      HEALTH_BIND_HOST: "::"
+      HEALTH_BIND_PORT: "15000"
+      LOCAL_WS_URL: ws://local_ai_server:8765
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://[::1]:15000/health', timeout=4).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  local_ai_server:
+    <<: *common
+    image: ${AVA_LOCAL_AI_IMAGE:-ghcr.io/pi0n00r/ava-local-ai}:${AVA_IMAGE_TAG:-maintained}
+    container_name: ava-local-ai
+    volumes:
+      - ./models:/app/models
+      - ava-data:/app/data
+    environment:
+      LOCAL_WS_HOST: "::"
+      LOCAL_WS_PORT: "8765"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import asyncio, json, os, websockets
+          async def check():
+              async with websockets.connect('ws://[::1]:8765', open_timeout=4) as ws:
+                  token = os.getenv('LOCAL_WS_AUTH_TOKEN', '').strip()
+                  if token:
+                      await ws.send(json.dumps({'type': 'auth', 'auth_token': token}))
+                      assert json.loads(await ws.recv()).get('status') == 'ok'
+                  await ws.send(json.dumps({'type': 'status'}))
+                  assert json.loads(await ws.recv()).get('status') == 'ok'
+          asyncio.run(check())
+      interval: 20s
+      timeout: 8s
+      retries: 45
+      start_period: 90s
+
+  admin_ui:
+    <<: *common
+    image: ${AVA_ADMIN_IMAGE:-ghcr.io/pi0n00r/ava-admin-ui}:${AVA_IMAGE_TAG:-maintained}
+    container_name: ava-admin
+    depends_on:
+      ai_engine:
+        condition: service_started
+    group_add:
+      - ${DOCKER_GID:-999}
+    ports:
+      - "${AVA_BIND_IPV4:-0.0.0.0}:${AVA_ADMIN_PORT:-3003}:3003"
+      - "[${AVA_BIND_IPV6:-::}]:${AVA_ADMIN_PORT:-3003}:3003"
+    volumes:
+      - ./:/app/project
+      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
+      - /etc/os-release:/host/etc/os-release:ro
+      - ava-data:/app/data
+      - ava-media:/mnt/asterisk_media
+    environment:
+      PROJECT_ROOT: /app/project
+      HOST_PROJECT_ROOT: ${HOST_PROJECT_ROOT}
+      UVICORN_HOST: "::"
+      UVICORN_PORT: "3003"
+      HEALTH_CHECK_AI_ENGINE_URL: http://ai_engine:15000
+      HEALTH_CHECK_LOCAL_AI_URL: ws://local_ai_server:8765
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://[::1]:3003/health', timeout=4).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  starter_asterisk:
+    <<: *common
+    image: ${AVA_ASTERISK_IMAGE:-ghcr.io/pi0n00r/ava-starter-asterisk}:${AVA_IMAGE_TAG:-maintained}
+    container_name: ava-starter-asterisk
+    profiles:
+      - starter
+    ports:
+      - "${AVA_BIND_IPV4:-0.0.0.0}:${AVA_SIP_PORT:-5060}:5060/udp"
+      - "[${AVA_BIND_IPV6:-::}]:${AVA_SIP_PORT:-5060}:5060/udp"
+      - "${AVA_BIND_IPV4:-0.0.0.0}:10000-10019:10000-10019/udp"
+      - "[${AVA_BIND_IPV6:-::}]:10000-10019:10000-10019/udp"
+    environment:
+      ASTERISK_ARI_USERNAME: ${ASTERISK_ARI_USERNAME}
+      ASTERISK_ARI_PASSWORD: ${ASTERISK_ARI_PASSWORD}
+      AVA_SIP_USERNAME: ${AVA_SIP_USERNAME:-7001}
+      AVA_SIP_PASSWORD: ${AVA_SIP_PASSWORD}
+      AVA_SIP_EXTENSION: ${AVA_SIP_EXTENSION:-7001}
+      AVA_AGENT_EXTENSION: ${AVA_AGENT_EXTENSION:-700}
+    healthcheck:
+      test: ["CMD", "asterisk", "-rx", "core show uptime"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+networks:
+  ava:
+    name: ava
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.31.76.0/24
+        - subnet: ${AVA_IPV6_SUBNET:-fd76:6176:6100::/64}
+
+volumes:
+  ava-data:
+  ava-logs:
+  ava-media:

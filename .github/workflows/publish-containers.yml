@@ -1,0 +1,173 @@
+# AI-NOTICE:Schema-Version=0.1
+# AI-NOTICE:License=AGPL-3.0-or-later
+# AI-NOTICE:Project=Ava
+# AI-NOTICE:Repository=https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk
+# AI-NOTICE:Author=Gary Bajaj
+name: Publish Docker images
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [bajaj/maintained]
+    paths:
+      - Dockerfile
+      - README.md
+      - admin_ui/**
+      - assets/audio/**
+      - deploy/docker/**
+      - local_ai_server/**
+      - main.py
+      - requirements.txt
+      - scripts/build_docker_bundle.py
+      - scripts/model_setup.sh
+      - src/**
+      - tests/test_docker_distribution.py
+      - .github/workflows/publish-containers.yml
+  push:
+    branches: [bajaj/maintained]
+    paths:
+      - Dockerfile
+      - admin_ui/**
+      - assets/audio/**
+      - config/**
+      - deploy/docker/**
+      - local_ai_server/**
+      - main.py
+      - requirements.txt
+      - scripts/build_docker_bundle.py
+      - scripts/model_setup.sh
+      - src/**
+      - .github/workflows/publish-containers.yml
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install pytest pyyaml
+      - run: pytest -q tests/test_docker_distribution.py
+      - run: bash -n deploy/docker/install.sh scripts/model_setup.sh deploy/docker/asterisk/entrypoint.sh
+      - run: python -m compileall -q deploy/docker/asterisk/render_config.py scripts/build_docker_bundle.py
+      - name: Build self-contained Docker package
+        env:
+          SOURCE_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python scripts/build_docker_bundle.py --version "${SOURCE_REF::12}" --source-ref "$SOURCE_REF" --output dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ava-docker-${{ github.sha }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+      - name: Validate both Compose profiles
+        working-directory: deploy/docker
+        run: |
+          cp .env.example .env
+          chmod 0600 .env
+          COMPOSE_PROFILES=starter docker compose -f compose.yaml config --quiet
+          COMPOSE_PROFILES=external-pbx docker compose -f compose.yaml config --quiet
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ava-ai-engine
+            file: Dockerfile
+            context: .
+          - name: ava-admin-ui
+            file: admin_ui/Dockerfile
+            context: .
+          - name: ava-local-ai
+            file: local_ai_server/Dockerfile
+            context: local_ai_server
+          - name: ava-starter-asterisk
+            file: deploy/docker/asterisk/Dockerfile
+            context: .
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}
+          tags: |
+            type=raw,value=maintained
+            type=sha,format=long
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64
+          provenance: mode=max
+          sbom: true
+
+  smoke-starter:
+    if: github.event_name == 'push'
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Build and extract exact-source package
+        run: |
+          python scripts/build_docker_bundle.py \
+            --version "$GITHUB_SHA" \
+            --source-ref "$GITHUB_SHA" \
+            --output dist
+          tar -xzf "dist/ava-docker-${GITHUB_SHA}.tar.gz" -C dist
+      - name: Install starter profile
+        working-directory: dist/ava-docker-${{ github.sha }}
+        run: ./install.sh starter
+      - name: Verify healthy dual-stack starter
+        working-directory: dist/ava-docker-${{ github.sha }}
+        run: |
+          for attempt in $(seq 1 60); do
+            all_healthy=true
+            for container in ava-ai-engine ava-local-ai ava-admin ava-starter-asterisk; do
+              state=$(docker inspect --format '{{.State.Status}} {{.State.Health.Status}}' "$container" 2>/dev/null || true)
+              [ "$state" = "running healthy" ] || all_healthy=false
+            done
+            if [ "$all_healthy" = true ]; then
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              docker compose ps
+              docker compose logs --tail=100
+              exit 1
+            fi
+            sleep 10
+          done
+          curl --fail --silent --show-error --noproxy '*' http://127.0.0.1:3003/health >/dev/null
+          curl --fail --silent --show-error --noproxy '*' 'http://[::1]:3003/health' >/dev/null
+          docker exec ava-starter-asterisk grep -F 'bind=[::]:5060' /etc/asterisk/pjsip.conf
+          docker exec ava-starter-asterisk asterisk -rx 'pjsip show transport transport-udp' | grep -E 'Bind:.*::.*5060'
+      - name: Remove smoke stack
+        if: always()
+        working-directory: dist/ava-docker-${{ github.sha }}
+        run: docker compose down --volumes --remove-orphans
