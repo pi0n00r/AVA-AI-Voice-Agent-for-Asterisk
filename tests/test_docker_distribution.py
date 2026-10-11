@@ -38,6 +38,12 @@ def test_operator_configuration_is_env_only():
     assert (BUNDLE / "defaults" / "ai-agent.yaml").is_file()
 
 
+def test_admin_image_contains_shared_runtime_package():
+    dockerfile = (ROOT / "admin_ui" / "Dockerfile").read_text(encoding="utf-8")
+    assert "COPY src/ ./src/" in dockerfile
+    assert "COPY src/config_apply.py ./config_apply.py" not in dockerfile
+
+
 def test_starter_dialplan_enters_stasis_without_audiosocket_duplication():
     source = (BUNDLE / "asterisk" / "render_config.py").read_text(encoding="utf-8")
     assert "Stasis(asterisk-ai-voice-agent)" in source

@@ -51,10 +51,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy backend code
 COPY admin_ui/backend/ .
 
-# Keep config apply/restart classification identical to the AI Engine. The
-# Admin image has a separate runtime tree, so copy the dependency-free shared
-# policy into its import root from the same repository source file.
-COPY src/config_apply.py ./config_apply.py
+# The Admin API imports shared configuration, tools, and runtime helpers from
+# the AI Engine package. Keep that package in the image instead of copying an
+# incomplete subset that can pass the image build but fail at application boot.
+COPY src/ ./src/
 
 # Copy built frontend assets to backend's static directory
 COPY --from=frontend-builder /app/frontend/dist ./static
