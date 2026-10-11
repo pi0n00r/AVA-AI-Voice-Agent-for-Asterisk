@@ -49,7 +49,8 @@ COPY --from=builder /opt/venv /opt/venv
 
 # Copy application source code
 COPY --chown=appuser:appuser src/ ./src
-COPY --chown=appuser:appuser config/ ./config
+RUN mkdir -p ./config && chown appuser:appuser ./config
+COPY --chown=appuser:appuser deploy/docker/defaults/ai-agent.yaml ./config/ai-agent.yaml
 COPY --chown=appuser:appuser assets/audio/receptionist-typing-cc0.wav ./assets/audio/receptionist-typing-cc0.wav
 COPY --chown=appuser:appuser assets/audio/receptionist-typing-cc0.LICENSE ./assets/audio/receptionist-typing-cc0.LICENSE
 COPY --chown=appuser:appuser main.py ./

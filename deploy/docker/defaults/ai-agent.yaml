@@ -1,0 +1,95 @@
+config_version: 6
+active_pipeline: local_hybrid
+default_provider: local_hybrid
+downstream_mode: stream
+audio_transport: audiosocket
+
+asterisk:
+  app_name: asterisk-ai-voice-agent
+  ws_ping_interval_sec: 10
+  ws_ping_timeout_sec: 10
+
+audiosocket:
+  host: "::"
+  advertise_host: ai_engine
+  port: 8090
+  format: slin16
+
+external_media:
+  rtp_host: "::"
+  advertise_host: ai_engine
+  rtp_port: 18080
+  port_range: "18080:18099"
+  codec: ulaw
+  format: slin16
+  sample_rate: 16000
+  direction: both
+  allowed_remote_hosts:
+    - 172.31.76.0/24
+    - fd76:6176:6100::/64
+  lock_remote_endpoint: true
+
+llm:
+  initial_greeting: Hello, how can I help you today?
+  prompt: Voice assistant. Be concise and conversational.
+
+pipelines:
+  local_hybrid:
+    stt: local_stt
+    llm: local_llm
+    tts: local_tts
+    tools: null
+    options:
+      stt:
+        ws_url: ${LOCAL_WS_URL:-ws://local_ai_server:8765}
+        mode: stt
+        streaming: true
+        stream_format: pcm16_16k
+        chunk_ms: 160
+      llm:
+        ws_url: ${LOCAL_WS_URL:-ws://local_ai_server:8765}
+        mode: llm
+      tts:
+        ws_url: ${LOCAL_WS_URL:-ws://local_ai_server:8765}
+        mode: tts
+        response_timeout_sec: 30
+        format:
+          encoding: mulaw
+          sample_rate: 8000
+
+profiles:
+  default: telephony_ulaw_8k
+  telephony_ulaw_8k:
+    output_resampler: linear
+    chunk_ms: auto
+    idle_cutoff_ms: 800
+    internal_rate_hz: 8000
+    provider_pref:
+      input_encoding: mulaw
+      input_sample_rate_hz: 8000
+      output_encoding: mulaw
+      output_sample_rate_hz: 8000
+    transport_out:
+      encoding: ulaw
+      sample_rate_hz: 8000
+
+barge_in:
+  enabled: true
+  initial_protection_ms: 200
+  min_ms: 250
+  energy_threshold: 1000
+  cooldown_ms: 500
+  pipeline_min_ms: 120
+  pipeline_energy_threshold: 300
+  pipeline_talk_detect_enabled: true
+  pipeline_talk_detect_silence_ms: 1200
+  pipeline_talk_detect_talking_threshold: 256
+  post_tts_end_protection_ms: 250
+  greeting_protection_ms: 5000
+
+contexts: {}
+providers: {}
+tools: {}
+mcp:
+  enabled: false
+  servers: {}

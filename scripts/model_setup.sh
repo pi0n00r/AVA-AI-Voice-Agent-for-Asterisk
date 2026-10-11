@@ -8,7 +8,7 @@ set -euo pipefail
 # Paths mirror models/registry.json
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
-MODELS_DIR="${ROOT_DIR}/models"
+MODELS_DIR="${AVA_MODELS_DIR:-${ROOT_DIR}/models}"
 ASSUME_YES=0
 TIER_OVERRIDE=""
 LANGUAGE="en-US"
