@@ -6,9 +6,13 @@ By participating in this project, you agree to abide by its terms.
 
 ## Enforcement
 
-Instances of unacceptable behavior may be reported to: **security@jugaar.llc**
+This source-only fork does not operate the upstream project's community or
+support channels. Repository conduct that also violates GitHub policy should be
+reported through GitHub's reporting tools. A contributor who already has a
+private channel with the repository owner may use it for a confidential report.
 
-Reports will be reviewed and investigated promptly and fairly. All community leaders are obligated to respect the privacy and security of the reporter.
+Do not publish sensitive conduct reports in a public issue or pull request.
+Reports are handled on a best-effort basis without a response-time commitment.
 
 ## Summary
 
