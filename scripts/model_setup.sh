@@ -188,7 +188,21 @@ select_tier() {
   ram=$(ram_gb)
   gpu=$(detect_gpu)
   
-  if [ -n "$TIER_OVERRIDE" ]; then echo "$TIER_OVERRIDE"; return; fi
+  if [ -n "$TIER_OVERRIDE" ]; then
+    case "${TIER_OVERRIDE^^}" in
+      LIGHT) echo LIGHT_CPU ;;
+      MEDIUM) [ "$gpu" -eq 1 ] && echo MEDIUM_GPU || echo MEDIUM_CPU ;;
+      HEAVY) [ "$gpu" -eq 1 ] && echo HEAVY_GPU || echo HEAVY_CPU ;;
+      LIGHT_CPU|MEDIUM_CPU|HEAVY_CPU|MEDIUM_GPU|HEAVY_GPU)
+        echo "${TIER_OVERRIDE^^}"
+        ;;
+      *)
+        echo "Invalid --tier value: $TIER_OVERRIDE" >&2
+        return 2
+        ;;
+    esac
+    return
+  fi
   
   # GPU-accelerated tiers
   if [ "$gpu" -eq 1 ]; then

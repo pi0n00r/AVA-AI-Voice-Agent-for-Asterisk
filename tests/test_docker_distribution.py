@@ -162,3 +162,46 @@ def test_standalone_bundle_is_reproducible_complete_and_installable(tmp_path):
         text=True,
     )
     assert (extracted / ".env").stat().st_mode & 0o777 == 0o600
+
+
+def test_documented_light_model_tier_is_accepted_without_network(tmp_path):
+    fake_bin = tmp_path / "model-bin"
+    fake_bin.mkdir()
+    curl = fake_bin / "curl"
+    curl.write_text(
+        "#!/bin/sh\n"
+        "while [ $# -gt 0 ]; do\n"
+        "  if [ \"$1\" = -o ]; then shift; mkdir -p \"$(dirname \"$1\")\"; : > \"$1\"; exit 0; fi\n"
+        "  shift\n"
+        "done\n"
+        "exit 2\n",
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+    unzip = fake_bin / "unzip"
+    unzip.write_text(
+        "#!/bin/sh\n"
+        "while [ $# -gt 0 ]; do\n"
+        "  if [ \"$1\" = -d ]; then shift; mkdir -p \"$1\"; : > \"$1/README\"; exit 0; fi\n"
+        "  shift\n"
+        "done\n"
+        "exit 2\n",
+        encoding="utf-8",
+    )
+    unzip.chmod(0o755)
+    models = tmp_path / "models"
+    env = {
+        **os.environ,
+        "AVA_MODELS_DIR": str(models),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+    }
+    result = subprocess.run(
+        [str(ROOT / "scripts" / "model_setup.sh"), "--tier", "LIGHT", "--assume-yes"],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "Selected tier: LIGHT_CPU (override)" in result.stdout
+    assert "Models ready" in result.stdout
+    assert (models / "llm" / "qwen2.5-1.5b-instruct-q4_k_m.gguf").is_file()
