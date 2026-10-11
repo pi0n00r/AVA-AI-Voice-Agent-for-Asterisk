@@ -1,5 +1,6 @@
 from pathlib import Path
 import hashlib
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -42,6 +43,26 @@ def test_admin_image_contains_shared_runtime_package():
     dockerfile = (ROOT / "admin_ui" / "Dockerfile").read_text(encoding="utf-8")
     assert "COPY src/ ./src/" in dockerfile
     assert "COPY src/config_apply.py ./config_apply.py" not in dockerfile
+    assert 'CMD ["python", "/app/dual_stack_server.py"]' in dockerfile
+
+
+def test_admin_dual_stack_listener_accepts_ipv4_and_ipv6():
+    module_path = ROOT / "admin_ui" / "backend" / "dual_stack_server.py"
+    spec = importlib.util.spec_from_file_location("dual_stack_server", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    listener = module.create_listener("::", 0)
+    try:
+        assert listener.getsockopt(module.socket.IPPROTO_IPV6, module.socket.IPV6_V6ONLY) == 0
+        port = listener.getsockname()[1]
+        with module.socket.create_connection(("127.0.0.1", port), timeout=1):
+            pass
+        with module.socket.create_connection(("::1", port), timeout=1):
+            pass
+    finally:
+        listener.close()
 
 
 def test_starter_dialplan_enters_stasis_without_audiosocket_duplication():
