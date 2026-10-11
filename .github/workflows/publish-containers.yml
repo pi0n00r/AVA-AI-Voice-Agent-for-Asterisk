@@ -168,7 +168,9 @@ jobs:
           curl --fail --silent --show-error --noproxy '*' http://127.0.0.1:3003/health >/dev/null
           curl --fail --silent --show-error --noproxy '*' 'http://[::1]:3003/health' >/dev/null
           docker exec ava-starter-asterisk grep -F 'bind=[::]:5060' /etc/asterisk/pjsip.conf
-          docker exec ava-starter-asterisk asterisk -rx 'pjsip show transport transport-udp' | grep -E 'Bind:.*::.*5060'
+          transport=$(docker exec ava-starter-asterisk asterisk -rx 'pjsip show transport transport-udp')
+          printf '%s\n' "$transport"
+          printf '%s\n' "$transport" | grep -F '[::]:5060'
       - name: Remove smoke stack
         if: always()
         working-directory: dist/ava-docker-${{ github.sha }}

@@ -65,6 +65,15 @@ def test_admin_dual_stack_listener_accepts_ipv4_and_ipv6():
         listener.close()
 
 
+def test_starter_smoke_checks_live_ipv6_transport_endpoint():
+    workflow = (ROOT / ".github" / "workflows" / "publish-containers.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "pjsip show transport transport-udp" in workflow
+    assert "grep -F '[::]:5060'" in workflow
+    assert "Bind:.*::.*5060" not in workflow
+
+
 def test_starter_dialplan_enters_stasis_without_audiosocket_duplication():
     source = (BUNDLE / "asterisk" / "render_config.py").read_text(encoding="utf-8")
     assert "Stasis(asterisk-ai-voice-agent)" in source
