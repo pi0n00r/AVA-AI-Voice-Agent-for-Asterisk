@@ -13,6 +13,16 @@ This is an independent maintained fork of
 It does not provide hosting, commercial services, managed deployment, a public
 demo, or a support program.
 
+## No fundraising
+
+This fork does not solicit or accept donations. Any fundraising links, prompts,
+or payment destinations inherited from upstream are not operated, endorsed, or
+accepted by this fork or its maintainers. They remain source artifacts pending
+removal from the maintained runtime during the next upstream integration.
+
+If you wish to support the original project, verify the recipient independently
+through the upstream repository. No contribution made elsewhere funds this fork.
+
 ## Maintained scope
 
 The fork retains upstream's voice-agent application and operator UI while
