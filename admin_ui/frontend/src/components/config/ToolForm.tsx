@@ -1,3 +1,5 @@
+import { ToolSection } from './toolSections';
+import TransferHandoffFields from './TransferHandoffFields';
 import React, { useEffect, useRef, useState } from 'react';
 import axios from 'axios';
 import { toast } from 'sonner';
@@ -9,6 +11,8 @@ import HelpTooltip from '../ui/HelpTooltip';
 import { MicrosoftBookingSettings } from './MicrosoftBookingSettings';
 
 interface ToolFormProps {
+    // Keep the form mounted while navigating so OAuth and local field drafts survive.
+    section?: ToolSection;
     config: any;
     contexts?: Record<string, any>;
     hangupUsage?: {
@@ -114,7 +118,11 @@ const DEVICE_STATE_STATUS_OPTIONS: { value: string; label: string }[] = [
     { value: 'unavailable', label: 'Unavailable' },
 ];
 
-const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, onSaveNow }: ToolFormProps) => {
+const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, onSaveNow, section }: ToolFormProps) => {
+    // Background connection/verification requests can complete after the operator
+    // navigates to another tool. Merge their results into the current draft.
+    const latestConfigRef = useRef(config);
+    latestConfigRef.current = config;
     // Migrate calendar key references in all contexts' selected_calendars
     const migrateCalendarKeyInContexts = (oldKey: string, newKey: string | null) => {
         if (!contexts || !onContextsChange) return;
@@ -332,12 +340,16 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                 // the operator has explicitly typed (e.g. they want a different
                 // display tz than the calendar's own tz).
                 const calActualTz = res.data?.calendar_actual_timezone || '';
-                if (calActualTz && !((cal as any)?.timezone || '').trim()) {
-                    const cals = { ...(config.google_calendar?.calendars || {}) };
+                const current = latestConfigRef.current;
+                const currentCalendar = current.google_calendar?.calendars?.[key];
+                const canAutofill = currentCalendar && _verifyFingerprint(currentCalendar) === _verifyFingerprint(cal)
+                    && calActualTz && !(currentCalendar.timezone || '').trim();
+                if (canAutofill) {
+                    const cals = { ...(current.google_calendar?.calendars || {}) };
                     cals[key] = { ...(cals[key] || {}), timezone: calActualTz };
                     onChange({
-                        ...config,
-                        google_calendar: { ...(config.google_calendar || {}), calendars: cals },
+                        ...current,
+                        google_calendar: { ...(current.google_calendar || {}), calendars: cals },
                     });
                 }
                 // Use the post-autofill cal snapshot for the fingerprint, not
@@ -347,7 +359,7 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                 // pre-autofill state. The next field-change check would
                 // immediately invalidate the green check on something that
                 // didn't actually change. CodeRabbit minor finding.
-                const calForFingerprint = (calActualTz && !((cal as any)?.timezone || '').trim())
+                const calForFingerprint = canAutofill
                     ? { ...cal, timezone: calActualTz }
                     : cal;
                 setVerifyByKey((prev) => ({
@@ -437,7 +449,13 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
 
                 // Build the next config in one shot. Always set credentials_path; conditionally
                 // set calendar_id + timezone if discovery returned exactly 1 reachable calendar.
-                const cals = { ...(config.google_calendar?.calendars || {}) };
+                const current = latestConfigRef.current;
+                const cals = { ...(current.google_calendar?.calendars || {}) };
+                if (!cals[key]) {
+                    setUploadByKey(prev => ({ ...prev, [key]: { uploading: false } }));
+                    toast.warning('Credentials uploaded, but the calendar was removed. No calendar settings were changed.');
+                    return;
+                }
                 const existing = cals[key] || {};
                 const updates: any = {
                     ...existing,
@@ -450,8 +468,8 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                 }
                 cals[key] = updates;
                 onChange({
-                    ...config,
-                    google_calendar: { ...(config.google_calendar || {}), calendars: cals },
+                    ...current,
+                    google_calendar: { ...(current.google_calendar || {}), calendars: cals },
                 });
 
                 setUploadByKey((prev) => ({
@@ -555,12 +573,13 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
 
         const microsoftAccount = config.microsoft_calendar?.accounts?.default || {};
         const updateMicrosoftAccount = (patch: Record<string, any>) => {
-            const accounts = { ...(config.microsoft_calendar?.accounts || {}) };
+            const current = latestConfigRef.current;
+            const accounts = { ...(current.microsoft_calendar?.accounts || {}) };
             accounts.default = { ...(accounts.default || {}), ...patch };
             onChange({
-                ...config,
+                ...current,
                 microsoft_calendar: {
-                    ...(config.microsoft_calendar || {}),
+                    ...(current.microsoft_calendar || {}),
                     accounts,
                 },
             });
@@ -608,12 +627,13 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                         const result = res.data?.result || {};
                         const calendars: MsCalendarSummary[] = result.calendars || [];
                         const defaultCal = calendars.find((c) => c.is_default_calendar) || calendars[0];
+                        const latestAccount = latestConfigRef.current?.microsoft_calendar?.accounts?.default || {};
                         setMsCalendars(calendars);
                         updateMicrosoftAccount({
                             token_cache_path: result.token_cache_path || '',
                             user_principal_name: result.user_principal_name || '',
-                            calendar_id: defaultCal?.id || microsoftAccount.calendar_id || '',
-                            timezone: microsoftAccount.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+                            calendar_id: defaultCal?.id || latestAccount.calendar_id || '',
+                            timezone: latestAccount.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
                         });
                         setMsDevice((prev) => ({ ...prev, status: 'success' }));
                         toast.success('Microsoft Calendar connected');
@@ -1336,6 +1356,10 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
 
     const handleSaveDestination = () => {
         if (!destinationForm.key) return;
+        if (destinationForm.handoff?.mode === 'custom' && !destinationForm.handoff.message?.trim()) {
+            toast.error('Enter a custom transfer announcement before saving.');
+            return;
+        }
 
         const destinations = { ...(config.transfer?.destinations || {}) };
 
@@ -1367,7 +1391,7 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
     return (
         <div className="space-y-8">
             {/* AI Identity & General Settings */}
-            <div className="space-y-4 border-b border-border pb-6">
+            <div hidden={section !== undefined && section !== 'defaults'} className="space-y-4 border-b border-border pb-6">
                 <h3 className="text-lg font-semibold text-primary">General Settings</h3>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                     <FormInput
@@ -1393,11 +1417,11 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
             </div>
 
             {/* Telephony Tools */}
-            <div className="space-y-6">
-                <h3 className="text-lg font-semibold text-primary">Telephony Tools</h3>
+            <div hidden={section !== undefined && !['transfer', 'hangup_call', 'leave_voicemail'].includes(section)} className="space-y-6">
+                <h3 hidden={section !== undefined} className="text-lg font-semibold text-primary">Telephony Tools</h3>
 
                 {/* Transfer Tool */}
-                <div className="border border-border rounded-lg p-4 bg-card/50">
+                <div hidden={section !== undefined && section !== 'transfer'} className="border border-border rounded-lg p-4 bg-card/50">
                     <div className="flex justify-between items-center mb-4">
                         <FormSwitch
                             label="Transfer Tool"
@@ -1410,13 +1434,6 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
 
 	                    {config.transfer?.enabled !== false && (
 	                        <div className="mt-4 space-y-4">
-		                            <FormInput
-		                                label="Channel Technology"
-		                                value={config.transfer?.technology || 'PJSIP'}
-		                                onChange={(e) => updateNestedConfig('transfer', 'technology', e.target.value.trim() || 'PJSIP')}
-		                                tooltip="Channel technology for extension transfers (PJSIP, SIP, IAX2, etc.). Default: PJSIP"
-		                                placeholder="PJSIP"
-		                            />
                                     <FormSwitch
                                         label="Defer Transfer Until Playback Completes"
                                         description="Speak the handoff message before executing blind, live-agent, or attended transfer actions."
@@ -1424,7 +1441,22 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                                         onChange={(e) => updateNestedConfig('transfer', 'defer_until_playback_complete', e.target.checked)}
                                         className="mb-0 border border-border rounded-lg p-3 bg-background/50"
                                     />
-                                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                    <TransferHandoffFields
+                                        value={config.transfer?.handoff}
+                                        disabled={config.transfer?.defer_until_playback_complete === false}
+                                        onChange={value => updateNestedConfig('transfer', 'handoff', value)}
+                                    />
+                                    <details open={section === undefined ? true : undefined} className="border-t border-border pt-4">
+                                        <summary className="cursor-pointer text-sm font-medium">Advanced transfer settings — routing and timing</summary>
+                                        <div className="space-y-4 pt-4">
+                                            <FormInput
+		                                label="Channel Technology"
+		                                value={config.transfer?.technology || 'PJSIP'}
+		                                onChange={(e) => updateNestedConfig('transfer', 'technology', e.target.value.trim() || 'PJSIP')}
+		                                tooltip="Channel technology for extension transfers (PJSIP, SIP, IAX2, etc.). Default: PJSIP"
+		                                placeholder="PJSIP"
+		                            />
+                                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                                         <FormSelect
                                             label="Deferred Transfer Strategy"
                                             value={config.transfer?.deferred_strategy || 'drain_then_dial'}
@@ -1558,7 +1590,9 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
 	                                    tooltip="Advanced/legacy override for live_agent_transfer. When set, live-agent requests route to this destination key instead of Live Agents."
 	                                />
 	                            )}
-	                            <div className="flex justify-between items-center">
+	                            </div>
+                                    </details>
+                                    <div className="flex justify-between items-center">
 	                                <FormLabel>Destinations</FormLabel>
 	                                <button
 	                                    onClick={handleAddDestination}
@@ -1610,7 +1644,7 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                 </div>
 
                 {/* Attended (Warm) Transfer */}
-                <div className="border border-border rounded-lg p-4 bg-card/50">
+                <div hidden={section !== undefined && section !== 'transfer'} className="border border-border rounded-lg p-4 bg-card/50">
                     <FormSwitch
                         label="Attended Transfer (Warm)"
                         description="Warm transfer with MOH, one-way announcement to the agent, and DTMF accept/decline. Requires Local AI Server for TTS. AI Briefing is experimental, requires Local AI Server LLM capability, and falls back to Basic TTS when unavailable."
@@ -1796,7 +1830,7 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                 </div>
 
                 {/* Cancel Transfer */}
-                <div className="border border-border rounded-lg p-4 bg-card/50">
+                <div hidden={section !== undefined && section !== 'transfer'} className="border border-border rounded-lg p-4 bg-card/50">
                     <FormSwitch
                         label="Cancel Transfer"
                         description="Allow callers to cancel an in-progress transfer."
@@ -1816,7 +1850,7 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                 </div>
 
                 {/* Check Extension Status */}
-                <div className="border border-border rounded-lg p-4 bg-card/50">
+                <div hidden={section !== undefined && section !== 'transfer'} className="border border-border rounded-lg p-4 bg-card/50">
                     <div className="space-y-2">
                         <FormLabel tooltip="Controls whether availability checks are limited to extensions explicitly configured under Live Agents or Transfer Destinations. Disable only if you intentionally want the model to probe arbitrary extension numbers.">
                             Check Extension Status
@@ -1881,7 +1915,7 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                 </div>
 
                 {/* Hangup Call */}
-                <div className="border border-border rounded-lg p-4 bg-card/50">
+                <div hidden={section !== undefined && section !== 'hangup_call'} className="border border-border rounded-lg p-4 bg-card/50">
                     <FormSwitch
                         label="Hangup Call"
                         description="Allow the agent to end the call gracefully. Call ending behavior is controlled via agent prompts."
@@ -2052,7 +2086,7 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                 </div>
 
                 {/* Leave Voicemail */}
-                <div className="border border-border rounded-lg p-4 bg-card/50">
+                <div hidden={section !== undefined && section !== 'leave_voicemail'} className="border border-border rounded-lg p-4 bg-card/50">
                     <FormSwitch
                         label="Leave Voicemail"
                         description="Transfer caller to a voicemail box."
@@ -2181,7 +2215,7 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                 </div>
 
 	                {/* Extensions (basic editor) */}
-	                <div className="border border-border rounded-lg p-4 bg-card/50">
+	                <div hidden={section !== undefined && section !== 'transfer'} className="border border-border rounded-lg p-4 bg-card/50">
 	                    <div className="flex justify-between items-center mb-4">
 	                        <FormLabel>Live Agents</FormLabel>
 	                        <button
@@ -2237,6 +2271,14 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
 
                                     return (
 	                            <div key={rowId} className="flex flex-col gap-4 p-5 border border-border/60 rounded-lg bg-card/40 hover:bg-card/60 transition-colors shadow-sm">
+
+                                <TransferHandoffFields override value={ext.handoff} global={config.transfer?.handoff}
+                                    disabled={config.transfer?.defer_until_playback_complete === false}
+                                    onChange={value => {
+                                        const updated = { ...(config.extensions?.internal || {}) };
+                                        updated[key] = { ...ext, handoff: value };
+                                        updateNestedConfig('extensions', 'internal', updated);
+                                    }} />
 
                                 {/* Core Info Row */}
                                 <div className="flex flex-col xl:flex-row gap-4 xl:items-end items-start w-full">
@@ -2554,11 +2596,11 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
             </div>
 
             {/* Business Tools */}
-            <div className="space-y-6 border-t border-border pt-6">
-                <h3 className="text-lg font-semibold text-primary">Business Tools</h3>
+            <div hidden={section !== undefined && !['send_email_summary', 'request_transcript', 'google_calendar', 'microsoft_calendar'].includes(section)} className="space-y-6 border-t border-border pt-6">
+                <h3 hidden={section !== undefined} className="text-lg font-semibold text-primary">Business Tools</h3>
 
                 {/* Send Email Summary */}
-                <div className="border border-border rounded-lg p-4 bg-card/50">
+                <div hidden={section !== undefined && section !== 'send_email_summary'} className="border border-border rounded-lg p-4 bg-card/50">
                     <FormSwitch
                         label="Send Email Summary"
                         description="Automatically send a call summary to the admin after each call."
@@ -2794,7 +2836,7 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                 </div>
 
                 {/* Request Transcript */}
-                <div className="border border-border rounded-lg p-4 bg-card/50">
+                <div hidden={section !== undefined && section !== 'request_transcript'} className="border border-border rounded-lg p-4 bg-card/50">
                     <FormSwitch
                         label="Request Transcript"
                         description="Allow callers to request a transcript via email."
@@ -3036,7 +3078,7 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                 </div>
 
                 {/* Google Calendar */}
-                <div className="border border-border rounded-lg p-4 bg-card/50">
+                <div hidden={section !== undefined && section !== 'google_calendar'} className="border border-border rounded-lg p-4 bg-card/50">
                     <FormSwitch
                         label="Google Calendar"
                         description="Enable the Google Calendar tool for listing events, creating events, and finding free slots."
@@ -3567,7 +3609,7 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                 </div>
 
                 {/* Microsoft Calendar */}
-                <div className="border border-border rounded-lg p-4 bg-card/50">
+                <div hidden={section !== undefined && section !== 'microsoft_calendar'} className="border border-border rounded-lg p-4 bg-card/50">
                     <FormSwitch
                         label="Microsoft Calendar"
                         description="Enable the Microsoft 365 Outlook Calendar tool using device-code OAuth."
@@ -3780,6 +3822,9 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                 }
             >
                 <div className="space-y-4">
+                    <TransferHandoffFields override value={destinationForm.handoff} global={config.transfer?.handoff}
+                        disabled={config.transfer?.defer_until_playback_complete === false}
+                        onChange={value => setDestinationForm({ ...destinationForm, handoff: value })} />
                     <FormInput
                         label="Key (Name)"
                         value={destinationForm.key || ''}
