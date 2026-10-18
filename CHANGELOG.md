@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Tools configuration:** replace the expanded built-in settings page with a
+  searchable tool list and dedicated editors. Keep call-phase navigation,
+  shared tool defaults, a read-only runtime catalog, and all existing settings.
+  HTTP editors explicitly stage changes with **Update tool** before the page's
+  **Save & Apply** action. Transfer routing/timing settings use a disclosure.
+
+### Fixed
+
+- **Tools save/apply and navigation:** preserve drafts and calendar connection
+  state while moving between editors; merge background calendar results into the
+  latest draft, including Microsoft timezone/calendar fallback values edited
+  during sign-in. Keep blur-committed fields in saves, block editing after a failed
+  configuration load, and distinguish failed/partial reloads from full application.
+  Restore keyboard focus after HTTP editing and match accessible action names
+  to the visible Configure labels.
+
+- **Deferred transfer announcements (#743):** optional global and per-target
+  announcement waiting across all full-agent providers and modular pipelines.
+  One action-scoped coordinator admits the intended response before the #702
+  repeat gate closes, retains playback drain and hangup/recovery ownership, and
+  bounds missing-start/completion waits. Admin UI and both config APIs share
+  validation; announcement waiting stays disabled until explicitly enabled.
+  Originating-turn fast release requires the full normalized sentence at the
+  start of the transcript; a later occurrence waits for the bounded reply path.
+  Google Live acceptance verified delayed and originating-turn announcements
+  without a repeated announcement or transfer commit; see the
+  [revision-pinned validation](docs/baselines/golden/transfer-announcement-743-validation.md).
+  Review hardening clears completed-call evidence, admits replies when the
+  tool precedes all audio, preserves Grok action metadata until the wire
+  boundary, recovers when preparation evidence is missing, and keeps timing
+  fields editable until blur. Announcement playback startup is bounded and
+  cancellation retains ownership until a remote stop is confirmed or its bounded
+  retry budget enters terminal call cleanup; delivered
+  function outputs are not reclassified when a later response request fails.
+  Action creation and playback selection share legacy provider-list normalization
+  so case, whitespace, string/list and boolean forms cannot select two owners.
+
 ## [7.6.4] - 2026-10-16
 
 Release scope: merged PRs [#739](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/739),
