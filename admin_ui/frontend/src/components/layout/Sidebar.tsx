@@ -20,8 +20,6 @@ import {
     Code,
     HelpCircle,
     ExternalLink,
-    Coffee,
-    Heart,
     HardDrive,
     ArrowUpCircle,
     Phone,
@@ -32,7 +30,6 @@ import {
     ChevronsRight
 } from 'lucide-react';
 import { useAuth } from '../../auth/AuthContext';
-import { KOFI_URL, SPONSORS_URL } from '../../config/donation';
 import { useSidebarCollapsed } from '../../hooks/useSidebarCollapsed';
 import ChangePasswordModal from '../auth/ChangePasswordModal';
 import { useState } from 'react';
@@ -184,8 +181,6 @@ const Sidebar = () => {
                     <SidebarGroup title="Support">
                         <SidebarItem to="/help" icon={HelpCircle} label="Help" />
                         <ExternalItem href="/docs" icon={ExternalLink} label="API Docs" />
-                        <ExternalItem href={KOFI_URL} icon={Coffee} label="Support on Ko-fi" ariaLabel="Support AVA on Ko-fi" />
-                        <ExternalItem href={SPONSORS_URL} icon={Heart} label="Sponsor" ariaLabel="Sponsor AVA on GitHub" />
                     </SidebarGroup>
                 </nav>
 
