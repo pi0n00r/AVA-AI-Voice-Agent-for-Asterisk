@@ -1,5 +1,7 @@
 import { ToolSection } from './toolSections';
 import TransferHandoffFields from './TransferHandoffFields';
+import EndpointDiscoveryModal from './EndpointDiscoveryModal';
+import { stageAdditions } from './endpointDiscovery';
 import React, { useEffect, useRef, useState } from 'react';
 import axios from 'axios';
 import { toast } from 'sonner';
@@ -119,6 +121,8 @@ const DEVICE_STATE_STATUS_OPTIONS: { value: string; label: string }[] = [
 ];
 
 const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, onSaveNow, section }: ToolFormProps) => {
+    const [discoveryOpen, setDiscoveryOpen] = useState(false);
+    useEffect(() => setDiscoveryOpen(false), [section]);
     // Background connection/verification requests can complete after the operator
     // navigates to another tool. Merge their results into the current draft.
     const latestConfigRef = useRef(config);
@@ -570,9 +574,20 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
         const [msDevice, setMsDevice] = useState<MsDeviceState>({ status: 'idle' });
         const [msCalendars, setMsCalendars] = useState<MsCalendarSummary[]>([]);
         const [msVerify, setMsVerify] = useState<MsVerifyState>({});
+        const msVerifyGeneration = useRef(0);
+        const msVerifyIdentity = JSON.stringify([config.microsoft_calendar?.accounts?.default || {}, config.microsoft_calendar?.teams_enabled === true]);
+        const msVerifyIdentityRef = useRef(msVerifyIdentity);
+        if (msVerifyIdentityRef.current !== msVerifyIdentity) {
+            msVerifyIdentityRef.current = msVerifyIdentity;
+            msVerifyGeneration.current += 1;
+        }
+        useEffect(() => { setMsVerify({}); }, [msVerifyIdentity]);
+        useEffect(() => () => { msVerifyGeneration.current += 1; }, []);
 
         const microsoftAccount = config.microsoft_calendar?.accounts?.default || {};
         const updateMicrosoftAccount = (patch: Record<string, any>) => {
+            msVerifyGeneration.current += 1;
+            setMsVerify({});
             const current = latestConfigRef.current;
             const accounts = { ...(current.microsoft_calendar?.accounts || {}) };
             accounts.default = { ...(accounts.default || {}), ...patch };
@@ -632,7 +647,7 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                         updateMicrosoftAccount({
                             token_cache_path: result.token_cache_path || '',
                             user_principal_name: result.user_principal_name || '',
-                            calendar_id: defaultCal?.id || latestAccount.calendar_id || '',
+                            calendar_id: latestAccount.calendar_id || defaultCal?.id || '',
                             timezone: latestAccount.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
                         });
                         setMsDevice((prev) => ({ ...prev, status: 'success' }));
@@ -659,6 +674,7 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
         }, [msDevice.flowId, msDevice.status]);
 
         const runMicrosoftVerify = async () => {
+            const generation = ++msVerifyGeneration.current;
             const account = config.microsoft_calendar?.accounts?.default || {};
             setMsVerify({ loading: true });
             try {
@@ -670,15 +686,18 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                     user_principal_name: account.user_principal_name || '',
                     calendar_id: account.calendar_id || '',
                     timezone: account.timezone || '',
+                    teams_enabled: config.microsoft_calendar?.teams_enabled === true,
                 });
+                if (generation !== msVerifyGeneration.current) return;
                 setMsVerify({
                     loading: false,
                     ok: true,
-                    message: `Reachable: ${res.data?.calendar_name || account.calendar_id || 'calendar'}`,
+                    message: `Reachable: ${res.data?.calendar_name || account.calendar_id || 'calendar'}${res.data?.teams_supported ? ' · Teams supported' : ''}. Save & Apply to use these settings.`,
                     calendarName: res.data?.calendar_name || '',
                 });
                 toast.success('Microsoft Calendar verified');
             } catch (err: any) {
+                if (generation !== msVerifyGeneration.current) return;
                 const detail = err?.response?.data?.detail || {};
                 setMsVerify({
                     loading: false,
@@ -1592,14 +1611,23 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
 	                            )}
 	                            </div>
                                     </details>
-                                    <div className="flex justify-between items-center">
+                                </div>
+                            )}
+                            <div className="mt-4 space-y-4">
+                                    <div className="flex flex-wrap justify-between items-center gap-2">
 	                                <FormLabel>Destinations</FormLabel>
+                                    <div className="flex flex-wrap gap-2">
+                                        <button type="button" onClick={() => setDiscoveryOpen(true)}
+                                            className="text-xs flex items-center bg-secondary px-2 py-1 rounded hover:bg-secondary/80 transition-colors">
+                                            Discover endpoints
+                                        </button>
 	                                <button
 	                                    onClick={handleAddDestination}
                                     className="text-xs flex items-center bg-secondary px-2 py-1 rounded hover:bg-secondary/80 transition-colors"
                                 >
                                     <Plus className="w-3 h-3 mr-1" /> Add Destination
                                 </button>
+                                    </div>
                             </div>
 
                             <div className="grid grid-cols-1 gap-2">
@@ -1640,7 +1668,6 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
                                 })}
                             </div>
                         </div>
-                    )}
                 </div>
 
                 {/* Attended (Warm) Transfer */}
@@ -3810,6 +3837,20 @@ const ToolForm = ({ config, contexts, hangupUsage, onChange, onContextsChange, o
             </div>
 
             {/* Destination Edit Modal */}
+            {discoveryOpen && <EndpointDiscoveryModal
+                transfer={config.transfer}
+                onClose={() => setDiscoveryOpen(false)}
+                onAdd={rows => {
+                    const latest = latestConfigRef.current;
+                    const next = { ...latest, transfer: stageAdditions(latest.transfer, rows) };
+                    latestConfigRef.current = next;
+                    onChange(next);
+                    setDiscoveryOpen(false);
+                    toast.success('Destinations added to your edits', {
+                        description: 'Click Save & Apply to activate them for new calls.',
+                    });
+                }}
+            />}
             <Modal
                 isOpen={!!editingDestination}
                 onClose={() => setEditingDestination(null)}

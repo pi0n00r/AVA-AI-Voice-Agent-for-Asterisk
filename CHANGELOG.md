@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Initial greeting readiness (#752):** opt-in AudioSocket/ExternalMedia streaming
+  guard with bounded inbound-media waiting and paced silence before the first
+  greeting. Admin Streaming controls preserve YAML values and require a deliberate
+  restart after calls finish. Delay zero preserves existing timing; file playback,
+  WebSocket, existing greeting controls, and transfer handoff remain unchanged.
+  Recheck guard ownership after asynchronous output/fallback session lookups so
+  cancelled greetings cannot emit stale audio or start fallback playback.
+  Bounded prefetch during readiness/silence keeps greeting queues draining to
+  avoid dropping provider chunks or stalling pipeline synthesis.
+  On a failed pre-roll send, bounded fallback collection preserves queued
+  greeting audio and releases the streaming producer and its gating token.
+- **ARI endpoint discovery (#753):** assisted transfer destination setup through
+  the existing Asterisk connection. Operators select endpoint candidates and
+  confirm number, description, and dialplan context before staging destinations
+  for Save & Apply. Discovery is bounded and read-only; manual destinations,
+  Agent resource policies, and active-call configuration remain intact. Raw response
+  limits are enforced before buffering, with compressed inventories rejected.
+
+- **Microsoft Calendar:** opt-in, calendar-backed Teams meetings with separate
+  Teams join and Outlook event links, capability verification, caller-confirmed
+  invitations, and protected same-call rescheduling of Microsoft meeting content.
+
 ### Changed
 
 - **Tools configuration:** replace the expanded built-in settings page with a
@@ -16,6 +40,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Save & Apply** action. Transfer routing/timing settings use a disclosure.
 
 ### Fixed
+
+- **Telnyx and MiniMax tool calls:** keep a tool call whose `arguments` is an
+  empty string, null or an object. A parameterless call such as `hangup_call`
+  used to fail `json.loads("")` and be dropped with only a warning.
+  Normalize JSON null to no parameters, reject other non-object JSON values,
+  and retain MiniMax tool arguments as JSON strings for valid history replay
+  while preserving the original assistant reasoning and content.
+- **OpenAI pipeline tool calls:** keep streamed tool calls apart when the
+  server omits the `index` field (Gemini, Ollama and other OpenAI-compatible
+  endpoints), or reuse one `index` for calls with different ids (Ollama). Every
+  call used to land in the same slot, so names were overwritten and arguments
+  concatenated into invalid JSON that ran the tool with empty parameters.
+  Repeated call ids also retain their slot when calls interleave at a shared
+  index; later anonymous fragments continue the most recently updated call,
+  including when its index first appears after the initial delta.
+
+- **Teams rescheduling:** tolerate equivalent Graph HTML serialization after a
+  conditional update and retain the observed body as the next baseline. Match
+  HTML parser offsets using LF only so Unicode separators cannot retain stale
+  booking details or overwrite Microsoft meeting content.
+
+- **Calendar booking lifecycle:** support confirmed cancellation/replacement with
+  fresh transaction generations, verify cancellation before replacement, and keep
+  uncertain mutations blocked when reconciliation reads fail. Preserve structured
+  calendar outcomes and silent metadata continuation in OpenAI responses.
+
+- **CLI troubleshoot with Anthropic:** `agent troubleshoot` LLM analysis used
+  `claude-3-haiku-20240307`, which Anthropic retired on 2026-04-20, so every
+  request failed. It now uses `claude-haiku-5-5` with thinking disabled and reads
+  the first text block of the response.
 
 - **Tools save/apply and navigation:** preserve drafts and calendar connection
   state while moving between editors; merge background calendar results into the
