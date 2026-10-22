@@ -31,9 +31,10 @@ Accepted work currently includes call capture and
 cancellation fixes, native greeting and wait-media behaviour, confirmed message
 deposit dispatch, prepared outbound speech, Unicode format-control handling,
 caller-end/gratitude behaviour, DTMF log redaction, and agent-configured HTTP
-tool advertisement. The root README/CHANGELOG version remains the imported upstream
-application version; `FLEET-RELEASE.json` identifies the distinct maintained
-fork release and never implies an upstream provenance that has not been proved.
+tool advertisement. The root README/CHANGELOG and maintained-fork release tag
+use the upstream application version. `FLEET-RELEASE.json` identifies the exact
+maintained source behind that release. Version alignment does not imply upstream
+affiliation or provenance that has not been proved.
 
 Production installation is built from a versioned fork source release. The
 `deploy/deploy-ava-http-advertisement.py` transaction exists for the currently
