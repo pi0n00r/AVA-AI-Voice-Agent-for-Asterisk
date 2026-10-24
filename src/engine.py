@@ -18916,7 +18916,11 @@ class Engine:
                             ari_client=self.ari_client,
                             config=self._tool_config_for_session(session),
                             tool_registry=tool_registry,
-                            provider_name="pipeline"
+                            provider_name="pipeline",
+                            user_input=transcript_text,
+                            # Both streaming and serial paths persist this caller turn
+                            # before tool execution, even when assistant text follows it.
+                            user_input_recorded=True,
                         )
 
                         for tool_call in tool_calls:
@@ -19119,7 +19123,12 @@ class Engine:
                                             # caller-facing phrase. Do not ask the LLM to
                                             # reinterpret the broader tool result.
                                             return
-                                        tool_result_msg = result.get("message", f"Tool {name} executed successfully.")
+                                        from src.tools.adapters.sanitize import prepare_pipeline_tool_result
+                                        tool_result_msg, continuation_context, continuation_options = prepare_pipeline_tool_result(
+                                            name,
+                                            result,
+                                            llm_options if result.get("internal_notification") else pipeline.llm_options,
+                                        )
                                         # Tool protocol messages are LLM context only. Keep
                                         # persisted conversation_history transcript-only.
                                         llm_context_history = list(conversation_history)
@@ -19135,12 +19144,15 @@ class Engine:
                                         
                                         # Trigger LLM to generate follow-up response
                                         try:
-                                            context_for_llm = {"prior_messages": _sanitize_for_llm(llm_context_history)}
+                                            context_for_llm = {
+                                                "prior_messages": _sanitize_for_llm(llm_context_history),
+                                                **continuation_context,
+                                            }
                                             llm_response = await pipeline.llm_adapter.generate(
                                                 call_id,
                                                 "",  # Empty transcript - tool result already in context
                                                 context_for_llm,
-                                                pipeline.llm_options
+                                                continuation_options,
                                             )
                                             if llm_response:
                                                 # Handle text response if present
@@ -20795,6 +20807,10 @@ class Engine:
                 inline_http,
                 cache_key=f"agent:{session.context_name or session.call_id}",
             )
+        from src.tools.pushover import NotificationState
+        if getattr(session, "notification_state", None) is None:
+            session.notification_state = NotificationState()
+        registry.summary_generator = self._post_call_summary_generator()
         session.tool_runtime_registry = registry
         session.tool_runtime_config = effective.config
         session.tool_generation_id = generation.generation_id
@@ -20872,6 +20888,7 @@ class Engine:
             # An Agent assignment alone is insufficient when this call has no
             # selected correctable pre-call fields.
             registry.unregister("update_call_metadata")
+        registry.summary_generator = self._post_call_summary_generator()
         session.tool_runtime_registry = registry
         await self._save_session(session)
         return session
@@ -22162,6 +22179,7 @@ class Engine:
                 try:
                     registry = self._tool_registry_for_session(session).clone()
                     registry.unregister("update_call_metadata")
+                    registry.summary_generator = self._post_call_summary_generator()
                     session.tool_runtime_registry = registry
                     await self._save_session(session)
                 except Exception:
@@ -24456,7 +24474,17 @@ class Engine:
                                 last = tool.get_last_result()
                         else:
                             last = None
+                        last = pre_call_ctx.execution_results.get(tool_name, last)
                         if isinstance(last, dict):
+                            metadata.update({
+                                key: last[key]
+                                for key in (
+                                    "delivery_status",
+                                    "notification_deliveries",
+                                    "notification_service",
+                                )
+                                if key in last
+                            })
                             diagnostic_status = last.get("status")
                             if diagnostic_status in {"ok", "error", "timeout", "skipped"}:
                                 metadata["status"] = diagnostic_status
@@ -24472,7 +24500,13 @@ class Engine:
 
                 return tool_results
             
-            # Run all pre-call tools in parallel
+            arrival_tools = [
+                tool
+                for tool in tools_to_run
+                if getattr(getattr(tool, "config", None), "kind", None) == "pushover"
+            ]
+            tools_to_run = [tool for tool in tools_to_run if tool not in arrival_tools]
+            # Run selected enrichment first; arrival consumes its completed snapshot.
             tool_tasks = [run_tool_with_timeout(tool) for tool in tools_to_run]
             tool_outputs = await asyncio.gather(*tool_tasks, return_exceptions=True)
             
@@ -24523,9 +24557,13 @@ class Engine:
             session.call_metadata = validate_call_metadata_document(metadata_values)
             session.call_metadata_policy = metadata_policy
             session.call_metadata_updates = []
+            pre_call_ctx.notification_state = session.notification_state
+            pre_call_ctx.pre_call_results = dict(results)
+            pre_call_ctx.call_metadata = dict(session.call_metadata)
+            await asyncio.gather(*(run_tool_with_timeout(tool) for tool in arrival_tools))
             # Execution metadata for the call history UI (one entry per tool).
             session.pre_call_tool_calls = tool_call_records
-            await self._save_session(session)
+            await self._save_session(session, require_current=True)
             
             logger.info("Pre-call tools completed",
                        call_id=call_id,
@@ -24615,6 +24653,8 @@ class Engine:
                 lead_id=getattr(session, 'outbound_lead_id', None),
                 config=self._tool_config_for_session(session),
                 summary_generator=self._post_call_summary_generator(),
+                transfer_destination=getattr(session, "transfer_destination", None),
+                notification_state=session.notification_state,
             )
             
             # Capture execution metadata in call_records.post_call_tool_calls
@@ -24677,7 +24717,17 @@ class Engine:
                             last = tool.get_last_result()
                     else:
                         last = None
+                    last = post_call_ctx.execution_results.get(tool_name, last)
                     if isinstance(last, dict):
+                        tool_extra.update({
+                            key: last[key]
+                            for key in (
+                                "delivery_status",
+                                "notification_deliveries",
+                                "notification_service",
+                            )
+                            if key in last
+                        })
                         # Tool's recorded status wins for skipped/error/timeout — the tool
                         # knows about non-2xx HTTP responses that didn't raise an exception
                         # (GenericWebhookTool catches them internally). Without this, a 502
@@ -24723,6 +24773,9 @@ class Engine:
                                 "finished_at": tool_extra.get("finished_at") or finished_at_iso,
                                 "http_status": tool_extra.get("http_status"),
                                 "response_summary": tool_extra.get("response_summary"),
+                                "delivery_status": tool_extra.get("delivery_status"),
+                                "notification_service": tool_extra.get("notification_service"),
+                                "notification_deliveries": tool_extra.get("notification_deliveries"),
                                 "summary_provider": tool_extra.get("summary_provider"),
                                 "summary_model": tool_extra.get("summary_model"),
                                 "summary_status": tool_extra.get("summary_status"),

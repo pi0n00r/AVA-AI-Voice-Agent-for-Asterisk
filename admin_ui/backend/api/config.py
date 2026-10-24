@@ -932,6 +932,25 @@ def _validate_ai_agent_config(content: str) -> Dict[str, Any]:
             detail=f"Server misconfiguration: cannot import config schema (src.config). Error: {exc}",
         )
 
+    # Native tool config is also saved by the normal full-document Tools/YAML flow.
+    # Reject invalid shapes without returning Pydantic input values (possible keys).
+    from src.integrations.pushover import PushoverToolConfig
+    for block in ("tools", "in_call_tools"):
+        section = parsed.get(block)
+        if not isinstance(section, dict):
+            continue
+        for name, doc in section.items():
+            if isinstance(doc, dict) and doc.get("kind") == "pushover":
+                try:
+                    from .tools import _reserved_builtin_names, RESERVED_TOOL_NAMES
+                    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", str(name)) or name in _reserved_builtin_names() or name in RESERVED_TOOL_NAMES or str(name).startswith("mcp_"):
+                        raise ValueError()
+                    native = PushoverToolConfig.model_validate(doc)
+                    if (native.phase == "in_call") != (block == "in_call_tools"):
+                        raise ValueError()
+                except Exception:
+                    raise HTTPException(400, "Invalid managed Pushover tool configuration") from None
+
     warnings: list[str] = []
 
     try:
@@ -1379,6 +1398,35 @@ def _redact_websocket_media_secrets(config: Dict[str, Any]) -> Dict[str, Any]:
         # so operators know exactly which ai_engine env var is required.
         for key in ("password", "secret", "token"):
             auth.pop(key, None)
+    for block in ("tools", "in_call_tools"):
+        section = safe.get(block)
+        if not isinstance(section, dict):
+            continue
+        for doc in section.values():
+            if isinstance(doc, dict) and doc.get("kind") == "pushover":
+                for secret in ("token", "application_token", "app_token", "user", "user_key", "group_key", "key", "recipient_key"):
+                    doc.pop(secret, None)
+    for block in ("tools", "in_call_tools"):
+        section = safe.get(block)
+        if not isinstance(section, dict): continue
+        for doc in section.values():
+            if not isinstance(doc, dict) or doc.get("kind") != "pushover": continue
+            recipients = doc.get("recipients")
+            if isinstance(recipients, dict):
+                for entry in recipients.values():
+                    if isinstance(entry, dict):
+                        for key in ("key", "user", "user_key", "group_key", "recipient_key"):
+                            entry.pop(key, None)
+    pushover = safe.get("pushover") if isinstance(safe, dict) else None
+    if isinstance(pushover, dict):
+        for key in ("token", "application_token", "app_token"):
+            pushover.pop(key, None)
+        recipients = pushover.get("recipients")
+        if isinstance(recipients, dict):
+            for recipient in recipients.values():
+                if isinstance(recipient, dict):
+                    for key in ("key", "user", "user_key", "group_key"):
+                        recipient.pop(key, None)
     return safe
 
 
@@ -1990,7 +2038,7 @@ async def test_provider_connection(request: ProviderTestRequest):
                     return url
 
                 async def _try_connect(url: str):
-                    async with websockets.connect(url, open_timeout=5.0) as ws:
+                    async with websockets.connect(url, open_timeout=5.0, proxy=None) as ws:
                         if auth_token:
                             await ws.send(json.dumps({"type": "auth", "auth_token": auth_token}))
                             response = await asyncio.wait_for(ws.recv(), timeout=5.0)
@@ -2193,7 +2241,7 @@ async def test_provider_connection(request: ProviderTestRequest):
             try:
                 import websockets
                 # Try connecting to the WebSocket
-                async with websockets.connect(ws_url, open_timeout=5.0) as ws:
+                async with websockets.connect(ws_url, open_timeout=5.0, proxy=None) as ws:
                     await ws.close()
                 return {"success": True, "message": "Local AI server is reachable via WebSocket"}
             except ImportError:
