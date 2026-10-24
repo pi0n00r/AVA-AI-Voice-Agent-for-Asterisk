@@ -325,7 +325,7 @@ def _http_tool_names_from_config(cfg: dict) -> set[str]:
             if not isinstance(tool_cfg, dict):
                 continue
             kind = str(tool_cfg.get("kind") or "").strip()
-            if kind in ("generic_http_lookup", "generic_webhook"):
+            if kind in ("generic_http_lookup", "generic_webhook", "pushover"):
                 names.add(name)
     in_call = cfg.get("in_call_tools") if isinstance(cfg, dict) else None
     if isinstance(in_call, dict):
@@ -335,7 +335,7 @@ def _http_tool_names_from_config(cfg: dict) -> set[str]:
             if not isinstance(tool_cfg, dict):
                 continue
             kind = str(tool_cfg.get("kind") or "in_call_http_lookup").strip()
-            if kind == "in_call_http_lookup":
+            if kind in {"in_call_http_lookup", "pushover"}:
                 names.add(name)
     return names
 
@@ -933,8 +933,8 @@ _PHASE_TO_KIND = {
     "post_call": "generic_webhook",
 }
 # Recognized `kind` values per config block.
-_TOOLS_BLOCK_KINDS = {"generic_http_lookup", "generic_webhook"}
-_IN_CALL_BLOCK_KINDS = {"in_call_http_lookup"}
+_TOOLS_BLOCK_KINDS = {"generic_http_lookup", "generic_webhook", "pushover"}
+_IN_CALL_BLOCK_KINDS = {"in_call_http_lookup", "pushover"}
 
 _SUPPORTED_HTTP_METHODS = frozenset(
     {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
@@ -959,6 +959,7 @@ _PASSTHROUGH_FIELDS = (
     "summary_max_words",
     "summary_timeout_ms",
     "summary_prompt",
+    "summary_failure_policy",
     "description",
     "return_raw_json",
     "direct_response_json_path",
@@ -1038,7 +1039,7 @@ class ManagedToolWrite(BaseModel):
     """Body for create (POST) and full replace (PUT)."""
     name: Optional[str] = None  # required for POST; taken from path on PUT
     phase: ToolPhase
-    url: str
+    url: Optional[str] = None
     enabled: bool = True
     is_global: bool = False
     kind: Optional[str] = None
@@ -1057,6 +1058,7 @@ class ManagedToolWrite(BaseModel):
     summary_max_words: Optional[int] = None
     summary_timeout_ms: Optional[int] = None
     summary_prompt: Optional[str] = None
+    summary_failure_policy: Optional[Literal["continue", "abort"]] = None
     description: Optional[str] = None
     parameters: Optional[List[ManagedToolParameter]] = None
     return_raw_json: Optional[bool] = None
@@ -1065,10 +1067,21 @@ class ManagedToolWrite(BaseModel):
     caller_wait_ambience: Optional[bool] = None
     error_message: Optional[str] = None
 
+    recipients: Optional[Dict[str, Any]] = None
+    token_file: Optional[str] = None
+    key_file: Optional[str] = None
+    recipient_label: Optional[str] = None
+    title: Optional[str] = None
+    body: Optional[str] = None
+    priority: Optional[int] = None
+    sound: Optional[str] = None
+    destination_key: Optional[str] = None
+    suppress_after_tool: Optional[str] = None
+
     @field_validator("url")
     @classmethod
     def validate_url(cls, value: str) -> str:
-        return _validate_managed_tool_url(value)
+        return _validate_managed_tool_url(value) if value is not None else None
 
     @field_validator("method")
     @classmethod
@@ -1142,6 +1155,7 @@ class ManagedToolPatch(BaseModel):
     summary_max_words: Optional[int] = None
     summary_timeout_ms: Optional[int] = None
     summary_prompt: Optional[str] = None
+    summary_failure_policy: Optional[Literal["continue", "abort"]] = None
     description: Optional[str] = None
     parameters: Optional[List[ManagedToolParameter]] = None
     return_raw_json: Optional[bool] = None
@@ -1149,6 +1163,17 @@ class ManagedToolPatch(BaseModel):
     direct_failure_message: Optional[str] = None
     caller_wait_ambience: Optional[bool] = None
     error_message: Optional[str] = None
+
+    recipients: Optional[Dict[str, Any]] = None
+    token_file: Optional[str] = None
+    key_file: Optional[str] = None
+    recipient_label: Optional[str] = None
+    title: Optional[str] = None
+    body: Optional[str] = None
+    priority: Optional[int] = None
+    sound: Optional[str] = None
+    destination_key: Optional[str] = None
+    suppress_after_tool: Optional[str] = None
 
     @field_validator("url")
     @classmethod
@@ -1306,10 +1331,10 @@ def _reserved_builtin_names() -> frozenset:
         import sys
         if project_root and project_root not in sys.path:
             sys.path.insert(0, project_root)
-        from src.tools.registry import tool_registry  # type: ignore
-        tool_registry.clear()
-        tool_registry.initialize_default_tools()
-        for d in tool_registry.get_definitions():
+        from src.tools.registry import ToolRegistry  # type: ignore
+        probe = ToolRegistry.isolated()
+        probe.initialize_default_tools()
+        for d in probe.get_definitions():
             n = str(getattr(d, "name", "") or "").strip()
             if n and not n.startswith("mcp_"):
                 names.add(n)
@@ -1320,12 +1345,14 @@ def _reserved_builtin_names() -> frozenset:
     return _reserved_builtin_cache
 
 
-def _validate_tool_name(name: str) -> None:
+def _validate_tool_name(name: str, *, max_length: Optional[int] = None) -> None:
     if not name or not _TOOL_NAME_RE.match(name):
         raise HTTPException(
             status_code=422,
             detail="Invalid tool name: use letters, digits and underscores, and start with a letter",
         )
+    if max_length is not None and len(name) > max_length:
+        raise HTTPException(status_code=422, detail=f"Pushover tool names must be at most {max_length} characters")
     if name in RESERVED_TOOL_NAMES:
         raise HTTPException(status_code=422, detail=f"'{name}' is a reserved tool name")
     if name.startswith("mcp_"):
@@ -1344,6 +1371,8 @@ def _resolve_kind(phase: str, kind: Optional[str]) -> str:
     a mismatched or unknown value is rejected with 422. An empty/missing value
     is derived from the phase.
     """
+    if kind == "pushover":
+        return "pushover"
     expected = _kind_for_phase(phase)
     if kind is not None:
         supplied = str(kind).strip()
@@ -1357,6 +1386,22 @@ def _resolve_kind(phase: str, kind: Optional[str]) -> str:
 
 def _build_tool_doc(data: Dict[str, Any], phase: str) -> Dict[str, Any]:
     """Build the stored tool config dict from validated input (None values dropped)."""
+    if data.get("kind") == "pushover":
+        from src.integrations.pushover import PushoverToolConfig
+        allowed = set(PushoverToolConfig.model_fields)
+        try:
+            http_only = (
+                "url", "headers", "parameters", "query_params", "body_template",
+                "payload_template", "output_variables", "call_metadata_fields",
+                "hold_audio_file", "hold_audio_threshold_ms", "return_raw_json", "error_message",
+            )
+            if any(data.get(key) for key in http_only) or data.get("method") not in (None, "", "POST"):
+                raise ValueError()
+            return PushoverToolConfig.model_validate({key: value for key, value in {**data, "phase": phase}.items() if key in allowed and value is not None}).model_dump()
+        except Exception:
+            raise HTTPException(status_code=422, detail="Invalid Pushover tool settings, templates or summary provider") from None
+    if not data.get("url"):
+        raise HTTPException(status_code=422, detail="HTTP tools require a URL")
     method = (data.get("method") or ("GET" if phase == "pre_call" else "POST"))
     timeout = data.get("timeout_ms")
     if timeout is None:
@@ -1463,11 +1508,19 @@ def _to_out(
 
 async def _validate_summary_provider_selection(doc: Dict[str, Any]) -> None:
     """Reject an explicit summary provider that cannot run before persistence."""
+    if doc.get("phase") == "in_call":
+        from src.tools.summary import summary_prompt
+        try:
+            summary_prompt(doc.get("summary_prompt"), doc.get("summary_max_words") or 100)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=422, detail="In-call summary_prompt only supports the plain {max_words} placeholder") from None
     if not doc.get("generate_summary"):
         return
     provider_key = str(doc.get("summary_provider") or "").strip()
     if not provider_key:
-        # Preserve the legacy OpenAI fallback for existing API-managed configs.
+        # Only post-call configurations retain the legacy behavior.
+        if doc.get("phase") == "in_call" or doc.get("kind") in {"in_call_http_lookup", "pushover"}:
+            raise HTTPException(status_code=422, detail="Select an explicit summary provider")
         return
 
     catalog = await config_api.get_llm_provider_options()
@@ -1504,7 +1557,7 @@ async def list_managed_tools():
 async def create_managed_tool(body: ManagedToolWrite):
     """Create a new managed HTTP tool and persist it to the config."""
     name = (body.name or "").strip()
-    _validate_tool_name(name)
+    _validate_tool_name(name, max_length=64 if body.kind == "pushover" else None)
 
     cfg = _load_cfg()
     if _raw_name_exists(cfg, name):
@@ -1536,7 +1589,7 @@ async def get_managed_tool(name: str):
 @router.put("/managed/{name}", response_model=ManagedToolOut)
 async def replace_managed_tool(name: str, body: ManagedToolWrite):
     """Replace a managed HTTP tool's full configuration (changing phase moves it between blocks)."""
-    _validate_tool_name(name)
+    _validate_tool_name(name, max_length=64 if body.kind == "pushover" else None)
     cfg = _load_cfg()
     cur_block, _ = _find_managed_tool(cfg, name)
     if cur_block is None:
@@ -1585,16 +1638,23 @@ async def patch_managed_tool(name: str, body: ManagedToolPatch):
     merged["phase"] = new_phase
     # Always normalize kind to the canonical value for the (possibly new) phase,
     # rejecting any mismatched client-supplied kind.
-    merged["kind"] = _resolve_kind(new_phase, patch.get("kind"))
-    merged["method"] = str(
-        merged.get("method") or ("GET" if new_phase == "pre_call" else "POST")
-    ).upper()
-    if merged["method"] not in _BODY_CAPABLE_HTTP_METHODS:
-        merged.pop("body_template", None)
-        merged.pop("payload_template", None)
+    current_kind = cur_doc.get("kind")
+    requested_kind = patch.get("kind")
+    if current_kind == "pushover" and requested_kind not in (None, "", "pushover"):
+        raise HTTPException(status_code=422, detail="kind cannot be changed for a Pushover tool")
+    merged["kind"] = _resolve_kind(
+        new_phase, requested_kind or ("pushover" if current_kind == "pushover" else None)
+    )
+    if merged["kind"] != "pushover":
+        merged["method"] = str(
+            merged.get("method") or ("GET" if new_phase == "pre_call" else "POST")
+        ).upper()
+        if merged["method"] not in _BODY_CAPABLE_HTTP_METHODS:
+            merged.pop("body_template", None)
+            merged.pop("payload_template", None)
 
     raw_metadata_fields = merged.get("call_metadata_fields")
-    if raw_metadata_fields is not None:
+    if merged["kind"] != "pushover" and raw_metadata_fields is not None:
         if new_phase != "pre_call":
             raise HTTPException(status_code=422, detail="call_metadata_fields is only valid for pre-call tools")
         from src.core.call_metadata import CallMetadataValidationError, normalize_call_metadata_policy
@@ -1607,6 +1667,11 @@ async def patch_managed_tool(name: str, body: ManagedToolPatch):
         except CallMetadataValidationError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    if merged["kind"] == "pushover":
+        _validate_tool_name(name, max_length=64)
+        if "recipients" in patch and patch["recipients"] is None:
+            merged["recipients"] = {}
+        merged = _build_tool_doc(merged, new_phase)
     await _validate_summary_provider_selection(merged)
 
     target_block = _block_for_phase(new_phase)

@@ -13,8 +13,10 @@ import logging
 import time
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, field
+from contextvars import ContextVar
 from urllib.parse import urlsplit, urlunsplit
 
+from src.tools.summary import SUMMARY_FIELDS, generate_summary, snapshot_history
 from src.tools.http.path_utils import extract_path
 from src.tools.http.template import (
     TemplateError, body_media_type, render_body, render_headers, render_template, render_url,
@@ -35,6 +37,11 @@ from src.tools.http.debug_trace import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Context propagates through wait_for tasks without sharing state between calls.
+_http_delivery_state: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "http_delivery_state", default=None
+)
 
 # Rita emits these only after native reconcile proved absence, before deposit.
 _DEPOSIT_TTS_ERRORS = frozenset({
@@ -75,6 +82,13 @@ class InCallHTTPConfig:
     enabled: bool = True
     is_global: bool = False
     timeout_ms: int = 5000
+
+    generate_summary: bool = False
+    summary_provider: Optional[str] = None
+    summary_prompt: Optional[str] = None
+    summary_max_words: int = 100
+    summary_timeout_ms: int = 15000
+    summary_failure_policy: str = "continue"
     
     # Hold audio (played if request exceeds threshold)
     hold_audio_file: Optional[str] = None
@@ -158,6 +172,8 @@ class InCallHTTPTool(Tool):
         # Convert config parameters to ToolParameter objects
         tool_params = []
         for p in config.parameters:
+            if config.generate_summary and p.get("name") in SUMMARY_FIELDS:
+                continue
             tool_params.append(ToolParameter(
                 name=p.get('name', ''),
                 type=p.get('type', 'string'),
@@ -174,7 +190,9 @@ class InCallHTTPTool(Tool):
             phase=ToolPhase.IN_CALL,
             is_global=config.is_global,
             parameters=tool_params,
-            timeout_ms=config.timeout_ms,
+            timeout_ms=config.timeout_ms + (
+                config.summary_timeout_ms if config.generate_summary else 0
+            ),
             hold_audio_file=config.hold_audio_file,
             hold_audio_threshold_ms=config.hold_audio_threshold_ms,
         )
@@ -200,6 +218,8 @@ class InCallHTTPTool(Tool):
             "status": status,
             "message": self.config.error_message,
         }
+        if not self.config.direct_response_json_path:
+            result.update(_http_delivery_state.get() or {})
         direct_failure = self._normalize_direct_response(
             self.config.direct_failure_message
         )
@@ -404,7 +424,128 @@ class InCallHTTPTool(Tool):
     async def execute(
         self,
         parameters: Dict[str, Any],
-        context: ToolExecutionContext
+        context: ToolExecutionContext,
+    ) -> Dict[str, Any]:
+        diagnostics = {"internal_notification": True} if self.config.generate_summary else {}
+        delivery_started = False
+        delivery: Dict[str, Any] = {}
+        delivery_token = _http_delivery_state.set(delivery)
+
+        async def run() -> Dict[str, Any]:
+            nonlocal delivery_started
+            if not self.config.enabled or not self.config.url:
+                return await self._execute_request(parameters, context, {})
+
+            values = await self._build_substitution_context(parameters, context)
+            if self.config.name == "pbx_message_deposit":
+                readonly_ticket = getattr(context, "native_deposit_reconcile", None)
+                if readonly_ticket is not None:
+                    # Reconciliation renders from the immutable original envelope;
+                    # model parameters are intentionally empty on this path.
+                    original = json.loads(readonly_ticket.envelope_json)
+                    for key in ("target", "message"):
+                        if isinstance(original.get(key), str):
+                            values[key] = original[key]
+                # These values came from the one-use native deposit guard. Keep
+                # caller-supplied call identity and every other undeclared field out.
+                # The same two-key projection preserves the legacy PBX-named adapter.
+                for key in ("target", "message"):
+                    if isinstance(parameters.get(key), str):
+                        values[key] = parameters[key]
+            if self.config.generate_summary:
+                history = await snapshot_history(context)
+                generator = getattr(context.tool_registry, "summary_generator", None)
+                summary_values, summary_diagnostics = await generate_summary(
+                    self.config,
+                    generator,
+                    call_id=context.call_id,
+                    history=history,
+                    values=values,
+                )
+                values.update(summary_values)
+                diagnostics.update(summary_diagnostics)
+                if (
+                    summary_values["summary_status"] != "ok"
+                    and self.config.summary_failure_policy == "abort"
+                ):
+                    return {
+                        "status": "error",
+                        "message": "Summary unavailable; request was not sent.",
+                        "delivery_status": "skipped",
+                    }
+                live = await context.get_session()
+                if getattr(live, "cleanup_in_progress", False) or getattr(
+                    live, "cleanup_completed", False
+                ):
+                    return {"status": "cancelled", "delivery_status": "skipped"}
+
+            delivery_started = True
+            return await self._execute_request(parameters, context, values)
+
+        try:
+            if (
+                self.config.name == "pbx_message_deposit"
+                and getattr(context, "native_deposit_required", False) is True
+            ):
+                # Native deposit owns one total request/reconciliation deadline
+                # and must preserve the last observed HTTP status on timeout.
+                result = await run()
+            else:
+                result = await asyncio.wait_for(
+                    run(), timeout=self.definition.timeout_ms / 1000
+                )
+        except asyncio.TimeoutError:
+            if (
+                self.config.name == "pbx_message_deposit"
+                and getattr(context, "native_deposit_required", False) is True
+            ):
+                result = self._note_deposit_result(
+                    self._deposit_failure(
+                        "deposit_request_budget_expired",
+                        outcome="unknown" if delivery_started else "not_deposited",
+                    ),
+                    context,
+                )
+            else:
+                result = {
+                    "status": "timeout",
+                    "message": self.config.error_message,
+                    "delivery_status": "uncertain" if delivery_started else "skipped",
+                    **delivery,
+                }
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if (
+                self.config.name == "pbx_message_deposit"
+                and getattr(context, "native_deposit_required", False) is True
+            ):
+                # Never log the exception text: preparation failures can carry
+                # caller-provided message content or credentials.
+                logger.warning("Native message deposit preparation failed")
+                result = self._note_deposit_result(
+                    self._deposit_failure(
+                        "deposit_request_failed",
+                        outcome="unknown" if delivery_started else "not_deposited",
+                    ),
+                    context,
+                )
+            else:
+                result = {
+                    "status": "error",
+                    "message": self.config.error_message,
+                    "delivery_status": "uncertain" if delivery_started else "skipped",
+                    **delivery,
+                }
+        finally:
+            _http_delivery_state.reset(delivery_token)
+        return {**result, **diagnostics}
+
+    async def _execute_request(
+        self,
+        parameters: Dict[str, Any],
+        context: ToolExecutionContext,
+        sub_context: Dict[str, Any],
     ) -> Dict[str, Any]:
         """
         Execute the HTTP lookup and return results to AI.
@@ -424,6 +565,10 @@ class InCallHTTPTool(Tool):
         request_dispatched = False
         native_guard = getattr(context, "native_deposit_guard", None) if deposit_name else None
         readonly_ticket = getattr(context, "native_deposit_reconcile", None) if deposit_name else None
+        delivery = _http_delivery_state.get()
+        if delivery is None:
+            delivery = {}
+        delivery.setdefault("delivery_status", "skipped")
         if not self.config.enabled:
             if native_deposit:
                 return self._note_deposit_result(
@@ -442,15 +587,6 @@ class InCallHTTPTool(Tool):
         
         try:
             started = time.monotonic()
-            # Build substitution context (context vars + pre-call results + AI params)
-            if deposit_name:
-                sub_context = await asyncio.wait_for(
-                    self._build_substitution_context(parameters, context),
-                    timeout=self.config.timeout_ms / 1000.0,
-                )
-            else:
-                sub_context = await self._build_substitution_context(parameters, context)
-            
             # Build request
             url = render_url(self.config.url, sub_context)
             headers = render_headers(self.config.headers, sub_context)
@@ -561,8 +697,22 @@ class InCallHTTPTool(Tool):
                             self._deposit_failure("deposit_request_budget_expired", outcome="not_deposited"), context,
                         )
                     request_kwargs["timeout"] = aiohttp.ClientTimeout(total=remaining)
+                delivery = _http_delivery_state.get()
+                if delivery is not None:
+                    delivery["delivery_status"] = "uncertain"
                 request_dispatched = True
                 async with session.request(**request_kwargs) as response:
+                    if delivery is not None:
+                        delivery.update(
+                            http_status=response.status,
+                            delivery_status=(
+                                "accepted"
+                                if 200 <= response.status < 300
+                                else "rejected"
+                                if 400 <= response.status < 500 and response.status != 408
+                                else "uncertain"
+                            ),
+                        )
                     if native_deposit:
                         result = self._note_deposit_result(await self._deposit_response(response), context)
                         ticket = native_guard.reconciliation_ticket(context.call_id) if native_guard is not None else None
@@ -691,6 +841,7 @@ class InCallHTTPTool(Tool):
                     
                     # Build result
                     result = {
+                        **(_http_delivery_state.get() or {}),
                         "status": "success",
                     }
 
@@ -752,6 +903,7 @@ class InCallHTTPTool(Tool):
             return self._failure_result("error")
         except Exception as e:
             if native_deposit:
+                logger.warning("Native message deposit request failed", exc_info=True)
                 return self._note_deposit_result(
                     self._deposit_failure(
                         "deposit_request_failed",
@@ -759,7 +911,9 @@ class InCallHTTPTool(Tool):
                     ), context,
                 )
             logger.error(f"In-call HTTP tool unexpected error: {self.config.name} error={e}", exc_info=True)
-            return self._failure_result("error")
+            return self._failure_result(
+                "failed" if self.config.direct_response_json_path else "error"
+            )
     
     async def _build_substitution_context(
         self,
@@ -785,6 +939,15 @@ class InCallHTTPTool(Tool):
             "caller_name": context.caller_name or "",
             "context_name": context.context_name or "",
             "call_id": context.call_id or "",
+            **(
+                {
+                    **{key: "" for key in SUMMARY_FIELDS},
+                    "summary_json": json.dumps(""),
+                    "summary_status": "pending",
+                }
+                if self.config.generate_summary
+                else {}
+            ),
         }
         
         # Add pre-call tool results (fetched before call started)
@@ -809,6 +972,7 @@ class InCallHTTPTool(Tool):
                     built_in_keys = {
                         "caller_number", "called_number", "caller_name",
                         "context_name", "call_id",
+                        *(SUMMARY_FIELDS if self.config.generate_summary else ()),
                     }
                     for key, value in call_metadata.items():
                         if key not in built_in_keys:
@@ -916,6 +1080,12 @@ def create_in_call_http_tool(name: str, config_dict: Dict[str, Any]) -> InCallHT
         enabled=config_dict.get('enabled', True),
         is_global=config_dict.get('is_global', False),
         timeout_ms=config_dict.get('timeout_ms', 5000),
+        generate_summary=config_dict.get("generate_summary", False),
+        summary_provider=config_dict.get("summary_provider"),
+        summary_prompt=config_dict.get("summary_prompt"),
+        summary_max_words=config_dict.get("summary_max_words", 100),
+        summary_timeout_ms=config_dict.get("summary_timeout_ms", 15000),
+        summary_failure_policy=config_dict.get("summary_failure_policy", "continue"),
         hold_audio_file=config_dict.get('hold_audio_file'),
         hold_audio_threshold_ms=config_dict.get('hold_audio_threshold_ms', 500),
         url=config_dict.get('url', ''),
