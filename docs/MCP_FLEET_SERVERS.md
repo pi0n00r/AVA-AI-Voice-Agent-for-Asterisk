@@ -54,6 +54,11 @@ intended Agent. Keep the public Extn 7 receptionist limited to its established
 transfer/message-taking surface. Assign fleet MCP tools only to the private
 operator-facing Extn 6 Agent after catalog review and synthetic validation.
 
+For provider-neutral appointment booking through a self-hosted calendar, see
+[Appointment booking providers](Appointment-booking-providers.md). The MCP
+route is the first-class extension boundary; Ava does not require Calendly or
+another hosted scheduling vendor.
+
 ## Production acceptance
 
 1. Validate protected environment and YAML without printing values.
