@@ -7,7 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.7.0] - 2026-10-24
+
+Additive integration and operator-experience release, prepared from main cutoff
+`9b58ddbd`. Included PRs: #744, #745, #746, #755, #760, #761, #762, #763,
+#768, #769, #770, #771, #773, #774, #772 and #775. The backup-safety prerequisite
+is merged; release metadata does not itself publish the tag.
+Open Dependabot and unrelated contributor PRs remain excluded.
+
+New functionality includes native Calendly booking, named Pushover tools,
+in-call HTTP summaries, opt-in Teams meetings and the refreshed Agents workspace.
+There are additive Agent appearance columns and a Calendly integration journal;
+existing provider/model/transport/Audio Profile defaults remain unchanged.
+See [migration](docs/MIGRATION.md#v764-to-v770),
+[integration backups](docs/INTEGRATION_BACKUPS.md), and the
+[validation matrix](docs/baselines/golden/v7.7.0-validation-matrix.md).
+
+Contributors: [@pcbeingused333](https://github.com/pcbeingused333) (CLI/pipeline
+code and tests), [@hkjarral](https://github.com/hkjarral) (implementation and
+maintenance), [@lucamancusodev](https://github.com/lucamancusodev) (reports and
+requirements), [@pi0n00r](https://github.com/pi0n00r) (greeting/discovery proposals),
+and [@MVECoder](https://github.com/MVECoder) (announcement report). Preserve
+existing attribution and co-authorship; see [CONTRIBUTORS.md](CONTRIBUTORS.md).
+
+### Security
+
+- Preserve private integration credentials and a coherent Calendly journal snapshot
+  before CLI/recovery updates (#775); fail closed on unsafe or unreadable state.
+  Never automatically restore booking state during application rollback. See
+  [backup and recovery boundaries](docs/INTEGRATION_BACKUPS.md).
+- Support moves to 7.7.x/7.6.x at publication; 7.5.x support ends then. Existing 7.5.x
+  HTTP-template mitigation is not a claim of a shipped backport.
+- Known dependency alerts remain documented. No blanket security-clearance claim.
+
 ### Added
+- Refreshed Agents workspace with searchable cards/list views, configured-tool summaries,
+  larger AVA avatars, male/female appearance presets and custom image uploads. A routed,
+  tabbed settings editor protects unsaved changes and sends only edited fields. Appearance
+  uses additive SQLite columns and is included in existing database backups; see
+  [upgrade and rollback guidance](docs/AGENTS_EXPERIENCE_ROLLOUT.md).
+- Native Calendly v1 booking with a guided single-account connection, per-agent appointment selection, explicit setup tests, durable submission/duplicate guards, and bounded positive reconciliation. Calendly handles configuration, invitations, and later booking changes; uncertain writes are never automatically resubmitted.
 - Native Pushover as a named tool in the existing pre/in/post-call workflow, with normal Agent selection, configurable descriptions/templates, masked per-tool credentials, multiple enabled user/group recipients, one shared summary per invocation, generic phase defaults with optional CRM customizations, official documentation links and explicit previews/tests.
 - Provider-backed in-call HTTP summaries with safe placeholders, failure policy, combined timeout budgets and independent generation diagnostics.
 - **Initial greeting readiness (#752):** opt-in AudioSocket/ExternalMedia streaming
@@ -50,6 +89,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Save & Apply** action. Transfer routing/timing settings use a disclosure.
 
 ### Fixed
+
+- Keep call-deleted Calendly operations immutable, including a deletion that wins before admission, so delayed booking or reconciliation responses cannot restore erased details; retain replay barriers while preserving previously released cross-call duplicates, and explicitly report that erasure does not cancel remote appointments.
+- Preserve explicit Calendly Agent denial through tool disable/re-enable, isolate setup operations by appointment, erase resolution notes with retained audit barriers, and keep recovery tasks independent when cleanup or another attempt fails. Load pending requests on setup entry, preserve recovery checks during rate-limit cooldowns, and keep valid appointments discoverable when another binding is incomplete.
+- Preserve Google buffered-audio order across concurrent flushes and interruption, reject stale chunks across latency-tracking awaits, and pace partial speech tails after the filler idle cutoff so terminal audio drain can finish.
+- Keep Calendly erasure work durable through journal absence and disabled history collection; handle malformed readback safely, display Agent access defaults consistently with runtime, preserve the latest UI draft after async setup, and expose matching recovery request references.
 
 - **Onward transfers preserve the caller** ([#699](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/699)):
   after an accepted AVA attended handoff, adopt Asterisk's replacement human leg
