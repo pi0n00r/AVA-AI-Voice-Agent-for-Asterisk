@@ -12,6 +12,35 @@ IDENTITY = {'uri': 'https://api.calendly.com/users/test', 'current_organization'
 PAYLOAD = {'event_type': 'https://api.calendly.com/event_types/test', 'start_time': '2030-01-01T12:00:00Z', 'invitee': {'email': 'test@example.com'}}
 
 
+def test_verified_connection_records_private_footprint_that_survives_disconnect(tmp_path):
+    store = CalendlyStore(str(tmp_path / 'calendly.db'), str(tmp_path / 'token'))
+    marker = tmp_path / 'calendly.db.configured'
+    assert not marker.exists()
+    conn = store.save_connection(IDENTITY, 'synthetic-private-token', 0)
+    assert marker.read_text() == 'calendly-configured-v1\n'
+    assert marker.stat().st_mode & 0o777 == 0o600
+    store.disconnect(conn['revision'])
+    assert marker.is_file() and not store.token_path.exists()
+
+
+@pytest.mark.parametrize('fail_marker', [False, True])
+def test_disconnect_preserves_legacy_erasure_obligation_before_removing_token(tmp_path, monkeypatch, fail_marker):
+    store = CalendlyStore(str(tmp_path / 'calendly.db'), str(tmp_path / 'token'))
+    conn = store.save_connection(IDENTITY, 'synthetic-private-token', 0)
+    marker = tmp_path / 'calendly.db.configured'
+    marker.unlink()  # Connected state from a release without the marker.
+    if fail_marker:
+        def fail(_):
+            raise OSError('synthetic marker write failure')
+        monkeypatch.setattr('src.core.calendly_store.record_calendly_footprint', fail)
+        with pytest.raises(OSError, match='synthetic marker write failure'):
+            store.disconnect(conn['revision'])
+        assert store.token_path.is_file() and not store.connection()['enabled']
+    else:
+        store.disconnect(conn['revision'])
+        assert marker.is_file() and not store.token_path.exists()
+
+
 def claim(paths):
     store = CalendlyStore(*paths)
     _, admitted = store.admit('call:concurrent', store.connection(), PAYLOAD, {})

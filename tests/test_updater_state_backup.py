@@ -35,6 +35,18 @@ def test_absent_state_is_optional(tmp_path):
     assert list((tmp_path / "backup").iterdir()) == []
 
 
+def test_standalone_calendly_footprint_is_preserved_during_journal_outage(tmp_path):
+    marker = tmp_path / 'data/operator/calendly.db.configured'
+    marker.parent.mkdir(parents=True)
+    marker.write_text('calendly-configured-v1\n')
+    marker.chmod(0o600)
+    assert run_backup(tmp_path).returncode == 0
+    copied = tmp_path / 'backup' / marker.relative_to(tmp_path)
+    assert copied.read_bytes() == marker.read_bytes()
+    assert copied.stat().st_mode & 0o777 == 0o600
+    assert not (tmp_path / 'backup/data/operator/calendly.db').exists()
+
+
 def test_live_wal_snapshot_and_private_credentials(tmp_path):
     secrets = tmp_path / "secrets/providers/example"
     secrets.mkdir(parents=True)
@@ -43,6 +55,9 @@ def test_live_wal_snapshot_and_private_credentials(tmp_path):
     token.write_text('{"token":"synthetic"}')
     journal = tmp_path / "data/operator/calendly.db"
     journal.parent.mkdir(parents=True)
+    marker = journal.with_name(journal.name + ".configured")
+    marker.write_text("calendly-configured-v1\n")
+    marker.chmod(0o600)
     source = sqlite3.connect(journal)
     try:
         source.execute("PRAGMA journal_mode=WAL")
@@ -56,6 +71,7 @@ def test_live_wal_snapshot_and_private_credentials(tmp_path):
             assert copied.execute("SELECT state FROM attempts").fetchall() == [("uncertain",)]
             assert copied.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert (backup / token.relative_to(tmp_path)).read_bytes() == token.read_bytes()
+        assert (backup / marker.relative_to(tmp_path)).read_bytes() == marker.read_bytes()
         assert (backup / "secrets/providers/example/api-key").read_bytes() == b"synthetic-key\x00"
         assert backup.stat().st_mode & 0o777 == 0o700
         for path in backup.rglob("*"):

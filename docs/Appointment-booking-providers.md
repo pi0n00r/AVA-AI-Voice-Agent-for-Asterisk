@@ -41,9 +41,17 @@ mcp:
             retry an unknown result; ask staff to verify the calendar first.
 ```
 
-Assign both exposed tools only to the intended Agent. Confirm the calendar name,
-timezone, organizer identity, attendee-delivery behavior and conflict handling
-with a disposable synthetic appointment before allowing real callers to book.
+These descriptions are guidance to the Agent, not enforcement. The reviewed MCP
+server must enforce confirmation, duplicate prevention and unknown-result safety
+when the workflow requires those guarantees. Preserve Ava's caller-confirmation
+and unknown-result instructions even when the server also enforces them.
+
+After adding or changing the MCP server, restart the AI Engine during a
+controlled window and verify the server is connected before assigning or testing
+its tools. Assign both exposed tools only to the intended Agent. Confirm the
+calendar name, timezone, organizer identity, attendee-delivery behavior and
+conflict handling with a disposable synthetic appointment before allowing real
+callers to book.
 The generic MCP client refuses redirects, does not expose configured headers and
 does not replay an unknown-result tool call.
 
@@ -65,8 +73,13 @@ result and notification result as separate evidence.
 The built-in `calendly_calendar` adapter remains for existing Calendly users and
 is disabled by default. Calendly's direct booking API requires a paid plan. Its
 credential, journal, recovery and erasure state belong only to that adapter;
-installations using MCP booking do not need them. A stock installation that has
-never initialized Calendly does not create Calendly erasure-queue entries.
+installations using MCP booking that have never initialized Calendly do not need
+them. Installations that previously initialized Calendly must retain this state.
+New history on a stock
+installation that has never initialized Calendly does not create Calendly
+erasure-queue entries. History written before this upgrade retains its prior
+conservative erasure guarantee, even if all adapter files are temporarily absent;
+see the [Calendly privacy guide](Calendly-calendar-tool.md#storage-privacy-and-recovery).
 
 Do not relabel an arbitrary MCP write tool as booking without checking its
 schema and failure semantics. A new provider should expose bounded availability,

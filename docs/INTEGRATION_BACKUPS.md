@@ -4,7 +4,9 @@ The updated CLI and pinned recovery script preserve `secrets/` (including immuta
 provider/Pushover credentials and the Calendly token) with owner-only files inside
 a private backup directory. They snapshot `data/operator/calendly.db` through
 SQLite's online backup API, including committed WAL data, and verify integrity.
-They do not copy a live journal's main file alone or restart either service.
+They also preserve the non-secret `calendly.db.configured` privacy marker, which
+must survive disconnect and temporary journal absence. They do not copy a live
+journal's main file alone or restart either service.
 Missing integrations are skipped; an unreadable/corrupt existing journal, unsafe
 symlink, or failed copy stops the update before checkout changes.
 
@@ -37,6 +39,12 @@ exports, support bundles and public PRs. Credential files and the journal are se
 snapshots, not one distributed transaction; do not rotate credentials or change
 connections during the maintenance window. Validate connection identity/revision
 after recovery; a mismatch must remain disabled until staff resolves it.
+
+Call History's queued erasures and internal legacy-erasure flag live in its own
+configured SQLite database. Preserve that database with a consistent WAL-aware
+snapshot as well; an adapter journal/credential snapshot alone is not the full
+privacy recovery set. The additive flag is ignored safely by older application
+code, whose inserts retain the conservative default until upgraded writers resume.
 
 ## Application rollback is not state rollback
 

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Present Calendly as an optional provider and document appointment booking through
+  the existing Streamable HTTP MCP route; calendar safety remains the reviewed
+  MCP server's responsibility (#778).
+
+### Fixed
+
+- Backfill Calendly's durable privacy marker when opening pre-marker journals and
+  preserve it before disconnect removes credentials. Individual and retention
+  deletion keep erasure retries across temporary journal absence and restart,
+  including previously disconnected installations. Preserve the prior erasure
+  contract for legacy History rows when all adapter files are absent before first
+  startup; new history on unused installations remains queue-free. Treat blank
+  optional Calendly paths as defaults throughout deletion and recovery so they
+  cannot block history purges. Treat unreadable footprint paths conservatively so
+  permission errors cannot discard or block history erasure work (#778).
+
 ## [7.7.0] - 2026-10-24
 
 Additive integration and operator-experience release, prepared from main cutoff

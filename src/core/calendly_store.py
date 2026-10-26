@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import time
 import uuid
 from contextlib import contextmanager
@@ -27,10 +28,48 @@ def digest(value) -> str:
     return hashlib.sha256(encoded(value).encode()).hexdigest()
 
 
+def calendly_footprint_path(db_path: str | Path | None = None) -> Path:
+    """Return the durable, non-secret marker for prior Calendly configuration."""
+    journal = Path(db_path or (os.getenv("CALENDLY_DB_PATH") or "/app/data/operator/calendly.db"))
+    return journal.with_name(journal.name + ".configured")
+
+
+def record_calendly_footprint(db_path: str | Path | None = None) -> None:
+    """Persist that Calendly was configured, independently of removable credentials."""
+    marker = calendly_footprint_path(db_path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        info = marker.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(info.st_mode):
+            raise CalendlyError("footprint_state_invalid")
+        if info.st_mode & 0o077:
+            os.chmod(marker, 0o600)
+        return
+    temp = marker.with_name(marker.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(b"calendly-configured-v1\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, marker)
+        os.chmod(marker, 0o600)
+        directory = os.open(marker.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
 class CalendlyStore:
     def __init__(self, db_path: str | None = None, token_path: str | None = None):
-        self.path = Path(db_path or os.getenv("CALENDLY_DB_PATH", "/app/data/operator/calendly.db"))
-        self.token_path = Path(token_path or os.getenv("CALENDLY_TOKEN_PATH", "/app/project/secrets/calendly-default-token.json"))
+        self.path = Path(db_path or (os.getenv("CALENDLY_DB_PATH") or "/app/data/operator/calendly.db"))
+        self.token_path = Path(token_path or (os.getenv("CALENDLY_TOKEN_PATH") or "/app/project/secrets/calendly-default-token.json"))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # SQLite derives WAL/SHM permissions from its main file. Never use 0666.
         fd = os.open(self.path, os.O_CREAT | os.O_WRONLY, 0o600)
@@ -41,6 +80,9 @@ class CalendlyStore:
         with self.db() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version == 1:
+                # Pre-marker journals retain private data even after disconnect.
+                # Backfill on open, before recovery/setup can remove credentials.
+                record_calendly_footprint(self.path)
                 return
             if version != 0:
                 raise CalendlyError("journal_version_unsupported")
@@ -51,6 +93,7 @@ class CalendlyStore:
                 if version not in {0, 1}:
                     raise CalendlyError("journal_version_unsupported")
                 if version == 1:
+                    record_calendly_footprint(self.path)
                     return
                 db.executescript("""
                     CREATE TABLE IF NOT EXISTS connection(id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
@@ -116,6 +159,10 @@ class CalendlyStore:
             old = self.connection()
             if old["revision"] != expected:
                 raise CalendlyError("connection_changed")
+            # save_connection is reached only after Calendly verifies the supplied
+            # identity. Keep this privacy-erasure obligation after disconnect,
+            # credential removal, journal outages and process restarts.
+            record_calendly_footprint(self.path)
             same = old.get("user") == identity["uri"] and old.get("organization") == identity["current_organization"]
             new = {"id": old["id"] if same else uuid.uuid4().hex, "user": identity["uri"],
                    "organization": identity["current_organization"], "name": str(identity.get("name") or "")[:200],
@@ -159,6 +206,9 @@ class CalendlyStore:
         self.token_path.parent.mkdir(parents=True, exist_ok=True)
         with portalocker.Lock(str(self.token_path) + ".lock", timeout=2):
             conn = self.update_connection(expected, enabled=False, qualified=False, revision=expected + 1)
+            # Do not remove the credential until its independent erasure marker
+            # is durable, including for a legacy connection opened before upgrade.
+            record_calendly_footprint(self.path)
             self.token_path.unlink(missing_ok=True)
             return conn
 
@@ -333,7 +383,7 @@ class CalendlyStore:
 
 def scrub_deleted_calls(call_ids: list[str]) -> bool:
     """Acknowledge erasure only after accessing the journal; keep replay barriers."""
-    path = Path(os.getenv("CALENDLY_DB_PATH", "/app/data/operator/calendly.db"))
+    path = Path(os.getenv("CALENDLY_DB_PATH") or "/app/data/operator/calendly.db")
     if path.exists():
         CalendlyStore().cleanup(call_ids)
         return True
