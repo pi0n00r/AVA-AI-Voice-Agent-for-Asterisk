@@ -1,6 +1,7 @@
 # Review draft PRs once they contain a coherent checkpoint, then pause automatic
 # incremental reviews while implementation continues. Maintainers request a
 # final full review explicitly after the PR is frozen.
+# Disposable installation smoke; this line will not be merged.
 reviews:
   auto_review:
     enabled: true
