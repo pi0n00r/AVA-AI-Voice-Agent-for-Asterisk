@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.7.3.1] - 2026-10-28
+
 ### Changed
 
 - Restore upstream's maintained Tool Calling Guide and align its farewell
