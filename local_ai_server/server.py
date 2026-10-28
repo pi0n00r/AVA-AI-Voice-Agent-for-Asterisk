@@ -2665,8 +2665,10 @@ class LocalAIServer:
             except ProcessLookupError:
                 pass
         try:
-            async with asyncio.timeout(180):
-                stdout, _ = await process.communicate(pcm16)
+            # The production CUDA image is based on Ubuntu 22.04 / Python 3.10.
+            # asyncio.timeout() was added in 3.11; wait_for() also cancels and
+            # reaps the child through the finally block below on timeout.
+            stdout, _ = await asyncio.wait_for(process.communicate(pcm16), timeout=180)
         except TimeoutError as exc:
             raise RuntimeError("transcription_timeout") from exc
         except (BrokenPipeError, ConnectionResetError) as exc:
