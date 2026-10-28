@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.7.3] - 2026-10-28
+
+### Fixed
+
+- Restrict transcription uploads to approved audio demuxers and local file input
+  so crafted playlists cannot recursively reopen the uploaded file (#784).
+- Prevent an older Local AI `AgentAudioDone` from hanging up an Asterisk-owned
+  farewell before `sound:goodbye` finishes. Reserve the farewell before tool
+  execution, match its exact ARI playback ID and terminal state, and report
+  missing or failed playback as unconfirmed rather than played. Preserve the
+  farewell gate across overlapping callbacks and coalesce duplicate hangup
+  requests so only the selected playback owns terminal hangup (#786, #787).
+
+## [7.7.2] - 2026-10-28
+
 ### Added
 
 - Add an authenticated, OpenAI-compatible local transcription API with
@@ -32,10 +47,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Prevent an older Local AI `AgentAudioDone` from hanging up an Asterisk-owned
-  farewell before `sound:goodbye` finishes. Reserve the farewell before tool
-  execution, match its exact ARI playback ID and terminal state, and report
-  missing or failed playback as unconfirmed rather than played (#786).
 - Backfill Calendly's durable privacy marker when opening pre-marker journals and
   preserve it before disconnect removes credentials. Individual and retention
   deletion keep erasure retries across temporary journal absence and restart,
