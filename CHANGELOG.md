@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Restore upstream's maintained Tool Calling Guide and align its farewell
   lifecycle wording with the merged implementation.
+- Update the Admin backend to FastAPI 0.162.0 and psutil 7.2.2 after reviewing
+  and qualifying the deferred upstream dependency updates together.
 
 ### Fixed
 
