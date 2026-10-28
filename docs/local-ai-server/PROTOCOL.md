@@ -71,8 +71,8 @@ Request:
 ```json
 {
   "type": "set_mode",
-  "mode": "stt",           
-  "call_id": "1234-5678"   
+  "mode": "stt",
+  "call_id": "1234-5678"
 }
 ```
 
