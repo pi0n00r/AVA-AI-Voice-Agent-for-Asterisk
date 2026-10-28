@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Update `msgpack` from 1.2.1 to 1.2.3 for the Fish Audio transport, including
+  upstream C-extension memory-safety and cleanup fixes (#788).
 - Restrict transcription uploads to approved audio demuxers and local file input
   so crafted playlists cannot recursively reopen the uploaded file (#784).
 - Prevent an older Local AI `AgentAudioDone` from hanging up an Asterisk-owned
