@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Restore upstream's maintained Tool Calling Guide and align its farewell
+  lifecycle wording with the merged implementation.
+
+### Fixed
+
+- Catch up the final upstream #786/#787 farewell hardening: bound ARI playback
+  startup, retain the `agent_hangup` disposition, preserve call-owned farewell
+  completion across provider-listener replacement, and describe ARI `done` as
+  a terminal boundary rather than proof of audible delivery.
+
 ## [7.7.3] - 2026-10-28
 
 ### Fixed
