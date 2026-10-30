@@ -8,6 +8,19 @@ AI-NOTICE:Scope=Fleet-authored fork notice; retained upstream source remains MIT
 
 # Ava for Asterisk
 
+<div align="center">
+
+[![Latest release](https://img.shields.io/github/v/release/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk?label=release)](https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/latest)
+[![Packages](https://img.shields.io/badge/GHCR-public%20packages-2496ED?logo=docker&logoColor=white)](#public-container-packages)
+[![License: MIT + AGPL-3.0-or-later](https://img.shields.io/badge/license-MIT%20%2B%20AGPL--3.0--or--later-blue)](#license)
+
+[Packages](#public-container-packages) |
+[Releases](https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/latest) |
+[Deployment](deploy/docker/README.md) | [Security](SECURITY.md) |
+[License](#license)
+
+</div>
+
 This is an independent maintained fork of
 [AVA AI Voice Agent for Asterisk](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk).
 It does not provide hosting, commercial services, managed deployment, a public
