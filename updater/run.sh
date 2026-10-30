@@ -998,12 +998,18 @@ run_rollback() {
       docker compose up -d --remove-orphans --no-build --pull never "${targets[@]}"
     fi
     if [ "${#rebuild_services[@]}" -gt 0 ]; then
+      if [ "${rollback_touches_calls}" = "true" ]; then
+        guard_rollback_active_calls "${rollback_changes_local_ai}"
+      fi
       docker compose up -d --no-build --pull never "${rebuild_services[@]}"
     fi
 
     if [ "${#restart_services[@]}" -gt 0 ]; then
       echo "==> Restarting services: ${restart_services[*]}" >&2
       for svc in "${restart_services[@]}"; do
+        if [ "${rollback_touches_calls}" = "true" ]; then
+          guard_rollback_active_calls "${rollback_changes_local_ai}"
+        fi
         docker compose restart "${svc}" || docker compose up -d --no-build --pull never "${svc}"
       done
     fi

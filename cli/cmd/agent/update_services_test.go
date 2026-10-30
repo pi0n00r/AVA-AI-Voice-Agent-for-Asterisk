@@ -290,6 +290,41 @@ func TestDockerActionsRebuildRunningLocalAIWithComposeUp(t *testing.T) {
 	if !commandSeen(*commands, "docker compose build local_ai_server") {
 		t.Fatalf("running Local AI must build its image before recreation: %#v", *commands)
 	}
+	probeIndex, upIndex := -1, -1
+	for i, command := range *commands {
+		if command == "docker compose ps --services --status running" {
+			probeIndex = i
+		}
+		if command == "docker compose up -d --no-build --pull never local_ai_server" {
+			upIndex = i
+		}
+	}
+	if probeIndex < 0 || upIndex < 0 || probeIndex >= upIndex {
+		t.Fatalf("runtime state must be refreshed immediately before rebuilt service recreation: %#v", *commands)
+	}
+}
+
+func TestDockerActionsRefreshCallStateBeforeRestart(t *testing.T) {
+	commands := withDockerActionState(t, "ai_engine\n", map[string]bool{"ai_engine": true})
+	ctx := updateTestContext()
+	ctx.servicesToRebuild = map[string]bool{}
+	ctx.servicesToRestart = map[string]bool{"ai_engine": true}
+
+	if err := applyDockerActions(ctx); err != nil {
+		t.Fatalf("applyDockerActions: %v", err)
+	}
+	probeIndex, restartIndex := -1, -1
+	for i, command := range *commands {
+		if command == "docker compose ps --services --status running" {
+			probeIndex = i
+		}
+		if command == "docker compose restart ai_engine" {
+			restartIndex = i
+		}
+	}
+	if probeIndex < 0 || restartIndex < 0 || probeIndex >= restartIndex {
+		t.Fatalf("runtime state must be refreshed immediately before restart: %#v", *commands)
+	}
 }
 
 func TestDockerActionsStartSelectedLocalAIWithoutExistingContainer(t *testing.T) {

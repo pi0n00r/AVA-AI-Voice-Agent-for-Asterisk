@@ -2087,6 +2087,17 @@ func guardUpdateActiveCalls(stage string, engineRunning, localAIChanges bool) er
 	return nil
 }
 
+func guardDockerRuntimeMutation(ctx *updateContext, stage string, affectsAIEngine, affectsLocalAI bool) error {
+	if !affectsAIEngine && !affectsLocalAI {
+		return nil
+	}
+	if err := captureRunningDockerServices(ctx); err != nil {
+		return err
+	}
+	localAIChanges := affectsLocalAI && ctx.currentlyRunning["local_ai_server"]
+	return guardUpdateActiveCalls(stage, ctx.currentlyRunning["ai_engine"], localAIChanges)
+}
+
 func applyDockerActions(ctx *updateContext) error {
 	if len(ctx.servicesToRebuild) == 0 && len(ctx.servicesToRestart) == 0 && !ctx.composeChanged {
 		return nil
@@ -2245,11 +2256,12 @@ func applyDockerActions(ctx *updateContext) error {
 			}
 			// Pulling a missing image can outlast the earlier call-state check.
 			// Refresh runtime state and fail closed immediately before recreation.
-			if err := captureRunningDockerServices(ctx); err != nil {
-				return err
-			}
-			localAIChanges := ctx.currentlyRunning["local_ai_server"] && ctx.composeChanged
-			if err := guardUpdateActiveCalls("reconcile services after image pull (pending Docker actions retained)", ctx.currentlyRunning["ai_engine"], localAIChanges); err != nil {
+			if err := guardDockerRuntimeMutation(
+				ctx,
+				"reconcile services after image pull (pending Docker actions retained)",
+				targets["ai_engine"],
+				targets["local_ai_server"],
+			); err != nil {
 				return err
 			}
 			args = append(args, targetList...)
@@ -2260,6 +2272,14 @@ func applyDockerActions(ctx *updateContext) error {
 	}
 
 	if len(rebuildServices) > 0 {
+		if err := guardDockerRuntimeMutation(
+			ctx,
+			"recreate rebuilt services (pending Docker actions retained)",
+			containsString(rebuildServices, "ai_engine"),
+			containsString(rebuildServices, "local_ai_server"),
+		); err != nil {
+			return err
+		}
 		args := []string{"compose", "up", "-d", "--no-build", "--pull", "never"}
 		if updateForceRecreate {
 			args = append(args, "--force-recreate")
@@ -2271,6 +2291,14 @@ func applyDockerActions(ctx *updateContext) error {
 	}
 
 	for _, svc := range restartServices {
+		if err := guardDockerRuntimeMutation(
+			ctx,
+			"restart "+svc+" (pending Docker actions retained)",
+			svc == "ai_engine",
+			svc == "local_ai_server",
+		); err != nil {
+			return err
+		}
 		if _, err := runDockerCommandForUpdate("docker", "compose", "restart", svc); err != nil {
 			// Fallback: start/recreate service if restart fails.
 			if _, err2 := runDockerCommandForUpdate("docker", "compose", "up", "-d", "--no-build", "--pull", "never", svc); err2 != nil {

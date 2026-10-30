@@ -373,7 +373,21 @@ def test_rollback_builds_before_reconcile_and_archives_pending_only_on_success()
     assert rollback.index(build) < rollback.index(pull) < rollback.index(reconcile) < rollback.index(archive)
     post_pull = rollback.index('guard_rollback_active_calls "${rollback_changes_local_ai}"', rollback.index(pull))
     assert rollback.index(pull) < post_pull < rollback.index(reconcile)
-    assert rollback.count("guard_rollback_active_calls") == 3
+    rebuild_reconcile = 'docker compose up -d --no-build --pull never "${rebuild_services[@]}"'
+    pre_rebuild = rollback.rindex(
+        'guard_rollback_active_calls "${rollback_changes_local_ai}"',
+        0,
+        rollback.index(rebuild_reconcile),
+    )
+    assert post_pull < rollback.index(reconcile) < pre_rebuild < rollback.index(rebuild_reconcile)
+    restart = 'docker compose restart "${svc}"'
+    pre_restart = rollback.rindex(
+        'guard_rollback_active_calls "${rollback_changes_local_ai}"',
+        0,
+        rollback.index(restart),
+    )
+    assert pre_rebuild < rollback.index(rebuild_reconcile) < pre_restart < rollback.index(restart)
+    assert rollback.count("guard_rollback_active_calls") == 5
     dockerfile = (ROOT / "updater" / "Dockerfile").read_text(encoding="utf-8")
     assert "docker-buildx-plugin" in dockerfile
     assert "COPY scripts/compose-build.sh /usr/local/bin/aava-compose-build" in dockerfile
