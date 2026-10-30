@@ -344,6 +344,7 @@ def test_rollback_never_reconciles_a_fully_stopped_stack_with_compose_up() -> No
     assert "Reconciling stopped services with built images" not in rollback
     assert 'docker compose up -d --remove-orphans --no-build "${safe_targets[@]}"' not in rollback
     assert '[ "${#targets[@]}" -gt 0 ]; then' in rollback
+    assert 'docker compose pull --ignore-buildable --policy missing "${targets[@]}"' in rollback
     assert 'docker compose up -d --remove-orphans --no-build --pull never "${targets[@]}"' in rollback
 
 
@@ -366,9 +367,10 @@ def test_rollback_builds_before_reconcile_and_archives_pending_only_on_success()
     runner = (ROOT / "updater" / "run.sh").read_text(encoding="utf-8")
     rollback = _run_rollback_body(runner)
     build = '"${COMPOSE_BUILD_HELPER}" "${rebuild_services[@]}"'
+    pull = 'docker compose pull --ignore-buildable --policy missing "${targets[@]}"'
     reconcile = 'docker compose up -d --remove-orphans --no-build --pull never "${targets[@]}"'
     archive = 'mv -- "${UPDATES_DIR}/pending-docker.json"'
-    assert rollback.index(build) < rollback.index(reconcile) < rollback.index(archive)
+    assert rollback.index(build) < rollback.index(pull) < rollback.index(reconcile) < rollback.index(archive)
     assert rollback.count("guard_rollback_active_calls") == 2
     dockerfile = (ROOT / "updater" / "Dockerfile").read_text(encoding="utf-8")
     assert "docker-buildx-plugin" in dockerfile

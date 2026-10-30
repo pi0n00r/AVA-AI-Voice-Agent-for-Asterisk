@@ -228,6 +228,44 @@ func TestDockerActionsBuildStoppedInstalledLocalAIWithoutStartingIt(t *testing.T
 	}
 }
 
+func TestComposeChangeTreatsRunningLocalAIAsRuntimeChange(t *testing.T) {
+	ctx := updateTestContext()
+	ctx.servicesToRebuild = map[string]bool{}
+	ctx.composeChanged = true
+	ctx.currentlyRunning = map[string]bool{"local_ai_server": true}
+	if !updateChangesLocalAIRuntime(ctx) {
+		t.Fatal("Compose reconciliation of running Local AI must be call-affecting")
+	}
+}
+
+func TestComposeChangePullsMissingImagesBeforeReconciliation(t *testing.T) {
+	commands := withDockerActionState(t, "ai_engine\n", map[string]bool{"ai_engine": true})
+	ctx := updateTestContext()
+	ctx.servicesToRebuild = map[string]bool{}
+	ctx.composeChanged = true
+
+	if err := applyDockerActions(ctx); err != nil {
+		t.Fatalf("applyDockerActions: %v", err)
+	}
+	pull := "docker compose pull --ignore-buildable --policy missing ai_engine"
+	up := "docker compose up -d --remove-orphans --no-build --pull never ai_engine"
+	if !commandSeen(*commands, pull) || !commandSeen(*commands, up) {
+		t.Fatalf("missing pull/reconcile commands: %#v", *commands)
+	}
+	pullIndex, upIndex := -1, -1
+	for i, command := range *commands {
+		if command == pull {
+			pullIndex = i
+		}
+		if command == up {
+			upIndex = i
+		}
+	}
+	if pullIndex < 0 || upIndex < 0 || pullIndex >= upIndex {
+		t.Fatalf("image pull must precede reconciliation: %#v", *commands)
+	}
+}
+
 func TestDockerActionsRebuildRunningLocalAIWithComposeUp(t *testing.T) {
 	commands := withDockerActionState(t, "local_ai_server\n", map[string]bool{"local_ai_server": true})
 	ctx := updateTestContext()

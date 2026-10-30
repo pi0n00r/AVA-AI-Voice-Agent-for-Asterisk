@@ -471,11 +471,21 @@ class GoogleLLMAdapter(LLMComponent):
     def _normalize_generation_config(cls, config: Dict[str, Any], model: str) -> None:
         # Apply after request overrides too, so legacy configuration cannot
         # reintroduce unsupported settings when switching to the new default.
+        dropped = []
         if cls._ignores_sampling_params(model):
             for key in ("temperature", "topP", "topK"):
-                config.pop(key, None)
+                if config.pop(key, None) is not None:
+                    dropped.append(key)
         if cls._gemini_version(model) >= (3, 0):
-            config.pop("candidateCount", None)
+            candidate_count = config.pop("candidateCount", None)
+            if candidate_count not in (None, 1):
+                dropped.append("candidateCount")
+        if dropped:
+            logger.warning(
+                "Google LLM removed generation settings unsupported by the model",
+                model=model,
+                dropped=dropped,
+            )
 
     def summary_options(self, max_output_tokens: int) -> Dict[str, Any]:
         """Reserve thinking room only for isolated Gemini 3+ summary jobs."""

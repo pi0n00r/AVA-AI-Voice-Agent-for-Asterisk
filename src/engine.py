@@ -19274,14 +19274,22 @@ class Engine:
                                                 if getattr(llm_response, 'text', None):
                                                     response_text = llm_response.text.strip()
                                                     if response_text:
+                                                        current_session = await self.session_store.get_by_call_id(call_id)
+                                                        if not current_session or not self._pipeline_output_allowed(
+                                                            call_id,
+                                                            current_session,
+                                                            stage="tool-continuation-tts",
+                                                        ):
+                                                            return
+                                                        conversation_history = list(current_session.conversation_history or [])
                                                         conversation_history.append(_ts_msg("assistant", response_text))
-                                                        session.conversation_history = list(conversation_history)
-                                                        await self.session_store.upsert_call(session)
+                                                        current_session.conversation_history = list(conversation_history)
+                                                        await self.session_store.upsert_call(current_session)
                                                         logger.info("LLM continuation response", preview=response_text[:80], call_id=call_id)
 
                                                         if not self._pipeline_output_allowed(
                                                             call_id,
-                                                            session,
+                                                            current_session,
                                                             stage="tool-continuation-tts",
                                                         ):
                                                             return

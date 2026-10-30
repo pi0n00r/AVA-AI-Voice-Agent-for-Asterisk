@@ -989,6 +989,7 @@ run_rollback() {
       guard_rollback_active_calls "${rollback_changes_local_ai}"
     fi
     if [ "${compose_changed}" = "true" ] && [ "${#targets[@]}" -gt 0 ]; then
+      docker compose pull --ignore-buildable --policy missing "${targets[@]}"
       docker compose up -d --remove-orphans --no-build --pull never "${targets[@]}"
     fi
     if [ "${#rebuild_services[@]}" -gt 0 ]; then

@@ -2041,7 +2041,8 @@ func updateMayAffectCalls(ctx *updateContext) bool {
 func updateChangesLocalAIRuntime(ctx *updateContext) bool {
 	localAIWillRun := ctx.currentlyRunning["local_ai_server"] || ctx.runningBeforeUpdate["local_ai_server"] ||
 		(ctx.localAISelected && !ctx.localAIExisting)
-	return localAIWillRun && (ctx.servicesToRebuild["local_ai_server"] || ctx.servicesToRestart["local_ai_server"])
+	return localAIWillRun && (ctx.composeChanged || ctx.servicesToRebuild["local_ai_server"] ||
+		ctx.servicesToRestart["local_ai_server"])
 }
 
 func updateHasDockerChanges(ctx *updateContext) bool {
@@ -2195,7 +2196,8 @@ func applyDockerActions(ctx *updateContext) error {
 		if err := captureRunningDockerServices(ctx); err != nil {
 			return err
 		}
-		localAIChanges := containsString(rebuildServices, "local_ai_server") || containsString(restartServices, "local_ai_server")
+		localAIChanges := containsString(rebuildServices, "local_ai_server") || containsString(restartServices, "local_ai_server") ||
+			(ctx.composeChanged && runningServices["local_ai_server"])
 		if err := guardUpdateActiveCalls("restart services after checkout (pending Docker actions retained)", ctx.currentlyRunning["ai_engine"], localAIChanges); err != nil {
 			return err
 		}
@@ -2236,7 +2238,12 @@ func applyDockerActions(ctx *updateContext) error {
 
 		// Only run compose-up if we have explicit targets; otherwise, don't implicitly start services.
 		if len(targets) > 0 {
-			args = append(args, sortedKeys(targets)...)
+			targetList := sortedKeys(targets)
+			pullArgs := append([]string{"compose", "pull", "--ignore-buildable", "--policy", "missing"}, targetList...)
+			if _, err := runDockerCommandForUpdate("docker", pullArgs...); err != nil {
+				return fmt.Errorf("docker compose pull failed: %w", err)
+			}
+			args = append(args, targetList...)
 			if _, err := runDockerCommandForUpdate("docker", args...); err != nil {
 				return fmt.Errorf("docker compose up (remove-orphans) failed: %w", err)
 			}

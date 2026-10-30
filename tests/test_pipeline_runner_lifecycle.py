@@ -2090,6 +2090,7 @@ async def test_google_truncation_uses_guarded_call_tts(monkeypatch, continuation
     raised = asyncio.Event()
     spoken = asyncio.Queue()
     calls = []
+    gate_stages = []
     call_id = f"truncated-call-{continuation}-{cleanup}"
     session = CallSession(call_id=call_id, caller_channel_id=call_id)
     session.pipeline_name = "truncation"
@@ -2119,8 +2120,15 @@ async def test_google_truncation_uses_guarded_call_tts(monkeypatch, continuation
     monkeypatch.setattr(engine.transport_orchestrator, "get_context_config", lambda *a, **k: SimpleNamespace(
         prompt=None, greeting=None, tools=["transcript_tool"], in_call_http_tools={}, disable_global_in_call_tools=[],
     ))
-    engine.playback_manager.play_audio = AsyncMock(return_value=None)
+    engine.playback_manager.play_audio = AsyncMock(return_value="playback-1")
     engine.ari_client.set_channel_var = AsyncMock(return_value=True)
+    original_output_allowed = engine._pipeline_output_allowed
+
+    def record_output_gate(*args, stage, **kwargs):
+        gate_stages.append(stage)
+        return original_output_allowed(*args, stage=stage, **kwargs)
+
+    monkeypatch.setattr(engine, "_pipeline_output_allowed", record_output_gate)
     await engine.session_store.upsert_call(session)
     try:
         await engine._ensure_pipeline_runner(session, forced=True)
@@ -2136,6 +2144,7 @@ async def test_google_truncation_uses_guarded_call_tts(monkeypatch, continuation
             assert text == "I'm sorry, I couldn't complete that response. Could you ask again?"
             assert session.conversation_history[-1]["content"] == text
             engine.playback_manager.play_audio.assert_awaited_once()
+        assert "post-llm" in gate_stages
         assert len(calls) == (2 if continuation else 1)
     finally:
         session.cleanup_in_progress = False
