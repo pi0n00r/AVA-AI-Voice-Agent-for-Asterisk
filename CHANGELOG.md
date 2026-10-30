@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.7.3.3] - 2026-10-30
+
+### Fixed
+
+- Preserve Ollama's resolved system prompt when long-call history is trimmed,
+  so configured instructions remain present beyond the first five turns.
+
 ## [7.7.3.2] - 2026-10-29
 
 ### Changed
