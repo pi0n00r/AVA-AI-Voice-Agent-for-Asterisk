@@ -1,6 +1,6 @@
 # Admin UI Setup Guide
 
-**Applies to**: v7.7.3.2 (Admin UI introduced in v4.4.1)
+**Applies to**: v7.7.3.3 (Admin UI introduced in v4.4.1)
 
 **Last reviewed**: October 2026
 **Quick Start**: 5 minutes to get running
