@@ -63,6 +63,17 @@ and run `./install.sh external-pbx`. See
 [`deploy/docker/README.md`](deploy/docker/README.md) for the exact boundary,
 first-login process, and upgrade commands.
 
+### Public container packages
+
+The maintained images are publicly readable without a GitHub account:
+
+- [`ava-ai-engine`](https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/pkgs/container/ava-ai-engine)
+- [`ava-admin-ui`](https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/pkgs/container/ava-admin-ui)
+- [`ava-local-ai`](https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/pkgs/container/ava-local-ai)
+- [`ava-starter-asterisk`](https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/pkgs/container/ava-starter-asterisk)
+
+GitHub may hide package discovery controls from signed-out visitors; these direct links and anonymous GHCR pulls remain supported.
+
 ## Deployment boundary
 
 This repository contains source, tests, public documentation, and a generic
