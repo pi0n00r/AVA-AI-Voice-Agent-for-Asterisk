@@ -371,7 +371,9 @@ def test_rollback_builds_before_reconcile_and_archives_pending_only_on_success()
     reconcile = 'docker compose up -d --remove-orphans --no-build --pull never "${targets[@]}"'
     archive = 'mv -- "${UPDATES_DIR}/pending-docker.json"'
     assert rollback.index(build) < rollback.index(pull) < rollback.index(reconcile) < rollback.index(archive)
-    assert rollback.count("guard_rollback_active_calls") == 2
+    post_pull = rollback.index('guard_rollback_active_calls "${rollback_changes_local_ai}"', rollback.index(pull))
+    assert rollback.index(pull) < post_pull < rollback.index(reconcile)
+    assert rollback.count("guard_rollback_active_calls") == 3
     dockerfile = (ROOT / "updater" / "Dockerfile").read_text(encoding="utf-8")
     assert "docker-buildx-plugin" in dockerfile
     assert "COPY scripts/compose-build.sh /usr/local/bin/aava-compose-build" in dockerfile

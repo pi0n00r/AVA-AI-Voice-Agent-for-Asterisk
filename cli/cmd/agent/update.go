@@ -2243,6 +2243,15 @@ func applyDockerActions(ctx *updateContext) error {
 			if _, err := runDockerCommandForUpdate("docker", pullArgs...); err != nil {
 				return fmt.Errorf("docker compose pull failed: %w", err)
 			}
+			// Pulling a missing image can outlast the earlier call-state check.
+			// Refresh runtime state and fail closed immediately before recreation.
+			if err := captureRunningDockerServices(ctx); err != nil {
+				return err
+			}
+			localAIChanges := ctx.currentlyRunning["local_ai_server"] && ctx.composeChanged
+			if err := guardUpdateActiveCalls("reconcile services after image pull (pending Docker actions retained)", ctx.currentlyRunning["ai_engine"], localAIChanges); err != nil {
+				return err
+			}
 			args = append(args, targetList...)
 			if _, err := runDockerCommandForUpdate("docker", args...); err != nil {
 				return fmt.Errorf("docker compose up (remove-orphans) failed: %w", err)

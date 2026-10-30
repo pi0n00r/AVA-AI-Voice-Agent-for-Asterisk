@@ -252,17 +252,20 @@ func TestComposeChangePullsMissingImagesBeforeReconciliation(t *testing.T) {
 	if !commandSeen(*commands, pull) || !commandSeen(*commands, up) {
 		t.Fatalf("missing pull/reconcile commands: %#v", *commands)
 	}
-	pullIndex, upIndex := -1, -1
+	pullIndex, postPullProbeIndex, upIndex := -1, -1, -1
 	for i, command := range *commands {
 		if command == pull {
 			pullIndex = i
+		}
+		if pullIndex >= 0 && i > pullIndex && command == "docker compose ps --services --status running" && postPullProbeIndex < 0 {
+			postPullProbeIndex = i
 		}
 		if command == up {
 			upIndex = i
 		}
 	}
-	if pullIndex < 0 || upIndex < 0 || pullIndex >= upIndex {
-		t.Fatalf("image pull must precede reconciliation: %#v", *commands)
+	if pullIndex < 0 || postPullProbeIndex < 0 || upIndex < 0 || pullIndex >= postPullProbeIndex || postPullProbeIndex >= upIndex {
+		t.Fatalf("image pull and refreshed call-state probe must precede reconciliation: %#v", *commands)
 	}
 }
 
