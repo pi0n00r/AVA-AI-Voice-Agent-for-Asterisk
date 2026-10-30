@@ -2073,7 +2073,10 @@ async def test_pipeline_open_receives_calendar_policy_from_call_snapshot_without
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("continuation,cleanup", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize(
+    "continuation,cleanup",
+    [(False, False), (True, False), (False, True), (True, True)],
+)
 async def test_google_truncation_uses_guarded_call_tts(monkeypatch, continuation, cleanup):
     from src.core.models import CallSession
     from src.pipelines.google import GoogleGenerationIncompleteError
@@ -2091,6 +2094,7 @@ async def test_google_truncation_uses_guarded_call_tts(monkeypatch, continuation
     spoken = asyncio.Queue()
     calls = []
     gate_stages = []
+    continuation_gate_reached = asyncio.Event()
     call_id = f"truncated-call-{continuation}-{cleanup}"
     session = CallSession(call_id=call_id, caller_channel_id=call_id)
     session.pipeline_name = "truncation"
@@ -2126,6 +2130,8 @@ async def test_google_truncation_uses_guarded_call_tts(monkeypatch, continuation
 
     def record_output_gate(*args, stage, **kwargs):
         gate_stages.append(stage)
+        if stage == "tool-continuation-tts":
+            continuation_gate_reached.set()
         return original_output_allowed(*args, stage=stage, **kwargs)
 
     monkeypatch.setattr(engine, "_pipeline_output_allowed", record_output_gate)
@@ -2136,9 +2142,17 @@ async def test_google_truncation_uses_guarded_call_tts(monkeypatch, continuation
         await stt.results.put("Tell me the office hours")
         await asyncio.wait_for(raised.wait(), 2)
         if cleanup:
-            # The response handler performs its ownership gate before yielding.
+            if continuation:
+                await asyncio.wait_for(continuation_gate_reached.wait(), 2)
+            # The response handler performs its ownership gate before yielding,
+            # including after a tool-continuation request.
             assert spoken.empty()
             engine.playback_manager.play_audio.assert_not_awaited()
+            assert all(
+                message.get("content")
+                != "I'm sorry, I couldn't complete that response. Could you ask again?"
+                for message in session.conversation_history
+            )
         else:
             text = await asyncio.wait_for(spoken.get(), 2)
             assert text == "I'm sorry, I couldn't complete that response. Could you ask again?"
