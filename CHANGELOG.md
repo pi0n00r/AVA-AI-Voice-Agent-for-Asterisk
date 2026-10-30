@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.7.3.2] - 2026-10-29
+
+### Changed
+
+- Update the Google modular provider defaults and capability handling for the
+  current Gemini model family, including complete-candidate selection and
+  guarded handling of truncated responses.
+- Keep non-call tools out of OpenAI streaming requests, matching the existing
+  non-streaming tool-selection contract.
+
+### Fixed
+
+- Harden interrupted updater recovery and rollback across Compose and Bake
+  workflows, including coherent state snapshots and preserved project names.
+- Classify Compose changes before reconciliation, pull updated images before
+  recreation, and clean up failed inference-engine fallbacks safely.
+- Recheck active-call state immediately before every call-affecting runtime
+  mutation, including post-pull reconciliation, rebuild-only recreation,
+  service restart, and rollback recovery.
+- Cover tool-continuation cleanup and runtime-mutation ordering with focused
+  regression tests.
+
 ## [7.7.3.1] - 2026-10-28
 
 ### Changed
