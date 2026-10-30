@@ -65,6 +65,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keep tools that are not in-call out of the OpenAI streaming LLM request, as the
+  non-streaming path already does, so a streaming turn cannot be offered pre-call or
+  post-call tools.
+- Resume interrupted updater Docker actions after Git has already advanced,
+  honor `--rebuild=all` at the same commit, and recover Compose/Bake host-network
+  entitlement failures with an explicit, scoped Bake build. Keep active-call
+  checks and stopped Local AI behavior during recovery (#790).
+- Audit upgrade/rollback recovery: build images before recreation, fail closed
+  on unknown active-call state, recheck calls after long builds, preserve
+  interrupted branch checkouts, and archive pending actions after rollback.
+  Use coherent host SQLite snapshots instead of copying live WAL sidecars;
+  reject unmapped database overrides and reused backup IDs. Add a packaged/manual
+  Compose build helper,
+  explicit Buildx dependency, and complete manual/release recovery guidance (#790).
+- Preserve configured Compose project names in manual recovery commands; require
+  verified remote drain for inference-only host runtime changes, including
+  Compose rollback reconciliation from older job plans. Harden journal
+  reads and Unix directory persistence, and check container snapshot integrity
+  before using it for recovery (#790).
+
+- Update the Google modular LLM default and Admin UI suggestions to Gemini 3.8
+  Flash, replacing retired Gemini 1.5 defaults. Omit unsupported temperature and
+  top-p parameters for Gemini 3.6+ while preserving older-model behavior and
+  existing saved model selections. Grey out temperature for Gemini 3.6+ with
+  persistent helper text, preserve its saved value, and re-enable editing for
+  models that support it, including correct handling of Gemini 3.5 Flash and
+  Flash-Lite. Omit unsupported candidate counts for Gemini 3+, remove ineffective
+  example sampling settings, reserve thinking room for isolated summaries, and
+  reject token-truncated responses instead of reporting them as complete. Select a
+  complete candidate even when another is truncated, and send live-call truncation
+  through the normal guarded TTS path with an apology instead of silence; summaries
+  still fail without partial text (#785).
+
+- Prevent an older Local AI `AgentAudioDone` from hanging up an Asterisk-owned
+  farewell before `sound:goodbye` finishes. Reserve the farewell before tool
+  execution, match its exact ARI playback ID and terminal state, and report
+  missing or failed playback as unconfirmed. Treat ARI `done` as a terminal
+  boundary, which also includes stopped/canceled playback, without claiming
+  uninterrupted or audible delivery. Bound the ARI playback-start request so
+  a stalled request cannot hold the farewell gate for minutes. Preserve
+  `agent_hangup` in lifecycle logs and post-call tools when the Asterisk farewell
+  initiates termination. Keep farewell ownership across Local listener replacement
+  while allowing caller teardown to cancel its finalizer (#786).
+- Cancel local transcription on HTTP disconnect and reap decoder/worker work
+  before releasing batch admission. Give full LocalProvider setup and greetings
+  live-call priority before the first incoming audio frame (#784).
+- Restrict transcription uploads to approved audio demuxers and local file input
+  so crafted playlists cannot recursively reopen the uploaded file (#784).
+
 - Backfill Calendly's durable privacy marker when opening pre-marker journals and
   preserve it before disconnect removes credentials. Individual and retention
   deletion keep erasure retries across temporary journal absence and restart,
