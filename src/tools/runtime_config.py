@@ -536,6 +536,13 @@ class ToolRuntimeGeneration:
                             "Skipping invalid HTTP tool at startup: tool=%s phase=%s error_code=%s",
                             name, phase, exc.code,
                         )
+                    except AttributeError:
+                        skipped_http_names.add(name)
+                        del snapshot[block][name]
+                        logging.getLogger(__name__).warning(
+                            "Skipping invalid HTTP tool at startup: tool=%s phase=%s error_code=invalid_http_tool_config",
+                            name, phase,
+                        )
         for block in ("tools", "in_call_tools"):
             for name, doc in (snapshot.get(block) or {}).items():
                 if isinstance(doc, dict) and doc.get("kind") == "pushover":

@@ -241,6 +241,36 @@ def test_startup_skips_only_bad_http_templates_and_never_restores_preserved_copi
     assert generation.registry.has("valid_pre") and not generation.registry.has("bad_post")
 
 
+def test_startup_skips_malformed_http_headers_and_publishes_valid_generation(caplog):
+    secret_marker = "private-header-value"
+    config = {
+        "tools": {
+            "valid_pre": {
+                "kind": "generic_http_lookup",
+                "url": "https://example.invalid",
+            },
+            "bad_headers": {
+                "kind": "generic_http_lookup",
+                "url": "https://example.invalid",
+                "headers": [secret_marker],
+            },
+        }
+    }
+
+    generation = ToolRuntimeGeneration.build(
+        generation_id=1,
+        config=config,
+        skip_invalid_http_templates=True,
+    )
+
+    assert generation.registry.has("valid_pre")
+    assert not generation.registry.has("bad_headers")
+    assert "bad_headers" not in generation.config["tools"]
+    assert "bad_headers" in config["tools"]
+    assert "error_code=invalid_http_tool_config" in caplog.text
+    assert secret_marker not in caplog.text
+
+
 def test_startup_http_policy_does_not_relax_handoff_or_pushover_validation():
     with pytest.raises(ValueError, match="message is required"):
         ToolRuntimeGeneration.build(generation_id=1, skip_invalid_http_templates=True,
