@@ -209,6 +209,50 @@ def test_generation_builds_an_isolated_registry():
     assert first.config_hash == second.config_hash
 
 
+def test_generation_ignores_reserved_in_call_parameters_but_rejects_unsafe_templates():
+    from src.tools.http.template import TemplateError
+    from src.tools.http.template_contract import validate_template
+
+    reporter = {
+        "kind": "in_call_http_lookup",
+        "url": "https://example.invalid/report",
+        "method": "POST",
+        "body_template": '{"transcript":{transcript_json},"topic":"{topic}"}',
+        "parameters": [
+            {"name": "transcript_json", "type": "string"},
+            {"name": "topic", "type": "string"},
+        ],
+    }
+    review = validate_template(reporter, "in_call")
+    reserved_issue = next(
+        issue
+        for issue in review["issues"]
+        if issue.get("error_code") == "reserved_template_variable"
+    )
+    assert review["valid"]
+    assert reserved_issue["severity"] == "warning"
+
+    generation = ToolRuntimeGeneration.build(
+        generation_id=1,
+        config={"in_call_tools": {"reporter": reporter}},
+    )
+    tool = generation.registry.get("reporter")
+    assert tool is not None
+    assert [parameter.name for parameter in tool.definition.parameters] == ["topic"]
+
+    unsafe = {
+        **reporter,
+        "body_template": '{"outcome":"{call_outcome}"}',
+        "parameters": [],
+    }
+    with pytest.raises(TemplateError) as error:
+        ToolRuntimeGeneration.build(
+            generation_id=2,
+            config={"in_call_tools": {"unsafe": unsafe}},
+        )
+    assert error.value.code == "unavailable_template_variable"
+
+
 def test_startup_skips_only_bad_http_templates_and_never_restores_preserved_copies(caplog):
     from src.tools.http.template import TemplateError
     from src.tools.registry import ToolRegistry

@@ -130,8 +130,8 @@ def validate_template(config: Mapping[str, Any], phase: str) -> dict[str, Any]:
         for param in parameters:
             name = param.get("name", "")
             if name in reserved:
-                issues.append(dict(severity="error", error_code="reserved_template_variable", field="parameters", variable=name,
-                                   message=f"{name} is supplied by AVA and cannot be a model parameter."))
+                issues.append(dict(severity="warning", error_code="reserved_template_variable", field="parameters", variable=name,
+                                   message=f"{name} is supplied by AVA and ignored as a model parameter."))
             elif name:
                 model_names.add(name)
                 kind = param.get("type", "string")
