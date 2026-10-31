@@ -485,8 +485,20 @@ class AttendedTransferTool(Tool):
             await context.session_store.upsert_call(session)
         except Exception:
             if attempt is not None:
+                logger.warning(
+                    "Failed to update session before attended transfer originate",
+                    call_id=call_id,
+                    exc_info=True,
+                )
+                await self._recover_background_failure(
+                    context, attempt, reason="session-state-failed"
+                )
                 return None
-            logger.debug("Failed to update session before attended transfer originate", call_id=call_id, exc_info=True)
+            logger.debug(
+                "Failed to update session before attended transfer originate",
+                call_id=call_id,
+                exc_info=True,
+            )
 
         caller_id = self._build_ai_caller_id(context)
         app = str(context.get_config_value("asterisk.app_name", "asterisk-ai-voice-agent") or "asterisk-ai-voice-agent")

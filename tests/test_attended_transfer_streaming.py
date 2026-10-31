@@ -2221,3 +2221,70 @@ async def test_background_screening_failures_use_owned_recovery(monkeypatch, fai
 
     if failure.endswith('during-originate'):
         engine.ari_client.send_command.assert_any_await(method='DELETE', resource='channels/orphan-agent')
+
+
+@pytest.mark.asyncio
+async def test_pre_originate_session_failure_after_moh_uses_owned_recovery(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from src.tools.context import ToolExecutionContext
+    from src.tools.telephony.attended_transfer import AttendedTransferTool
+
+    engine = _build_engine({"enabled": True})
+    session = CallSession(call_id="pre-originate-recovery", caller_channel_id="caller")
+    attempt = {
+        "id": "attempt",
+        "type": "attended_transfer",
+        "_tool_history_origin": {"tool_call_id": "original"},
+    }
+    session.current_action = attempt
+    await engine.session_store.upsert_call(session)
+
+    notify = AsyncMock(return_value=True)
+    engine._call_providers[session.call_id] = types.SimpleNamespace(
+        notify_transfer_failed=notify
+    )
+    send_command = AsyncMock(return_value={})
+    monkeypatch.setattr(engine.ari_client, "send_command", send_command)
+    monkeypatch.setattr(engine.ari_client, "hangup_channel", AsyncMock())
+
+    context = ToolExecutionContext(
+        call_id=session.call_id,
+        caller_channel_id=session.caller_channel_id,
+        session_store=engine.session_store,
+        ari_client=types.SimpleNamespace(engine=engine, send_command=send_command),
+        config={},
+    )
+    get_session = AsyncMock(
+        side_effect=[session, RuntimeError("session state unavailable")]
+    )
+    monkeypatch.setattr(context, "get_session", get_session)
+
+    result = await AttendedTransferTool()._originate_attended_transfer_leg(
+        context=context,
+        destination="support",
+        extension="6000",
+        dial_endpoint="SIP/6000",
+        dial_timeout_sec=30,
+        moh_class="default",
+        attempt=attempt,
+    )
+
+    assert result is None
+    assert get_session.await_count == 2
+    send_command.assert_any_await(
+        method="POST",
+        resource="channels/caller/moh",
+        params={"mohClass": "default"},
+    )
+    send_command.assert_any_await(method="DELETE", resource="channels/caller/moh")
+    assert not any(
+        call.kwargs.get("resource") == "channels"
+        for call in send_command.await_args_list
+    )
+    notify.assert_awaited_once_with(
+        call_id=session.call_id, attempt=attempt, caller_prompt=""
+    )
+    assert session.current_action is None
+    assert session.audio_capture_enabled
+    assert session.tool_calls[-1]["message"] == "Transfer failed (session-state-failed)."
