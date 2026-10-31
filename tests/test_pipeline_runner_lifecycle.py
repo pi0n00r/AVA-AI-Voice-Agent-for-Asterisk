@@ -2095,11 +2095,10 @@ async def test_google_truncation_uses_guarded_call_tts(monkeypatch, continuation
     calls = []
     gate_stages = []
     continuation_gate_reached = asyncio.Event()
-    expected_fallback = (
-        "I'm sorry, I couldn't complete the follow-up response."
-        if continuation
-        else "I'm sorry, I couldn't complete that response. Could you ask again?"
-    )
+    ordinary_fallback = "I'm sorry, I couldn't complete that response. Could you ask again?"
+    continuation_fallback = "I'm sorry, I couldn't complete the follow-up response."
+    fallback_messages = {ordinary_fallback, continuation_fallback}
+    expected_fallback = continuation_fallback if continuation else ordinary_fallback
     call_id = f"truncated-call-{continuation}-{cleanup}"
     session = CallSession(call_id=call_id, caller_channel_id=call_id)
     session.pipeline_name = "truncation"
@@ -2154,7 +2153,7 @@ async def test_google_truncation_uses_guarded_call_tts(monkeypatch, continuation
             assert spoken.empty()
             engine.playback_manager.play_audio.assert_not_awaited()
             assert all(
-                message.get("content") != expected_fallback
+                message.get("content") not in fallback_messages
                 for message in session.conversation_history
             )
         else:
