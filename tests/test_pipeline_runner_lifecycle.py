@@ -2095,6 +2095,11 @@ async def test_google_truncation_uses_guarded_call_tts(monkeypatch, continuation
     calls = []
     gate_stages = []
     continuation_gate_reached = asyncio.Event()
+    expected_fallback = (
+        "I'm sorry, I couldn't complete the follow-up response."
+        if continuation
+        else "I'm sorry, I couldn't complete that response. Could you ask again?"
+    )
     call_id = f"truncated-call-{continuation}-{cleanup}"
     session = CallSession(call_id=call_id, caller_channel_id=call_id)
     session.pipeline_name = "truncation"
@@ -2149,15 +2154,15 @@ async def test_google_truncation_uses_guarded_call_tts(monkeypatch, continuation
             assert spoken.empty()
             engine.playback_manager.play_audio.assert_not_awaited()
             assert all(
-                message.get("content")
-                != "I'm sorry, I couldn't complete that response. Could you ask again?"
+                message.get("content") != expected_fallback
                 for message in session.conversation_history
             )
         else:
             text = await asyncio.wait_for(spoken.get(), 2)
-            assert text == "I'm sorry, I couldn't complete that response. Could you ask again?"
+            assert text == expected_fallback
             assert session.conversation_history[-1]["content"] == text
             engine.playback_manager.play_audio.assert_awaited_once()
+            assert ("ask again" in text.lower()) is not continuation
         assert "post-llm" in gate_stages
         assert len(calls) == (2 if continuation else 1)
     finally:

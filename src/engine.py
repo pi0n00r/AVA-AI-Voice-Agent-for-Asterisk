@@ -17426,7 +17426,9 @@ class Engine:
             return audio_bytes
 
     @staticmethod
-    async def _generate_pipeline_response(adapter, call_id, transcript, context, options):
+    async def _generate_pipeline_response(
+        adapter, call_id, transcript, context, options, fallback_text=None
+    ):
         """Keep truncation audible in calls; isolated summaries still fail closed.
 
         Return through the normal history/TTS path so teardown and transfer gates
@@ -17437,7 +17439,8 @@ class Engine:
         except GoogleGenerationIncompleteError:
             logger.warning("Google call response truncated; using spoken fallback", call_id=call_id)
             return LLMResponse(
-                text="I'm sorry, I couldn't complete that response. Could you ask again?"
+                text=fallback_text
+                or "I'm sorry, I couldn't complete that response. Could you ask again?"
             )
 
     async def _ensure_pipeline_runner(self, session: CallSession, *, forced: bool = False) -> None:
@@ -19380,6 +19383,9 @@ class Engine:
                                                 "",  # Empty transcript - tool result already in context
                                                 context_for_llm,
                                                 continuation_options,
+                                                fallback_text=(
+                                                    "I'm sorry, I couldn't complete the follow-up response."
+                                                ),
                                             )
                                             if llm_response:
                                                 # Handle text response if present
