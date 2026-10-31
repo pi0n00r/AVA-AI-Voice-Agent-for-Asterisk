@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.7.4] - 2026-10-31
+
+### Added
+
+- Add phase-aware HTTP and Pushover template validation, previews, diagnostics,
+  and bounded in-call transcript substitution from upstream #794.
+- Add operator documentation for HTTP templates and OpenAI-compatible batch
+  transcription while retaining the maintained fork's public documentation.
+
+### Fixed
+
+- Recover Google Live sessions after failed attended transfers and preserve
+  tool-response sanitization from upstream #795.
+- Preserve the fork's one-use native message-deposit reconciliation and exact
+  direct-response failure contract while adopting the upstream validator.
+
 ## [7.7.3.3] - 2026-10-30
 
 ### Fixed
