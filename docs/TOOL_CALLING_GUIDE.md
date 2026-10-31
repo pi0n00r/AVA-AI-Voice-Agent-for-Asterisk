@@ -1,6 +1,6 @@
 # Tool Calling Guide
 
-**Version**: 7.7.0<br>
+**Version**: 7.7.1 (release preparation)<br>
 **Status**: Provider-specific qualification (see setup guides)<br>
 **Last Updated**: October 2026
 
@@ -483,6 +483,10 @@ for setup, multiple recipients/groups, prompts, templates, transfer policies,
 credentials, limits and testing.
 
 ## HTTP Template Safety and Compatibility
+
+See [HTTP tool templates](HTTP-Tool-Templates.md) for phase-specific examples,
+inline variable guidance, configuration validation, synthetic previews, and
+in-call transcript-so-far payloads.
 
 The engine's pre-call lookups, in-call HTTP tools, and post-call webhooks resolve
 `${ENV_VAR}` and `{variable}` only in the original operator-authored template.
@@ -1946,5 +1950,44 @@ Tools written once, work with any provider.
 ---
 
 **Last Updated**: October 2026<br>
-**Version**: 7.7.0<br>
+**Version**: 7.7.1 (release preparation)<br>
 **Status**: Provider-specific qualification (see setup guides)
+
+
+### Attended-transfer failure recovery
+
+For Google Live, an attended transfer that ends without connecting sends an
+explicit engine event to the active provider. The agent explains the failed
+connection in the caller's language and follows its configured fallback behavior;
+it is instructed not to redial automatically. This recovery response does not
+require Local AI Server TTS. A configured `caller_declined_prompt` is supplied to
+Google Live as the preferred failure response. Other providers retain their
+existing local failure-prompt path.
+
+Call History records **Transfer initiated** separately from **Transfer failed** or
+**Transfer completed**. Initiation and terminal outcomes retain the
+provider tool invocation ID for both deferred and immediate transfers. Initiation
+success means the request was prepared, not that the destination answered. Older
+records without these stages retain their original display. Failure reasons such
+as `no-answer` describe the recovery path; they do not establish SIP cause or prove
+that all operators are busy. This change adds no strict transfer-attempt budget;
+a prompt instruction alone is not an enforced runtime limit.
+
+The provider event uses Google's documented history-bearing `clientContent`
+message with `turnComplete: true`, after the original tool response has been
+acknowledged: https://ai.google.dev/api/live#bidigeneratecontentclientcontent .
+This requests an immediate recovery response; it is not a second function result.
+Failure events wait for the originating Google tool response to finish sending
+within the existing recovery deadline. Failed/aborted sends suppress the event.
+Queued failure events recheck the exact active attempt after acquiring the
+provider send lock. Superseded attempts cannot interrupt a newer transfer.
+Configured failure prompts resolve the attended caller/screening/destination
+variables in both provider and local playback paths. Background caller-recording
+screening/origination failures use the same owned recovery and terminal history
+path, even when no destination channel was created.
+If the provider has disconnected or event delivery fails, recovery logs the
+failure and still restores caller capture and clears the ended action. It does
+not retry notification or dialing automatically. Real-call validation must cover
+failure announcement playback and a subsequent caller turn as well as successful
+handoff. Bridge failures after provider/media teardown still require the existing
+provider/media recovery mechanisms; this patch does not restart a stopped provider.

@@ -427,6 +427,8 @@ def build_in_call_tool_record(
            if name == "calendly_calendar" else {}),
         **{key: result_dict[key] for key in ("summary_provider", "summary_model", "summary_status",
             "summary_duration_ms", "summary_error_code") if key in result_dict},
+        **({key: result_dict[key] for key in ("phase", "http_status", "delivery_status", "error_code", "template_variable") if key in result_dict}
+           if result_dict.get("http_tool") else {}),
         **({key: result_dict[key] for key in ("delivery_status", "notification_deliveries", "notification_service") if key in result_dict} if result_dict.get("internal_notification") else {}),
         "type": "tool_result",
         "call_id": str(call_id or ""),
@@ -488,6 +490,15 @@ async def record_in_call_tool_result(
             and deferred_action.get("kind") == "transfer"
             else ""
         )
+        if record["status"] == "success" and (
+            (isinstance(deferred_action, dict) and deferred_action.get("transfer_type") == "attended_transfer")
+            or (
+                record["name"] == "attended_transfer"
+                and isinstance(result, dict) and result.get("type") == "attended_transfer"
+                and not result.get("action")
+            )
+        ):
+            record["action"] = "attended_transfer_initiated"
         deferred_origin = {
             "tool_call_id": record["tool_call_id"],
             "name": record["name"],

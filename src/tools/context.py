@@ -81,6 +81,7 @@ class ToolExecutionContext:
     user_input_recorded: bool = False  # Trusted caller path already persisted this turn
     detected_intent: Optional[str] = None
     confidence: Optional[float] = None
+    tool_call_id: Optional[str] = None  # Upstream invocation ID; private runtime metadata
 
     # Private pipeline transport binding, never tool schema/model arguments.
     native_deposit_guard: Any = field(default=None, repr=False)

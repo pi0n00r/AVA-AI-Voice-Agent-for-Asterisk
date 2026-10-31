@@ -18,8 +18,9 @@ from urllib.parse import urlsplit, urlunsplit
 
 from src.tools.summary import SUMMARY_FIELDS, generate_summary, snapshot_history
 from src.tools.http.path_utils import extract_path
+from src.tools.http.template_contract import IN_CALL_RESERVED, render_request, template_fields
 from src.tools.http.template import (
-    TemplateError, body_media_type, render_body, render_headers, render_template, render_url,
+    TemplateError, body_media_type, render_template,
 )
 
 import aiohttp
@@ -27,7 +28,6 @@ import aiohttp
 from src.tools.base import Tool, ToolDefinition, ToolCategory, ToolPhase, ToolParameter
 from src.tools.context import ToolExecutionContext
 from src.tools.http.debug_trace import (
-    BODY_CAPABLE_HTTP_METHODS,
     build_var_snapshot,
     debug_enabled,
     extract_used_brace_vars,
@@ -172,7 +172,9 @@ class InCallHTTPTool(Tool):
         # Convert config parameters to ToolParameter objects
         tool_params = []
         for p in config.parameters:
-            if config.generate_summary and p.get("name") in SUMMARY_FIELDS:
+            if p.get("name") in IN_CALL_RESERVED or (
+                config.generate_summary and p.get("name") in SUMMARY_FIELDS
+            ):
                 continue
             tool_params.append(ToolParameter(
                 name=p.get('name', ''),
@@ -426,7 +428,15 @@ class InCallHTTPTool(Tool):
         parameters: Dict[str, Any],
         context: ToolExecutionContext,
     ) -> Dict[str, Any]:
-        diagnostics = {"internal_notification": True} if self.config.generate_summary else {}
+        diagnostics: Dict[str, Any] = {}
+        if not self.config.direct_response_json_path:
+            diagnostics.update(http_tool=True, phase="in_call")
+        if self.config.generate_summary:
+            diagnostics["internal_notification"] = True
+            diagnostics.update(
+                summary_status="skipped",
+                summary_provider=self.config.summary_provider,
+            )
         delivery_started = False
         delivery: Dict[str, Any] = {}
         delivery_token = _http_delivery_state.set(delivery)
@@ -452,15 +462,27 @@ class InCallHTTPTool(Tool):
                 for key in ("target", "message"):
                     if isinstance(parameters.get(key), str):
                         values[key] = parameters[key]
+
+            needs_history = self.config.generate_summary or any(
+                "{transcript_json}" in template
+                for template in template_fields(vars(self.config), "in_call").values()
+            )
+            history = await snapshot_history(context) if needs_history else []
+            values["transcript_json"] = json.dumps(history)
+            # Validate the final runtime inputs before summary generation or I/O.
+            render_request(vars(self.config), values, "in_call")
             if self.config.generate_summary:
-                history = await snapshot_history(context)
                 generator = getattr(context.tool_registry, "summary_generator", None)
                 summary_values, summary_diagnostics = await generate_summary(
                     self.config,
                     generator,
                     call_id=context.call_id,
                     history=history,
-                    values=values,
+                    values={
+                        key: value
+                        for key, value in values.items()
+                        if key != "transcript_json"
+                    },
                 )
                 values.update(summary_values)
                 diagnostics.update(summary_diagnostics)
@@ -473,6 +495,7 @@ class InCallHTTPTool(Tool):
                         "message": "Summary unavailable; request was not sent.",
                         "delivery_status": "skipped",
                     }
+            if context.session_store:
                 live = await context.get_session()
                 if getattr(live, "cleanup_in_progress", False) or getattr(
                     live, "cleanup_completed", False
@@ -515,6 +538,44 @@ class InCallHTTPTool(Tool):
                 }
         except asyncio.CancelledError:
             raise
+        except TemplateError as exc:
+            if (
+                self.config.name == "pbx_message_deposit"
+                and getattr(context, "native_deposit_required", False) is True
+            ):
+                logger.warning("Native message deposit template rejected")
+                result = self._note_deposit_result(
+                    self._deposit_failure(
+                        "deposit_request_failed",
+                        outcome="unknown" if delivery_started else "not_deposited",
+                    ),
+                    context,
+                )
+            elif self.config.direct_response_json_path:
+                # Direct-response tools retain their bounded caller-facing
+                # failure contract; template diagnostics must not replace it.
+                result = self._failure_result("failed")
+            else:
+                logger.warning(
+                    "HTTP tool template rejected call_id=%s tool=%s "
+                    "phase=in_call error_code=%s template_variable=%s",
+                    context.call_id,
+                    self.config.name,
+                    exc.code,
+                    exc.variable,
+                    extra={
+                        "call_id": context.call_id,
+                        "tool": self.config.name,
+                        "phase": "in_call",
+                        **exc.diagnostics(),
+                    },
+                )
+                result = {
+                    "status": "error",
+                    "message": self.config.error_message,
+                    "delivery_status": "skipped",
+                    **exc.diagnostics(),
+                }
         except Exception:
             if (
                 self.config.name == "pbx_message_deposit"
@@ -531,9 +592,22 @@ class InCallHTTPTool(Tool):
                     context,
                 )
             else:
+                logger.warning(
+                    "HTTP tool preparation failed call_id=%s tool=%s "
+                    "phase=in_call error_code=preparation_failed",
+                    context.call_id,
+                    self.config.name,
+                    extra={
+                        "call_id": context.call_id,
+                        "tool": self.config.name,
+                        "phase": "in_call",
+                        "error_code": "preparation_failed",
+                    },
+                )
                 result = {
                     "status": "error",
                     "message": self.config.error_message,
+                    "error_code": "preparation_failed",
                     "delivery_status": "uncertain" if delivery_started else "skipped",
                     **delivery,
                 }
@@ -587,21 +661,15 @@ class InCallHTTPTool(Tool):
         
         try:
             started = time.monotonic()
-            # Build request
-            url = render_url(self.config.url, sub_context)
-            headers = render_headers(self.config.headers, sub_context)
-            query_params = {
-                k: self._substitute_variables(v, sub_context)
-                for k, v in self.config.query_params.items()
-            }
-            
-            body = None
+            # Build and validate the complete request as one phase-aware contract.
+            prepared = render_request(vars(self.config), sub_context, "in_call")
+            url = prepared["url"]
+            headers = prepared["headers"]
+            query_params = prepared["query_params"]
+            body = prepared["body"]
             json_body = None
             method = str(self.config.method or "GET").strip().upper()
-            if method in BODY_CAPABLE_HTTP_METHODS and self.config.body_template:
-                if not any(key.lower() == "content-type" for key in headers):
-                    headers["Content-Type"] = "application/json"
-                body = render_body(self.config.body_template, sub_context, headers)
+            if body is not None:
                 media_type = body_media_type(headers)
                 if media_type == "application/json" or media_type.endswith("+json"):
                     json_body = json.loads(body)
@@ -896,6 +964,8 @@ class InCallHTTPTool(Tool):
                     dispatch_generation=context.native_deposit_attempt,
                 )
             raise
+        except TemplateError:
+            raise
         except aiohttp.ClientError as e:
             if native_deposit:
                 return self._note_deposit_result(self._deposit_failure("deposit_transport_failed"), context)
@@ -939,6 +1009,7 @@ class InCallHTTPTool(Tool):
             "caller_name": context.caller_name or "",
             "context_name": context.context_name or "",
             "call_id": context.call_id or "",
+            "transcript_json": "[]",
             **(
                 {
                     **{key: "" for key in SUMMARY_FIELDS},
@@ -971,7 +1042,7 @@ class InCallHTTPTool(Tool):
                     call_metadata = getattr(session, 'call_metadata', None) or {}
                     built_in_keys = {
                         "caller_number", "called_number", "caller_name",
-                        "context_name", "call_id",
+                        "context_name", "call_id", "transcript_json",
                         *(SUMMARY_FIELDS if self.config.generate_summary else ()),
                     }
                     for key, value in call_metadata.items():
