@@ -2288,3 +2288,85 @@ async def test_pre_originate_session_failure_after_moh_uses_owned_recovery(monke
     assert session.current_action is None
     assert session.audio_capture_enabled
     assert session.tool_calls[-1]["message"] == "Transfer failed (session-state-failed)."
+
+
+@pytest.mark.asyncio
+async def test_recovery_continues_when_history_write_fails(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    engine = _build_engine({"enabled": True})
+    session = CallSession(call_id="history-failure-recovery", caller_channel_id="caller")
+    action = {
+        "type": "attended_transfer",
+        "agent_channel_id": "agent",
+        "_tool_history_origin": {"tool_call_id": "original"},
+    }
+    session.current_action = action
+    session.audio_capture_enabled = False
+    await engine.session_store.upsert_call(session)
+
+    notify = AsyncMock(return_value=True)
+    engine._call_providers[session.call_id] = types.SimpleNamespace(
+        notify_transfer_failed=notify
+    )
+    record = AsyncMock(side_effect=RuntimeError("history unavailable"))
+    save = AsyncMock(wraps=engine._save_session)
+    monkeypatch.setattr(engine, "_record_attended_transfer_outcome", record)
+    monkeypatch.setattr(engine, "_save_session", save)
+    monkeypatch.setattr(engine.ari_client, "hangup_channel", AsyncMock())
+    monkeypatch.setattr(engine.ari_client, "send_command", AsyncMock())
+
+    await engine._attended_transfer_abort_and_resume(
+        session, "agent", reason="no-answer"
+    )
+
+    record.assert_awaited_once_with(session, action, reason="no-answer")
+    notify.assert_awaited_once_with(
+        call_id=session.call_id, attempt=action, caller_prompt=""
+    )
+    save.assert_awaited_once_with(session)
+    updated = await engine.session_store.get_by_call_id(session.call_id)
+    assert updated.current_action is None
+    assert updated.audio_capture_enabled
+
+
+@pytest.mark.asyncio
+async def test_completion_persists_state_when_history_write_fails(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    engine = _build_engine({"enabled": True})
+    session = CallSession(
+        call_id="history-failure-completion",
+        caller_channel_id="caller",
+        bridge_id="bridge",
+    )
+    action = {"type": "attended_transfer", "agent_channel_id": "agent"}
+    session.current_action = action
+    await engine.session_store.upsert_call(session)
+
+    record = AsyncMock(side_effect=RuntimeError("history unavailable"))
+    save = AsyncMock(wraps=engine._save_session)
+    monkeypatch.setattr(engine, "_record_attended_transfer_outcome", record)
+    monkeypatch.setattr(engine, "_save_session", save)
+    monkeypatch.setattr(
+        engine, "_cleanup_attended_transfer_helper_media", AsyncMock()
+    )
+    monkeypatch.setattr(engine, "_remove_primary_media_from_bridge", AsyncMock())
+    monkeypatch.setattr(engine.ari_client, "send_command", AsyncMock())
+    monkeypatch.setattr(engine.ari_client, "add_channel_to_bridge", AsyncMock())
+
+    await engine._attended_transfer_finalize_bridge(
+        session,
+        agent_channel_id="agent",
+        destination_description="Support agent",
+        caller_connected_prompt="",
+        tts_timeout=8,
+    )
+
+    record.assert_awaited_once_with(session, action)
+    save.assert_awaited_once_with(session)
+    updated = await engine.session_store.get_by_call_id(session.call_id)
+    assert updated.transfer_destination == "Support agent"
+    assert updated.current_action["answered"] is True
+    assert updated.current_action["agent_channel_id"] == "agent"
+    assert updated.current_action["decision"] == "accepted"

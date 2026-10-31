@@ -10271,7 +10271,17 @@ class Engine:
             session = current_session
             if session.current_action is not action:
                 return  # A newer transfer owns the caller now.
-            await self._record_attended_transfer_outcome(session, action, reason=reason)
+            try:
+                await self._record_attended_transfer_outcome(
+                    session, action, reason=reason
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to record attended transfer failure outcome",
+                    call_id=call_id,
+                    reason=reason,
+                    exc_info=True,
+                )
             current_session = await self.session_store.get_by_call_id(call_id)
             if not current_session or current_session.cleanup_in_progress or current_session.current_action is not action:
                 return
@@ -10418,7 +10428,17 @@ class Engine:
         try:
             session = await self.session_store.get_by_call_id(call_id) or session
             session.transfer_destination = destination_description
-            await self._record_attended_transfer_outcome(session, session.current_action or {})
+            try:
+                await self._record_attended_transfer_outcome(
+                    session, session.current_action or {}
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to record attended transfer completion outcome",
+                    call_id=call_id,
+                    destination=destination_description,
+                    exc_info=True,
+                )
             if session.current_action and session.current_action.get("type") == "attended_transfer":
                 session.current_action["answered"] = True
                 session.current_action["agent_channel_id"] = agent_channel_id
