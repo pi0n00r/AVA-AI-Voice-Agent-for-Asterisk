@@ -155,6 +155,22 @@ async def test_confirmed_speech_preserves_learned_noise_floor():
 
 
 @pytest.mark.asyncio
+async def test_classifier_false_negative_cannot_train_during_active_turn():
+    engine, session, provider = setup(evidence=True)
+    await engine.session_store.upsert_call(session)
+    await send(engine, [6000] * 2)
+    state = session.vad_state["upstream_squelch"]
+    assert state["speaking"]
+    floor = state["noise_ema"]
+    session.upstream_speech_evidence.observe.return_value = False
+    await send(engine, [6000])
+    state = session.vad_state["upstream_squelch"]
+    assert state["speaking"]
+    assert state["noise_ema"] == floor
+    assert nonzero(provider) == 2
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("name,cls", PROVIDERS)
 @pytest.mark.parametrize("mode", ["enabled", "disabled", "gated", "pipeline"])
 async def test_provider_capability_and_gating_boundaries(name, cls, mode):

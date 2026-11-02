@@ -12764,13 +12764,7 @@ class Engine:
                         # Keep the configured dynamic energy threshold: a brief
                         # classifier false positive must not reopen learned noise.
                         # An unavailable classifier instead fails open below.
-                        raw_speech = energy > threshold
-
-                        # Independent non-speech evidence lets the floor recover
-                        # even if startup noise opened the energy-only squelch.
-                        # Do not train from speech or unclassified loud frames.
-                        if speech_evidence is False:
-                            noise_ema = (1.0 - alpha) * noise_ema + alpha * float(energy)
+                        raw_speech = energy > threshold and speech_evidence is not False
 
                         if raw_speech:
                             speech_frames += 1
@@ -12782,6 +12776,13 @@ class Engine:
                             speech_frames = 0
                             if speaking and silence_frames >= max(1, end_silence_frames):
                                 speaking = False
+
+                        # Independent non-speech evidence lets the floor recover
+                        # even if startup noise opened the energy-only squelch.
+                        # Do not train during an active turn: a classifier false
+                        # negative must not raise the floor under current speech.
+                        if speech_evidence is False and not speaking:
+                            noise_ema = (1.0 - alpha) * noise_ema + alpha * float(energy)
 
                         suppress_frame = (
                             not speaking and detector.available and speech_evidence is not None
