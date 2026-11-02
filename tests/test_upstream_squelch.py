@@ -171,6 +171,20 @@ async def test_classifier_false_negative_cannot_train_during_active_turn():
 
 
 @pytest.mark.asyncio
+async def test_unknown_packets_do_not_keep_completed_turn_open():
+    engine, session, provider = setup(evidence=True)
+    await engine.session_store.upsert_call(session)
+    await send(engine, [6000] * 2)
+    assert session.vad_state["upstream_squelch"]["speaking"]
+    session.upstream_speech_evidence.observe.side_effect = [None, False] * 15
+    await send(engine, [600] * 30)
+    state = session.vad_state["upstream_squelch"]
+    assert not state["speaking"]
+    assert state["silence_frames"] == 15
+    assert state["speech_frames"] == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("name,cls", PROVIDERS)
 @pytest.mark.parametrize("mode", ["enabled", "disabled", "gated", "pipeline"])
 async def test_provider_capability_and_gating_boundaries(name, cls, mode):

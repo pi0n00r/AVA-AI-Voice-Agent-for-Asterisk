@@ -12764,9 +12764,13 @@ class Engine:
                         # Keep the configured dynamic energy threshold: a brief
                         # classifier false positive must not reopen learned noise.
                         # An unavailable classifier instead fails open below.
-                        raw_speech = energy > threshold and speech_evidence is not False
+                        raw_speech = energy > threshold and speech_evidence is True
 
-                        if raw_speech:
+                        if speech_evidence is None:
+                            # Preserve unclassified audio without treating it as
+                            # speech or resetting an in-progress silence run.
+                            pass
+                        elif raw_speech:
                             speech_frames += 1
                             silence_frames = 0
                             if not speaking and speech_frames >= max(1, min_speech_frames):
