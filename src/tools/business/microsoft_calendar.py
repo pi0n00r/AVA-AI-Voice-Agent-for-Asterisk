@@ -1442,6 +1442,23 @@ class MicrosoftCalendarTool(Tool):
                         "booking_changed",
                         "The booking changed in Outlook; ask staff to verify it.",
                     )
+                if teams:
+                    actual_emails = sorted(
+                        str(
+                            (item.get("emailAddress") or {}).get("address") or ""
+                        ).casefold()
+                        for item in event.get("attendees") or []
+                    )
+                    if (
+                        event.get("subject") != summary
+                        or actual_emails
+                        != sorted(email.casefold() for email in attendees)
+                        or event.get("type", "singleInstance") != "singleInstance"
+                    ):
+                        raise BookingValidationError(
+                            "booking_changed",
+                            "The Teams booking details changed in Outlook; ask staff to verify it.",
+                        )
             record.update(event_id=event["id"], state="active")
             if teams and not resend:
                 # A resend cannot tell a new event from a repeat, so its body is

@@ -1357,6 +1357,33 @@ async def test_teams_resend_gives_no_meeting_baseline(phoenix, teams_booking):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("subject", "Edited by staff"),
+        (
+            "attendees",
+            [{"emailAddress": {"address": "different@example.com"}}],
+        ),
+        ("type", "seriesMaster"),
+    ],
+)
+async def test_teams_resend_rejects_changed_details(
+    phoenix, teams_booking, field, value
+):
+    tool, fake = MicrosoftCalendarTool(), GraphTransactionClient()
+    fake.creation_error = lost_response()
+    with patch.object(tool, "_client_for_config", return_value=fake):
+        await tool.execute(teams_booking, phoenix)
+        fake.hidden.add(fake.events[0]["id"])
+        fake.events[0][field] = value
+        fake.creation_error = None
+        retry = await tool.execute(teams_booking, phoenix)
+    assert retry["error_code"] == "booking_changed"
+    assert len(fake.created) == 2 and len(fake.events) == 1
+
+
+@pytest.mark.asyncio
 async def test_resolving_a_lost_creation_frees_earlier_booking(phoenix):
     tool, fake = MicrosoftCalendarTool(), GraphTransactionClient()
     later = booking(
