@@ -69,6 +69,19 @@ def test_classified_energy_covers_pending_and_current_packet(monkeypatch):
     assert detector.classified_energy is None
     assert detector.observe(quiet, 16000) is True
     assert detector.classified_energy == audioop.rms(loud + quiet, 2)
+    assert detector.voiced_energy == detector.classified_energy
+
+
+def test_voiced_energy_is_not_diluted_by_later_quiet_frames(monkeypatch):
+    vad = Mock()
+    vad.is_speech.side_effect = [True, False]
+    monkeypatch.setattr(module, "webrtcvad", SimpleNamespace(Vad=Mock(return_value=vad)))
+    detector = UpstreamSpeechEvidence()
+    voiced = struct.pack("<hh", 250, -250) * 80
+    quiet = b"\0\0" * 160
+    assert detector.observe(voiced + quiet, 16000) is True
+    assert detector.classified_energy < 200
+    assert detector.voiced_energy == 250
 
 
 def test_rate_change_creates_fresh_detector_and_failed_evidence_is_unknown(monkeypatch):

@@ -212,6 +212,33 @@ async def test_split_frame_uses_energy_from_the_classified_window():
 
 
 @pytest.mark.asyncio
+async def test_voiced_frame_energy_is_not_diluted_by_trailing_silence():
+    vad = Mock()
+    vad.is_speech.side_effect = [True, False]
+    with patch(
+        "src.core.upstream_speech_evidence.webrtcvad",
+        SimpleNamespace(Vad=Mock(return_value=vad)),
+    ):
+        engine, session, provider = setup(
+            evidence=None, upstream_squelch_min_speech_frames=1
+        )
+        await engine.session_store.upsert_call(session)
+        onset = struct.pack("<hh", 300, -300) * 40
+        trailing_silence = b"\0\0" * 240
+        await engine._audiosocket_handle_audio(
+            "ingress",
+            AudioSocketAudioFrame(
+                onset + trailing_silence, 0x12, "slin16", 16000
+            ),
+        )
+    state = session.vad_state["upstream_squelch"]
+    assert state["last_energy"] < state["last_threshold"]
+    assert state["last_voiced_energy"] > state["last_threshold"]
+    assert state["speaking"]
+    assert nonzero(provider) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("name,cls", PROVIDERS)
 @pytest.mark.parametrize("mode", ["enabled", "disabled", "gated", "pipeline"])
 async def test_provider_capability_and_gating_boundaries(name, cls, mode):

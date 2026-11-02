@@ -12754,11 +12754,13 @@ class Engine:
                         speech_evidence = detector.observe(pcm_bytes, int(pcm_rate))
                         squelch_speech_evidence = speech_evidence
                         classified_energy = getattr(detector, "classified_energy", None)
-                        decision_energy = (
-                            float(classified_energy)
-                            if speech_evidence is not None and classified_energy is not None
-                            else float(energy)
-                        )
+                        voiced_energy = getattr(detector, "voiced_energy", None)
+                        if speech_evidence is True and voiced_energy is not None:
+                            decision_energy = float(voiced_energy)
+                        elif speech_evidence is False and classified_energy is not None:
+                            decision_energy = float(classified_energy)
+                        else:
+                            decision_energy = float(energy)
                         if not detector.available and not state.get("evidence_unavailable_warned"):
                             state["evidence_unavailable_warned"] = True
                             logger.warning(
@@ -12805,6 +12807,7 @@ class Engine:
                                 "noise_ema": noise_ema,
                                 "last_energy": energy,
                                 "last_classified_energy": classified_energy,
+                                "last_voiced_energy": voiced_energy,
                                 "last_threshold": int(threshold),
                                 "speech_evidence": speech_evidence,
                                 "frames": int(state.get("frames", 0)) + 1,
