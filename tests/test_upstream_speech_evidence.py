@@ -25,7 +25,10 @@ def test_real_detector_frames_all_audiosocket_rates_without_growing_buffers(rate
         decisions.append(detector.observe(b"\0\0" * samples, rate))
         assert len(detector._pending) < 960  # Less than 10 ms at the largest VAD rate.
     assert detector.available
-    assert False in decisions[-max(5, 100 // ptime):]
+    # Some resampled packet shapes retain an unclassified tail indefinitely;
+    # those must fail open as unknown rather than label the whole packet quiet.
+    assert set(decisions) <= {False, None}
+    assert decisions[-max(5, 100 // ptime):]
 
 
 def test_short_fragments_are_unknown_not_non_speech_and_pause_discards_them(monkeypatch):
@@ -42,6 +45,17 @@ def test_short_fragments_are_unknown_not_non_speech_and_pause_discards_them(monk
     detector.pause()
     assert detector.observe(b"\0\0" * 80, 16000) is None
     assert factory.call_count == 2
+
+
+def test_negative_complete_frame_with_unclassified_tail_is_unknown(monkeypatch):
+    vad = Mock()
+    vad.is_speech.return_value = False
+    monkeypatch.setattr(module, "webrtcvad", SimpleNamespace(Vad=Mock(return_value=vad)))
+    detector = UpstreamSpeechEvidence()
+    silence_then_speech = b"\0\0" * 160 + b"\xff\x7f" * 80
+    assert detector.observe(silence_then_speech, 16000) is None
+    assert detector._pending == b"\xff\x7f" * 80
+    vad.is_speech.assert_called_once_with(b"\0\0" * 160, 16000)
 
 
 def test_rate_change_creates_fresh_detector_and_failed_evidence_is_unknown(monkeypatch):

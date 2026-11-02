@@ -60,9 +60,9 @@ class UpstreamSpeechEvidence:
                 voiced = voiced or positive
             if voiced:
                 return True
-            # A resampler can leave a fractional frame on every packet. Retain
-            # that tail, but still use evidence from the complete real frames.
-            return False if complete_bytes else None
+            # Negative evidence is safe only when every sample in this packet
+            # was classified. A retained tail may contain the start of speech.
+            return False if complete_bytes and not self._pending else None
         except Exception:
             self.available = False
             self.pause()
