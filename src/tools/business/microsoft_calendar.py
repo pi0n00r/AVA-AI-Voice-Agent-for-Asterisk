@@ -1442,17 +1442,18 @@ class MicrosoftCalendarTool(Tool):
                         "booking_changed",
                         "The booking changed in Outlook; ask staff to verify it.",
                     )
-                if teams:
-                    actual_emails = sorted(
-                        str(
-                            (item.get("emailAddress") or {}).get("address") or ""
-                        ).casefold()
-                        for item in event.get("attendees") or []
+                actual_emails = sorted(
+                    str((item.get("emailAddress") or {}).get("address") or "").casefold()
+                    for item in event.get("attendees") or []
+                )
+                if actual_emails != sorted(email.casefold() for email in attendees):
+                    raise BookingValidationError(
+                        "booking_changed",
+                        "The booking attendees changed in Outlook; ask staff to verify it.",
                     )
+                if teams:
                     if (
                         event.get("subject") != summary
-                        or actual_emails
-                        != sorted(email.casefold() for email in attendees)
                         or event.get("type", "singleInstance") != "singleInstance"
                     ):
                         raise BookingValidationError(

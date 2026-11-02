@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **AudioSocket caller squelch (#799):** preserve first-frame speech, recover
+- **AudioSocket caller squelch (#799):** preserve first utterances that start
+  without quiet onset, recover
   from sustained startup noise, and fail open when speech evidence is unknown
   or unavailable without changing RTP, Media WebSocket, or no-input behavior.
 

@@ -1274,6 +1274,28 @@ async def test_resend_keeps_first_attendee_order(phoenix, ms_config):
 
 
 @pytest.mark.asyncio
+async def test_non_teams_resend_rejects_changed_attendees(phoenix, ms_config):
+    ms_config["invitations_enabled"] = True
+    tool, fake = MicrosoftCalendarTool(), GraphTransactionClient()
+    args = booking(booking_confirmed=True, invitation_confirmed=True)
+    fake.creation_error = lost_response()
+    with patch.object(tool, "_client_for_config", return_value=fake):
+        await tool.execute(
+            {**args, "attendee_emails": ["expected@example.com"]}, phoenix
+        )
+        fake.hidden.add(fake.events[0]["id"])
+        fake.events[0]["attendees"] = [
+            {"emailAddress": {"address": "different@example.com"}}
+        ]
+        fake.creation_error = None
+        retry = await tool.execute(
+            {**args, "attendee_emails": ["expected@example.com"]}, phoenix
+        )
+    assert retry["error_code"] == "booking_changed"
+    assert len(fake.created) == 2 and len(fake.events) == 1
+
+
+@pytest.mark.asyncio
 async def test_resend_of_moved_event_reports_booking_changed(phoenix):
     tool, fake = MicrosoftCalendarTool(), GraphTransactionClient()
     fake.creation_error = lost_response()
