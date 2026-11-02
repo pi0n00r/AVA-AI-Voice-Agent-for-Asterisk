@@ -2327,12 +2327,17 @@ class PlatformResponse(BaseModel):
 _PLATFORMS_CACHE = None
 _PLATFORMS_CACHE_MTIME = None
 
+# Ava uses three-component upstream releases and four-component fork fix
+# releases (for example, v7.7.4.1).
+_RELEASE_VERSION_PATTERN = r"\d+\.\d+\.\d+(?:\.\d+)?"
+
 
 def _detect_latest_changelog_version(project_root: str) -> Optional[str]:
     """
     Parse the first released Keep-a-Changelog heading from CHANGELOG.md.
 
-    Expected format: `## [X.Y.Z] - YYYY-MM-DD`
+    Expected format: `## [X.Y.Z] - YYYY-MM-DD` or
+    `## [X.Y.Z.N] - YYYY-MM-DD`.
     """
     try:
         changelog_path = os.path.join(project_root, "CHANGELOG.md")
@@ -2341,7 +2346,10 @@ def _detect_latest_changelog_version(project_root: str) -> Optional[str]:
         with open(changelog_path, "r", encoding="utf-8", errors="ignore") as f:
             for raw_line in f:
                 line = raw_line.strip()
-                m = re.match(r"^## \[(\d+\.\d+\.\d+)\]\s*-\s*\d{4}-\d{2}-\d{2}$", line)
+                m = re.match(
+                    rf"^## \[({_RELEASE_VERSION_PATTERN})\]\s*-\s*\d{{4}}-\d{{2}}-\d{{2}}$",
+                    line,
+                )
                 if m:
                     return f"v{m.group(1)}"
     except Exception:
@@ -2357,9 +2365,9 @@ def _detect_project_version(project_root: str) -> dict:
       1) AAVA_PROJECT_VERSION env var (operator override)
       2) git release tag (`git describe --tags --abbrev=0 --match 'v*'`) — the
          authoritative source, consistent with the Updates page (LOW-U1)
-      3) CHANGELOG.md latest release heading (`## [X.Y.Z] - YYYY-MM-DD`) — fallback
+      3) CHANGELOG.md latest release heading (`## [X.Y.Z[.N]] - YYYY-MM-DD`) — fallback
          when git is unavailable (e.g. tarball install or no checkout)
-      4) Parse README.md for a `vX.Y.Z` token
+      4) Parse README.md for a `vX.Y.Z` or `vX.Y.Z.N` token
       5) unknown
     """
     override = (os.getenv("AAVA_PROJECT_VERSION") or "").strip()
@@ -2405,7 +2413,7 @@ def _detect_project_version(project_root: str) -> dict:
         if os.path.exists(readme_path):
             with open(readme_path, "r", encoding="utf-8", errors="ignore") as f:
                 text = f.read()
-            m = re.search(r"\bv\d+\.\d+\.\d+\b", text)
+            m = re.search(rf"\bv{_RELEASE_VERSION_PATTERN}\b", text)
             if m:
                 return {"version": m.group(0), "source": "readme"}
     except Exception:

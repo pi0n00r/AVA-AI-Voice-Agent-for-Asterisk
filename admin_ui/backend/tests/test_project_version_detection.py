@@ -51,6 +51,23 @@ def test_project_version_falls_back_to_changelog_when_git_unavailable(monkeypatc
     assert result == {"version": "v7.0.1", "source": "changelog"}
 
 
+def test_project_version_accepts_four_component_changelog_release(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("AAVA_PROJECT_VERSION", raising=False)
+    (tmp_path / "CHANGELOG.md").write_text(
+        "# Changelog\n\n## [Unreleased]\n\n## [7.7.4.1] - 2026-11-02\n\n"
+        "## [7.7.4] - 2026-10-31\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        system.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout=""),
+    )
+
+    result = system._detect_project_version(str(tmp_path))
+    assert result == {"version": "v7.7.4.1", "source": "changelog"}
+
+
 def test_project_version_uses_git_when_no_changelog(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("AAVA_PROJECT_VERSION", raising=False)
     (tmp_path / "README.md").write_text("Project version v6.1.0", encoding="utf-8")
@@ -75,3 +92,16 @@ def test_project_version_falls_back_to_readme(monkeypatch, tmp_path) -> None:
 
     result = system._detect_project_version(str(tmp_path))
     assert result == {"version": "v6.2.0", "source": "readme"}
+
+
+def test_project_version_accepts_four_component_readme_release(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("AAVA_PROJECT_VERSION", raising=False)
+    (tmp_path / "README.md").write_text("Current release is v7.7.4.1", encoding="utf-8")
+    monkeypatch.setattr(
+        system.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout=""),
+    )
+
+    result = system._detect_project_version(str(tmp_path))
+    assert result == {"version": "v7.7.4.1", "source": "readme"}
