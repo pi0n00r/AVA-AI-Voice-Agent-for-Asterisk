@@ -12753,6 +12753,12 @@ class Engine:
                             detector = session.upstream_speech_evidence = UpstreamSpeechEvidence()
                         speech_evidence = detector.observe(pcm_bytes, int(pcm_rate))
                         squelch_speech_evidence = speech_evidence
+                        classified_energy = getattr(detector, "classified_energy", None)
+                        decision_energy = (
+                            float(classified_energy)
+                            if speech_evidence is not None and classified_energy is not None
+                            else float(energy)
+                        )
                         if not detector.available and not state.get("evidence_unavailable_warned"):
                             state["evidence_unavailable_warned"] = True
                             logger.warning(
@@ -12764,7 +12770,7 @@ class Engine:
                         # Keep the configured dynamic energy threshold: a brief
                         # classifier false positive must not reopen learned noise.
                         # An unavailable classifier instead fails open below.
-                        raw_speech = energy > threshold and speech_evidence is True
+                        raw_speech = decision_energy > threshold and speech_evidence is True
 
                         if speech_evidence is None:
                             # Preserve unclassified audio without treating it as
@@ -12786,7 +12792,7 @@ class Engine:
                         # Do not train during an active turn: a classifier false
                         # negative must not raise the floor under current speech.
                         if speech_evidence is False and not speaking:
-                            noise_ema = (1.0 - alpha) * noise_ema + alpha * float(energy)
+                            noise_ema = (1.0 - alpha) * noise_ema + alpha * decision_energy
 
                         suppress_frame = (
                             not speaking and detector.available and speech_evidence is not None
@@ -12798,6 +12804,7 @@ class Engine:
                                 "silence_frames": silence_frames,
                                 "noise_ema": noise_ema,
                                 "last_energy": energy,
+                                "last_classified_energy": classified_energy,
                                 "last_threshold": int(threshold),
                                 "speech_evidence": speech_evidence,
                                 "frames": int(state.get("frames", 0)) + 1,

@@ -25,6 +25,7 @@ class UpstreamSpeechEvidence:
         self._input_rate: Optional[int] = None
         self._resample_state = None
         self._pending = b""
+        self.classified_energy: Optional[int] = None
 
     def pause(self) -> None:
         """Do not join partial frames or detector hangover across output gating."""
@@ -32,6 +33,7 @@ class UpstreamSpeechEvidence:
         self._input_rate = None
         self._resample_state = None
         self._pending = b""
+        self.classified_energy = None
 
     def observe(self, pcm16: bytes, rate: int) -> Optional[bool]:
         if not self.available:
@@ -53,6 +55,9 @@ class UpstreamSpeechEvidence:
             frame_bytes = detector_rate * 2 // 100  # Exactly 10 ms.
             complete_bytes = len(data) // frame_bytes * frame_bytes
             self._pending = data[complete_bytes:]
+            self.classified_energy = (
+                audioop.rms(data[:complete_bytes], 2) if complete_bytes else None
+            )
             voiced = False
             for start in range(0, complete_bytes, frame_bytes):
                 # Consume every frame even after a positive result: VAD is stateful.

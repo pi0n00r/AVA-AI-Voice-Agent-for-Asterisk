@@ -58,6 +58,19 @@ def test_negative_complete_frame_with_unclassified_tail_is_unknown(monkeypatch):
     vad.is_speech.assert_called_once_with(b"\0\0" * 160, 16000)
 
 
+def test_classified_energy_covers_pending_and_current_packet(monkeypatch):
+    vad = Mock()
+    vad.is_speech.return_value = True
+    monkeypatch.setattr(module, "webrtcvad", SimpleNamespace(Vad=Mock(return_value=vad)))
+    detector = UpstreamSpeechEvidence()
+    loud = struct.pack("<h", 3000) * 80
+    quiet = b"\0\0" * 80
+    assert detector.observe(loud, 16000) is None
+    assert detector.classified_energy is None
+    assert detector.observe(quiet, 16000) is True
+    assert detector.classified_energy == audioop.rms(loud + quiet, 2)
+
+
 def test_rate_change_creates_fresh_detector_and_failed_evidence_is_unknown(monkeypatch):
     factory = Mock(side_effect=lambda mode: Mock(is_speech=Mock(return_value=True)))
     monkeypatch.setattr(module, "webrtcvad", SimpleNamespace(Vad=factory))
