@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.7.4.1] - 2026-11-02
+
+### Fixed
+
+- **AudioSocket caller squelch (#799):** preserve first utterances that start
+  without quiet onset, recover
+  from sustained startup noise, and fail open when speech evidence is unknown
+  or unavailable without changing RTP, Media WebSocket, or no-input behavior.
+
+- **Microsoft Calendar lost create (#798):** resend an unresolved identical
+  create on the same Graph transaction ID and require event readback before
+  reporting success; unresolved and duplicate-transaction outcomes stay uncertain.
+
 ## [7.7.4] - 2026-10-31
 
 ### Added

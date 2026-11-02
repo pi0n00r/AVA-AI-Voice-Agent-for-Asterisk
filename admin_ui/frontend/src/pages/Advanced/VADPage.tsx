@@ -18,7 +18,9 @@ const VADPage = () => {
     const { confirm } = useConfirmDialog();
     const [config, setConfig] = useState<any>(() => getCachedConfig()?.config ?? {});
     const [loading, setLoading] = useState(() => getCachedConfig() == null);
-    const [yamlError, setYamlError] = useState<YamlErrorInfo | null>(() => getCachedConfig()?.yamlError ?? null);
+    const [yamlError, setYamlError] = useState<YamlErrorInfo | null>(
+        () => getCachedConfig()?.yamlError ?? null
+    );
     const [saving, setSaving] = useState(false);
     const { restartRequired, refetch } = useRestartRequired();
     const [restartingEngine, setRestartingEngine] = useState(false);
@@ -36,7 +38,10 @@ const VADPage = () => {
 
     useEffect(() => {
         try {
-            localStorage.setItem(VAD_UTTERANCE_EXPERT_STORAGE_KEY, showUtteranceExpert ? 'true' : 'false');
+            localStorage.setItem(
+                VAD_UTTERANCE_EXPERT_STORAGE_KEY,
+                showUtteranceExpert ? 'true' : 'false'
+            );
         } catch {
             // Ignore.
         }
@@ -66,7 +71,9 @@ const VADPage = () => {
         setSaving(true);
         try {
             const sanitized = sanitizeConfigForSave(config);
-            const response = await axios.post('/api/config/yaml', { content: yaml.dump(sanitized) });
+            const response = await axios.post('/api/config/yaml', {
+                content: yaml.dump(sanitized),
+            });
             const method = response.data?.recommended_apply_method || 'restart';
             setApplyMethod(method);
             await refetch();
@@ -93,7 +100,10 @@ const VADPage = () => {
                 if (response.data?.restart_required) {
                     setApplyMethod('restart');
                     await refetch();
-                    toast.warning('Hot reload applied partially', { description: response.data.message || 'Restart AI Engine to fully apply changes' });
+                    toast.warning('Hot reload applied partially', {
+                        description:
+                            response.data.message || 'Restart AI Engine to fully apply changes',
+                    });
                     return;
                 }
 
@@ -107,14 +117,16 @@ const VADPage = () => {
                 return;
             }
 
-            const response = await axios.post(`/api/system/containers/ai_engine/restart?force=${force}`);
+            const response = await axios.post(
+                `/api/system/containers/ai_engine/restart?force=${force}`
+            );
 
             if (response.data.status === 'warning') {
                 const confirmForce = await confirm({
                     title: 'Force Restart?',
                     description: `${response.data.message}\n\nDo you want to force restart anyway? This may disconnect active calls.`,
                     confirmText: 'Force Restart',
-                    variant: 'destructive'
+                    variant: 'destructive',
                 });
                 if (confirmForce) {
                     setRestartingEngine(false);
@@ -124,7 +136,9 @@ const VADPage = () => {
             }
 
             if (response.data.status === 'degraded') {
-                toast.warning('AI Engine restarted but may not be fully healthy', { description: response.data.output || 'Please verify manually' });
+                toast.warning('AI Engine restarted but may not be fully healthy', {
+                    description: response.data.output || 'Please verify manually',
+                });
                 return;
             }
 
@@ -134,19 +148,21 @@ const VADPage = () => {
             }
         } catch (error: any) {
             const actionLabel = applyMethod === 'hot_reload' ? 'hot reload' : 'restart';
-            toast.error(`Failed to ${actionLabel} AI Engine`, { description: error.response?.data?.detail || error.message });
+            toast.error(`Failed to ${actionLabel} AI Engine`, {
+                description: error.response?.data?.detail || error.message,
+            });
         } finally {
             setRestartingEngine(false);
         }
     };
 
-    const updateVADConfig = (field: string, value: any) => {
+    const updateVADConfig = (field: string, value: string | number | boolean) => {
         setConfig({
             ...config,
             vad: {
                 ...config.vad,
-                [field]: value
-            }
+                [field]: value,
+            },
         });
     };
 
@@ -167,28 +183,33 @@ const VADPage = () => {
             'max_utterance_duration_ms',
             'utterance_padding_ms',
             'fallback_buffer_size',
-        ].some((field) => vad[field] !== undefined);
+        ].some(field => vad[field] !== undefined);
         if (hasExpertOverrides) {
             setShowUtteranceExpert(true);
         }
     }, [config?.vad]);
 
-    if (loading) return <div className="p-8 text-center text-muted-foreground">Loading configuration...</div>;
+    if (loading)
+        return (
+            <div className="p-8 text-center text-muted-foreground">Loading configuration...</div>
+        );
 
-    if (yamlError) return (
-        <div className="space-y-6">
-            <YamlErrorBanner error={yamlError} />
-        </div>
-    );
+    if (yamlError)
+        return (
+            <div className="space-y-6">
+                <YamlErrorBanner error={yamlError} />
+            </div>
+        );
 
     const vadConfig = config.vad || {};
     const noInputConfig = config.no_input || {};
     const effectiveVadMode =
         vadConfig.vad_mode ?? (vadConfig.use_provider_vad ? 'provider' : 'auto');
 
-    const bannerMessage = applyMethod === 'hot_reload'
-        ? 'Changes saved. Apply Changes to hot reload AI Engine without dropping active calls.'
-        : 'Changes to VAD configurations require an AI Engine restart to take effect.';
+    const bannerMessage =
+        applyMethod === 'hot_reload'
+            ? 'Changes saved. Apply Changes to hot reload AI Engine without dropping active calls.'
+            : 'Changes to VAD configurations require an AI Engine restart to take effect.';
 
     return (
         <div className="space-y-6">
@@ -209,8 +230,12 @@ const VADPage = () => {
                             <RefreshCw className="w-3 h-3 mr-1.5" />
                         )}
                         {restartingEngine
-                            ? (applyMethod === 'hot_reload' ? 'Applying...' : 'Restarting...')
-                            : (applyMethod === 'hot_reload' ? 'Apply Changes' : 'Restart AI Engine')}
+                            ? applyMethod === 'hot_reload'
+                                ? 'Applying...'
+                                : 'Restarting...'
+                            : applyMethod === 'hot_reload'
+                              ? 'Apply Changes'
+                              : 'Restart AI Engine'}
                     </button>
                 </div>
             )}
@@ -232,7 +257,10 @@ const VADPage = () => {
                 </button>
             </div>
 
-            <ConfigSection title="Primary Detection" description="Main VAD settings for speech detection.">
+            <ConfigSection
+                title="Primary Detection"
+                description="Main VAD settings for speech detection."
+            >
                 <ConfigCard>
                     <div className="space-y-6">
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -241,14 +269,16 @@ const VADPage = () => {
                                 description="Use advanced algorithms for better accuracy."
                                 tooltip="Enables engine-side VAD (energy + optional WebRTC VAD) used for local heuristics like barge-in fallback and silence robustness. Does not change provider-owned turn-taking."
                                 checked={vadConfig.enhanced_enabled ?? false}
-                                onChange={(e) => updateVADConfig('enhanced_enabled', e.target.checked)}
+                                onChange={e =>
+                                    updateVADConfig('enhanced_enabled', e.target.checked)
+                                }
                             />
                             <div className="space-y-2">
                                 <label className="text-sm font-medium leading-none">VAD Mode</label>
                                 <select
                                     className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                                     value={effectiveVadMode}
-                                    onChange={(e) => updateVADConfig('vad_mode', e.target.value)}
+                                    onChange={e => updateVADConfig('vad_mode', e.target.value)}
                                 >
                                     <option value="auto">Auto (per-provider)</option>
                                     <option value="local">Always Local VAD</option>
@@ -258,8 +288,8 @@ const VADPage = () => {
                                     {effectiveVadMode === 'local'
                                         ? 'Local Enhanced + WebRTC VAD active for all providers.'
                                         : effectiveVadMode === 'provider'
-                                        ? 'Provider-managed turn detection for all providers (legacy behavior).'
-                                        : 'Automatically decides per-provider: providers with native VAD + barge-in (e.g. OpenAI Realtime) use provider VAD; others (e.g. Google Live) use local VAD.'}
+                                          ? 'Provider-managed turn detection for all providers (legacy behavior).'
+                                          : 'Automatically decides per-provider: providers with native VAD + barge-in (e.g. OpenAI Realtime) use provider VAD; others (e.g. Google Live) use local VAD.'}
                                 </p>
                             </div>
                         </div>
@@ -269,7 +299,9 @@ const VADPage = () => {
                                 label="Energy Threshold (RMS)"
                                 type="number"
                                 value={vadConfig.energy_threshold ?? 1500}
-                                onChange={(e) => updateVADConfig('energy_threshold', parseInt(e.target.value))}
+                                onChange={e =>
+                                    updateVADConfig('energy_threshold', parseInt(e.target.value))
+                                }
                                 tooltip="Engine VAD energy threshold (RMS over PCM16). Higher = less sensitive (fewer false triggers), lower = more sensitive (better for quiet callers). Only applies when Enhanced VAD is enabled."
                                 disabled={!vadConfig.enhanced_enabled}
                             />
@@ -280,7 +312,12 @@ const VADPage = () => {
                                 min="0"
                                 max="1"
                                 value={vadConfig.confidence_threshold ?? 0.6}
-                                onChange={(e) => updateVADConfig('confidence_threshold', parseFloat(e.target.value))}
+                                onChange={e =>
+                                    updateVADConfig(
+                                        'confidence_threshold',
+                                        parseFloat(e.target.value)
+                                    )
+                                }
                                 tooltip="Confidence required for engine VAD decisions (0.0–1.0). Used by engine heuristics; providers may implement their own confidence/endpointing. Only applies when Enhanced VAD is enabled."
                                 disabled={!vadConfig.enhanced_enabled}
                             />
@@ -292,7 +329,9 @@ const VADPage = () => {
                                 description="Adapt energy threshold based on observed noise floor."
                                 tooltip="When enabled, engine VAD raises the effective energy threshold in noisy environments so background noise doesn’t trigger speech."
                                 checked={vadConfig.adaptive_threshold_enabled ?? true}
-                                onChange={(e) => updateVADConfig('adaptive_threshold_enabled', e.target.checked)}
+                                onChange={e =>
+                                    updateVADConfig('adaptive_threshold_enabled', e.target.checked)
+                                }
                             />
                             <FormInput
                                 label="Noise Adaptation Rate"
@@ -301,7 +340,12 @@ const VADPage = () => {
                                 min="0"
                                 max="1"
                                 value={vadConfig.noise_adaptation_rate ?? 0.1}
-                                onChange={(e) => updateVADConfig('noise_adaptation_rate', parseFloat(e.target.value))}
+                                onChange={e =>
+                                    updateVADConfig(
+                                        'noise_adaptation_rate',
+                                        parseFloat(e.target.value)
+                                    )
+                                }
                                 tooltip="How quickly the adaptive threshold reacts to background noise (0.0–1.0). Higher reacts faster but can over-adjust on short noise bursts."
                             />
                         </div>
@@ -320,7 +364,7 @@ const VADPage = () => {
                             description="Protect inbound calls by default after 30 seconds without caller activity."
                             tooltip="The clock pauses while the agent is greeting, speaking, processing a turn, or transferring. Caller audio and provider speech events reset it. Outbound calls remain disabled unless the individual agent opts in."
                             checked={noInputConfig.enabled ?? true}
-                            onChange={(e) => updateNoInputConfig('enabled', e.target.checked)}
+                            onChange={e => updateNoInputConfig('enabled', e.target.checked)}
                         />
 
                         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
@@ -330,7 +374,12 @@ const VADPage = () => {
                                 min="1"
                                 max="3600"
                                 value={noInputConfig.initial_timeout_sec ?? 30}
-                                onChange={(e) => updateNoInputConfig('initial_timeout_sec', parseFloat(e.target.value))}
+                                onChange={e =>
+                                    updateNoInputConfig(
+                                        'initial_timeout_sec',
+                                        parseFloat(e.target.value)
+                                    )
+                                }
                                 tooltip="How long to wait after the agent becomes idle before asking whether the caller is still there."
                                 disabled={!(noInputConfig.enabled ?? true)}
                             />
@@ -340,7 +389,12 @@ const VADPage = () => {
                                 min="1"
                                 max="3600"
                                 value={noInputConfig.grace_timeout_sec ?? 15}
-                                onChange={(e) => updateNoInputConfig('grace_timeout_sec', parseFloat(e.target.value))}
+                                onChange={e =>
+                                    updateNoInputConfig(
+                                        'grace_timeout_sec',
+                                        parseFloat(e.target.value)
+                                    )
+                                }
                                 tooltip="How long the caller has to respond after each check-in."
                                 disabled={!(noInputConfig.enabled ?? true)}
                             />
@@ -350,7 +404,9 @@ const VADPage = () => {
                                 min="0"
                                 max="10"
                                 value={noInputConfig.max_check_ins ?? 1}
-                                onChange={(e) => updateNoInputConfig('max_check_ins', parseInt(e.target.value))}
+                                onChange={e =>
+                                    updateNoInputConfig('max_check_ins', parseInt(e.target.value))
+                                }
                                 tooltip="Number of check-in prompts before the final message and hangup. Set to 0 to skip directly to the final message."
                                 disabled={!(noInputConfig.enabled ?? true)}
                             />
@@ -360,27 +416,36 @@ const VADPage = () => {
                             <FormInput
                                 label="Check-In Message"
                                 value={noInputConfig.check_in_message ?? 'Are you still there?'}
-                                onChange={(e) => updateNoInputConfig('check_in_message', e.target.value)}
+                                onChange={e =>
+                                    updateNoInputConfig('check_in_message', e.target.value)
+                                }
                                 tooltip="Spoken by the active provider or pipeline using this agent's configured voice."
                                 disabled={!(noInputConfig.enabled ?? true)}
                             />
                             <FormInput
                                 label="Final Message"
-                                value={noInputConfig.final_message ?? "I still can't hear you, so I'll end the call now. Goodbye."}
-                                onChange={(e) => updateNoInputConfig('final_message', e.target.value)}
+                                value={
+                                    noInputConfig.final_message ??
+                                    "I still can't hear you, so I'll end the call now. Goodbye."
+                                }
+                                onChange={e => updateNoInputConfig('final_message', e.target.value)}
                                 tooltip="Spoken in the configured agent voice immediately before the engine hangs up. Leave empty for no final announcement."
                                 disabled={!(noInputConfig.enabled ?? true)}
                             />
                         </div>
 
                         <p className="text-xs text-muted-foreground">
-                            Outbound calls do not inherit this behavior automatically. Enable it explicitly in the outbound agent's settings.
+                            Outbound calls do not inherit this behavior automatically. Enable it
+                            explicitly in the outbound agent's settings.
                         </p>
                     </div>
                 </ConfigCard>
             </ConfigSection>
 
-            <ConfigSection title="Engine VAD (WebRTC)" description="Engine-side fallback heuristics (barge-in + safety), using WebRTC VAD when available.">
+            <ConfigSection
+                title="Engine VAD (WebRTC)"
+                description="Engine-side fallback heuristics (barge-in + safety), using WebRTC VAD when available."
+            >
                 <ConfigCard>
                     <div className="space-y-6">
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -389,7 +454,9 @@ const VADPage = () => {
                                 description="Allow periodic forwarding / heuristics during extended silence (engine-side)."
                                 tooltip="If the engine believes the caller is silent for too long, it periodically lets audio through to avoid getting “stuck” on mis-detected silence. Does not affect providers that continuously stream audio."
                                 checked={vadConfig.fallback_enabled ?? true}
-                                onChange={(e) => updateVADConfig('fallback_enabled', e.target.checked)}
+                                onChange={e =>
+                                    updateVADConfig('fallback_enabled', e.target.checked)
+                                }
                             />
                         </div>
 
@@ -398,7 +465,12 @@ const VADPage = () => {
                                 label="Fallback Interval (ms)"
                                 type="number"
                                 value={vadConfig.fallback_interval_ms ?? 1500}
-                                onChange={(e) => updateVADConfig('fallback_interval_ms', parseInt(e.target.value))}
+                                onChange={e =>
+                                    updateVADConfig(
+                                        'fallback_interval_ms',
+                                        parseInt(e.target.value)
+                                    )
+                                }
                                 tooltip="After this much detected silence, engine may periodically allow audio through for robustness (default: 1500ms). Increase to reduce background noise leakage; decrease if calls feel “stuck”."
                             />
                         </div>
@@ -410,21 +482,33 @@ const VADPage = () => {
                                 min="0"
                                 max="3"
                                 value={vadConfig.webrtc_aggressiveness ?? 1}
-                                onChange={(e) => updateVADConfig('webrtc_aggressiveness', parseInt(e.target.value))}
+                                onChange={e =>
+                                    updateVADConfig(
+                                        'webrtc_aggressiveness',
+                                        parseInt(e.target.value)
+                                    )
+                                }
                                 tooltip="WebRTC VAD aggressiveness (0–3). Higher = more aggressive silence detection (fewer false speech triggers) but may miss quiet speech."
                             />
                             <FormInput
                                 label="Start Frames"
                                 type="number"
                                 value={vadConfig.webrtc_start_frames ?? 2}
-                                onChange={(e) => updateVADConfig('webrtc_start_frames', parseInt(e.target.value))}
+                                onChange={e =>
+                                    updateVADConfig('webrtc_start_frames', parseInt(e.target.value))
+                                }
                                 tooltip="Number of consecutive “speech” frames needed to declare speech started. Higher reduces false starts but increases detection latency."
                             />
                             <FormInput
                                 label="End Silence Frames"
                                 type="number"
                                 value={vadConfig.webrtc_end_silence_frames ?? 15}
-                                onChange={(e) => updateVADConfig('webrtc_end_silence_frames', parseInt(e.target.value))}
+                                onChange={e =>
+                                    updateVADConfig(
+                                        'webrtc_end_silence_frames',
+                                        parseInt(e.target.value)
+                                    )
+                                }
                                 tooltip="Number of consecutive “silence” frames needed to declare speech ended. Higher avoids cutting off trailing words but increases tail latency."
                             />
                         </div>
@@ -443,10 +527,12 @@ const VADPage = () => {
                                 label="Utterance Expert Settings"
                                 description="Enable editing of low-level utterance timing and buffer controls."
                                 checked={showUtteranceExpert}
-                                onChange={(e) => setShowUtteranceExpert(e.target.checked)}
+                                onChange={e => setShowUtteranceExpert(e.target.checked)}
                                 className="mb-0 border-0 p-0 bg-transparent"
                             />
-                            <p className={`text-xs mt-2 ${showUtteranceExpert ? 'text-amber-700 dark:text-amber-400' : 'text-muted-foreground'}`}>
+                            <p
+                                className={`text-xs mt-2 ${showUtteranceExpert ? 'text-amber-700 dark:text-amber-400' : 'text-muted-foreground'}`}
+                            >
                                 {showUtteranceExpert
                                     ? 'Warning: these controls can clip speech, delay turn-taking, or over-buffer audio if tuned aggressively.'
                                     : 'Expert values are visible and read-only until enabled.'}
@@ -457,7 +543,12 @@ const VADPage = () => {
                                 label="Min Utterance Duration (ms)"
                                 type="number"
                                 value={vadConfig.min_utterance_duration_ms ?? 800}
-                                onChange={(e) => updateVADConfig('min_utterance_duration_ms', parseInt(e.target.value))}
+                                onChange={e =>
+                                    updateVADConfig(
+                                        'min_utterance_duration_ms',
+                                        parseInt(e.target.value)
+                                    )
+                                }
                                 tooltip="Minimum duration to consider detected speech a valid utterance."
                                 disabled={!showUtteranceExpert}
                             />
@@ -465,7 +556,12 @@ const VADPage = () => {
                                 label="Max Utterance Duration (ms)"
                                 type="number"
                                 value={vadConfig.max_utterance_duration_ms ?? 8000}
-                                onChange={(e) => updateVADConfig('max_utterance_duration_ms', parseInt(e.target.value))}
+                                onChange={e =>
+                                    updateVADConfig(
+                                        'max_utterance_duration_ms',
+                                        parseInt(e.target.value)
+                                    )
+                                }
                                 tooltip="Hard cap for a single utterance before forced boundary handling."
                                 disabled={!showUtteranceExpert}
                             />
@@ -475,7 +571,12 @@ const VADPage = () => {
                                 label="Utterance Padding (ms)"
                                 type="number"
                                 value={vadConfig.utterance_padding_ms ?? 100}
-                                onChange={(e) => updateVADConfig('utterance_padding_ms', parseInt(e.target.value))}
+                                onChange={e =>
+                                    updateVADConfig(
+                                        'utterance_padding_ms',
+                                        parseInt(e.target.value)
+                                    )
+                                }
                                 tooltip="Extra audio kept around utterance boundaries for naturalness."
                                 disabled={!showUtteranceExpert}
                             />
@@ -483,7 +584,12 @@ const VADPage = () => {
                                 label="Fallback Buffer Size (bytes)"
                                 type="number"
                                 value={vadConfig.fallback_buffer_size ?? 128000}
-                                onChange={(e) => updateVADConfig('fallback_buffer_size', parseInt(e.target.value))}
+                                onChange={e =>
+                                    updateVADConfig(
+                                        'fallback_buffer_size',
+                                        parseInt(e.target.value)
+                                    )
+                                }
                                 tooltip="Internal fallback buffer size used by engine-side VAD fallback paths."
                                 disabled={!showUtteranceExpert}
                             />
@@ -494,7 +600,7 @@ const VADPage = () => {
 
             <ConfigSection
                 title="Upstream Squelch"
-                description="Optional upstream noise squelch for continuous-audio providers with server-side VAD."
+                description="AudioSocket only: optional noise squelch for continuous-audio providers with server-side VAD. Save and restart AI Engine to apply settings."
             >
                 <ConfigCard>
                     <div className="space-y-6">
@@ -502,9 +608,11 @@ const VADPage = () => {
                             <FormSwitch
                                 label="Enable Upstream Squelch"
                                 description="Replace non-speech frames with silence for server-VAD providers."
-                                tooltip="When enabled, the AI Engine analyzes inbound PCM16 energy and replaces low-energy/noise frames with silence before forwarding audio to providers that require continuous audio and have native VAD. This can improve end-of-turn detection in noisy environments, but overly aggressive settings can clip quiet speech."
+                                tooltip="On AudioSocket, replace frames below the adaptive energy threshold with silence. Independent speech evidence protects speech from noise-floor learning and lets sustained non-speech noise raise the floor, even if it briefly opens the squelch. RTP, Media WebSocket, Local full agent and modular pipelines bypass this squelch. Speech-like noise may still pass, and aggressive thresholds can suppress quiet callers."
                                 checked={vadConfig.upstream_squelch_enabled ?? true}
-                                onChange={(e) => updateVADConfig('upstream_squelch_enabled', e.target.checked)}
+                                onChange={e =>
+                                    updateVADConfig('upstream_squelch_enabled', e.target.checked)
+                                }
                             />
                         </div>
 
@@ -514,8 +622,13 @@ const VADPage = () => {
                                 type="number"
                                 min="0"
                                 value={vadConfig.upstream_squelch_base_rms ?? 200}
-                                onChange={(e) => updateVADConfig('upstream_squelch_base_rms', parseInt(e.target.value))}
-                                tooltip="Minimum RMS threshold in PCM16 space. Higher blocks more low-energy audio (less noise leakage) but may suppress quiet callers."
+                                onChange={e =>
+                                    updateVADConfig(
+                                        'upstream_squelch_base_rms',
+                                        parseInt(e.target.value)
+                                    )
+                                }
+                                tooltip="Minimum RMS threshold in PCM16 space, also used as the initial threshold before a noise floor is established. Higher blocks more low-energy audio but may suppress quiet callers."
                             />
                             <FormInput
                                 label="Noise Factor"
@@ -523,7 +636,12 @@ const VADPage = () => {
                                 step="0.1"
                                 min="0"
                                 value={vadConfig.upstream_squelch_noise_factor ?? 2.5}
-                                onChange={(e) => updateVADConfig('upstream_squelch_noise_factor', parseFloat(e.target.value))}
+                                onChange={e =>
+                                    updateVADConfig(
+                                        'upstream_squelch_noise_factor',
+                                        parseFloat(e.target.value)
+                                    )
+                                }
                                 tooltip="Dynamic threshold multiplier: threshold = max(base_rms, noise_floor_rms × noise_factor). Increase to be more conservative about what counts as speech."
                             />
                         </div>
@@ -536,15 +654,25 @@ const VADPage = () => {
                                 min="0"
                                 max="1"
                                 value={vadConfig.upstream_squelch_noise_ema_alpha ?? 0.06}
-                                onChange={(e) => updateVADConfig('upstream_squelch_noise_ema_alpha', parseFloat(e.target.value))}
-                                tooltip="Noise floor smoothing factor (0–1). Higher adapts faster to changing background noise but can overreact to short bursts."
+                                onChange={e =>
+                                    updateVADConfig(
+                                        'upstream_squelch_noise_ema_alpha',
+                                        parseFloat(e.target.value)
+                                    )
+                                }
+                                tooltip="Noise floor smoothing factor (0–1). Independently detected non-speech can update the floor even while the squelch is open; detected speech does not train it. Higher adapts faster. Zero disables noise-floor adaptation."
                             />
                             <FormInput
                                 label="Min Speech Frames"
                                 type="number"
                                 min="1"
                                 value={vadConfig.upstream_squelch_min_speech_frames ?? 2}
-                                onChange={(e) => updateVADConfig('upstream_squelch_min_speech_frames', parseInt(e.target.value))}
+                                onChange={e =>
+                                    updateVADConfig(
+                                        'upstream_squelch_min_speech_frames',
+                                        parseInt(e.target.value)
+                                    )
+                                }
                                 tooltip="Hysteresis: number of consecutive speech frames required before the engine considers the caller “speaking”. Higher reduces false positives but can increase detection latency."
                             />
                         </div>
@@ -555,7 +683,12 @@ const VADPage = () => {
                                 type="number"
                                 min="1"
                                 value={vadConfig.upstream_squelch_end_silence_frames ?? 15}
-                                onChange={(e) => updateVADConfig('upstream_squelch_end_silence_frames', parseInt(e.target.value))}
+                                onChange={e =>
+                                    updateVADConfig(
+                                        'upstream_squelch_end_silence_frames',
+                                        parseInt(e.target.value)
+                                    )
+                                }
                                 tooltip="Hysteresis: number of consecutive silence frames required to exit speaking state. Higher avoids toggling during noise, but may keep speech ‘open’ longer."
                             />
                         </div>
