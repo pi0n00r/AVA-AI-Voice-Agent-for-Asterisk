@@ -55,7 +55,45 @@ def test_negative_complete_frame_with_unclassified_tail_is_unknown(monkeypatch):
     silence_then_speech = b"\0\0" * 160 + b"\xff\x7f" * 80
     assert detector.observe(silence_then_speech, 16000) is None
     assert detector._pending == b"\xff\x7f" * 80
+    assert detector.has_unclassified_tail
     vad.is_speech.assert_called_once_with(b"\0\0" * 160, 16000)
+
+
+def test_positive_complete_frame_reports_unclassified_tail(monkeypatch):
+    vad = Mock()
+    vad.is_speech.return_value = True
+    monkeypatch.setattr(module, "webrtcvad", SimpleNamespace(Vad=Mock(return_value=vad)))
+    detector = UpstreamSpeechEvidence()
+    complete_then_tail = b"\0\0" * 160 + struct.pack("<hh", 3000, -3000) * 40
+    assert detector.observe(complete_then_tail, 16000) is True
+    assert detector.voiced_energy == 0
+    assert detector.has_unclassified_tail
+
+
+def test_classified_energy_covers_pending_and_current_packet(monkeypatch):
+    vad = Mock()
+    vad.is_speech.return_value = True
+    monkeypatch.setattr(module, "webrtcvad", SimpleNamespace(Vad=Mock(return_value=vad)))
+    detector = UpstreamSpeechEvidence()
+    loud = struct.pack("<h", 3000) * 80
+    quiet = b"\0\0" * 80
+    assert detector.observe(loud, 16000) is None
+    assert detector.classified_energy is None
+    assert detector.observe(quiet, 16000) is True
+    assert detector.classified_energy == audioop.rms(loud + quiet, 2)
+    assert detector.voiced_energy == detector.classified_energy
+
+
+def test_voiced_energy_is_not_diluted_by_later_quiet_frames(monkeypatch):
+    vad = Mock()
+    vad.is_speech.side_effect = [True, False]
+    monkeypatch.setattr(module, "webrtcvad", SimpleNamespace(Vad=Mock(return_value=vad)))
+    detector = UpstreamSpeechEvidence()
+    voiced = struct.pack("<hh", 250, -250) * 80
+    quiet = b"\0\0" * 160
+    assert detector.observe(voiced + quiet, 16000) is True
+    assert detector.classified_energy < 200
+    assert detector.voiced_energy == 250
 
 
 def test_rate_change_creates_fresh_detector_and_failed_evidence_is_unknown(monkeypatch):

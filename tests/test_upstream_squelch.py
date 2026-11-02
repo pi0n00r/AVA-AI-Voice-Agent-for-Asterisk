@@ -4,6 +4,7 @@ import struct
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+from unittest.mock import patch
 
 import pytest
 
@@ -182,6 +183,92 @@ async def test_unknown_packets_do_not_keep_completed_turn_open():
     assert not state["speaking"]
     assert state["silence_frames"] == 15
     assert state["speech_frames"] == 0
+
+
+@pytest.mark.asyncio
+async def test_split_frame_uses_energy_from_the_classified_window():
+    vad = Mock()
+    vad.is_speech.return_value = True
+    with patch(
+        "src.core.upstream_speech_evidence.webrtcvad",
+        SimpleNamespace(Vad=Mock(return_value=vad)),
+    ):
+        engine, session, provider = setup(
+            evidence=None, upstream_squelch_min_speech_frames=1
+        )
+        await engine.session_store.upsert_call(session)
+        loud = struct.pack("<hh", 3000, -3000) * 40
+        quiet = b"\0\0" * 80
+        for payload in (loud, quiet):
+            await engine._audiosocket_handle_audio(
+                "ingress", AudioSocketAudioFrame(payload, 0x12, "slin16", 16000)
+            )
+    state = session.vad_state["upstream_squelch"]
+    assert state["speaking"]
+    assert state["last_energy"] == 0
+    assert state["last_classified_energy"] > state["last_threshold"]
+    assert provider.send_audio.await_count == 2
+    assert nonzero(provider) == 1
+
+
+@pytest.mark.asyncio
+async def test_voiced_frame_energy_is_not_diluted_by_trailing_silence():
+    vad = Mock()
+    vad.is_speech.side_effect = [True, False]
+    with patch(
+        "src.core.upstream_speech_evidence.webrtcvad",
+        SimpleNamespace(Vad=Mock(return_value=vad)),
+    ):
+        engine, session, provider = setup(
+            evidence=None, upstream_squelch_min_speech_frames=1
+        )
+        await engine.session_store.upsert_call(session)
+        onset = struct.pack("<hh", 300, -300) * 40
+        trailing_silence = b"\0\0" * 240
+        await engine._audiosocket_handle_audio(
+            "ingress",
+            AudioSocketAudioFrame(
+                onset + trailing_silence, 0x12, "slin16", 16000
+            ),
+        )
+    state = session.vad_state["upstream_squelch"]
+    assert state["last_energy"] < state["last_threshold"]
+    assert state["last_voiced_energy"] > state["last_threshold"]
+    assert state["speaking"]
+    assert nonzero(provider) == 1
+
+
+@pytest.mark.asyncio
+async def test_unclassified_tail_preserves_the_atomic_packet():
+    vad = Mock()
+    vad.is_speech.return_value = True
+    with patch(
+        "src.core.upstream_speech_evidence.webrtcvad",
+        SimpleNamespace(Vad=Mock(return_value=vad)),
+    ):
+        engine, session, provider = setup(
+            evidence=None, upstream_squelch_min_speech_frames=1
+        )
+        await engine.session_store.upsert_call(session)
+        classified_quiet = b"\0\0" * 160
+        unclassified_onset = struct.pack("<hh", 3000, -3000) * 40
+        await engine._audiosocket_handle_audio(
+            "ingress",
+            AudioSocketAudioFrame(
+                classified_quiet + unclassified_onset,
+                0x12,
+                "slin16",
+                16000,
+            ),
+        )
+    state = session.vad_state["upstream_squelch"]
+    assert state["has_unclassified_tail"]
+    assert state["last_voiced_energy"] == 0
+    assert not state["speaking"]
+    assert state["speech_frames"] == 0
+    assert state["silence_frames"] == 0
+    assert state["suppressed_frames"] == 0
+    assert nonzero(provider) == 1
 
 
 @pytest.mark.asyncio
