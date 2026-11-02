@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.7.4.2] - 2026-11-02
+
+### Fixed
+
+- **Admin release display:** recognize the fork's four-component fix-release
+  versions in CHANGELOG and README fallbacks so packaged deployments report
+  `v7.7.4.2` instead of falling through to the preceding upstream-style
+  three-component release.
+
 ## [7.7.4.1] - 2026-11-02
 
 ### Fixed

@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "project": "Ava",
-  "release": "7.7.4.1",
-  "sourceCommit": "8c675e6e3cfba842518979eee05b39a845fdee3e",
-  "sourceTree": "393f808ef2b1aa5c93afaea706eb67b532fc0429",
+  "release": "7.7.4.2",
+  "sourceCommit": "578d17f3159c972c103177bf9cd05d9f95daa62b",
+  "sourceTree": "ef11c33fe133fab4a65f8aa3fb1668ada595740e",
   "reconstructionBoundaryCommit": "7dcb5b1",
   "upstreamBaseCommit": "c0f8e32ba714bed54ca5f9f0f847393e7dd08eda",
   "provenanceBridgeCommit": "4546da569ff13e07976a0cb34c1953a1b71a89dc",
