@@ -12755,6 +12755,9 @@ class Engine:
                         squelch_speech_evidence = speech_evidence
                         classified_energy = getattr(detector, "classified_energy", None)
                         voiced_energy = getattr(detector, "voiced_energy", None)
+                        has_unclassified_tail = bool(
+                            getattr(detector, "has_unclassified_tail", False)
+                        )
                         if speech_evidence is True and voiced_energy is not None:
                             decision_energy = float(voiced_energy)
                         elif speech_evidence is False and classified_energy is not None:
@@ -12774,7 +12777,10 @@ class Engine:
                         # An unavailable classifier instead fails open below.
                         raw_speech = decision_energy > threshold and speech_evidence is True
 
-                        if speech_evidence is None:
+                        packet_unknown = speech_evidence is None or (
+                            has_unclassified_tail and not raw_speech
+                        )
+                        if packet_unknown:
                             # Preserve unclassified audio without treating it as
                             # speech or resetting an in-progress silence run.
                             pass
@@ -12797,7 +12803,7 @@ class Engine:
                             noise_ema = (1.0 - alpha) * noise_ema + alpha * decision_energy
 
                         suppress_frame = (
-                            not speaking and detector.available and speech_evidence is not None
+                            not speaking and detector.available and not packet_unknown
                         )
                         state.update(
                             {
@@ -12808,6 +12814,7 @@ class Engine:
                                 "last_energy": energy,
                                 "last_classified_energy": classified_energy,
                                 "last_voiced_energy": voiced_energy,
+                                "has_unclassified_tail": has_unclassified_tail,
                                 "last_threshold": int(threshold),
                                 "speech_evidence": speech_evidence,
                                 "frames": int(state.get("frames", 0)) + 1,

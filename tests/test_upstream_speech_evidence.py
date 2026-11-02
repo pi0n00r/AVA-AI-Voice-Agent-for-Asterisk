@@ -55,7 +55,19 @@ def test_negative_complete_frame_with_unclassified_tail_is_unknown(monkeypatch):
     silence_then_speech = b"\0\0" * 160 + b"\xff\x7f" * 80
     assert detector.observe(silence_then_speech, 16000) is None
     assert detector._pending == b"\xff\x7f" * 80
+    assert detector.has_unclassified_tail
     vad.is_speech.assert_called_once_with(b"\0\0" * 160, 16000)
+
+
+def test_positive_complete_frame_reports_unclassified_tail(monkeypatch):
+    vad = Mock()
+    vad.is_speech.return_value = True
+    monkeypatch.setattr(module, "webrtcvad", SimpleNamespace(Vad=Mock(return_value=vad)))
+    detector = UpstreamSpeechEvidence()
+    complete_then_tail = b"\0\0" * 160 + struct.pack("<hh", 3000, -3000) * 40
+    assert detector.observe(complete_then_tail, 16000) is True
+    assert detector.voiced_energy == 0
+    assert detector.has_unclassified_tail
 
 
 def test_classified_energy_covers_pending_and_current_packet(monkeypatch):

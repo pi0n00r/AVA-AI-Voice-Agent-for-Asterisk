@@ -239,6 +239,39 @@ async def test_voiced_frame_energy_is_not_diluted_by_trailing_silence():
 
 
 @pytest.mark.asyncio
+async def test_unclassified_tail_preserves_the_atomic_packet():
+    vad = Mock()
+    vad.is_speech.return_value = True
+    with patch(
+        "src.core.upstream_speech_evidence.webrtcvad",
+        SimpleNamespace(Vad=Mock(return_value=vad)),
+    ):
+        engine, session, provider = setup(
+            evidence=None, upstream_squelch_min_speech_frames=1
+        )
+        await engine.session_store.upsert_call(session)
+        classified_quiet = b"\0\0" * 160
+        unclassified_onset = struct.pack("<hh", 3000, -3000) * 40
+        await engine._audiosocket_handle_audio(
+            "ingress",
+            AudioSocketAudioFrame(
+                classified_quiet + unclassified_onset,
+                0x12,
+                "slin16",
+                16000,
+            ),
+        )
+    state = session.vad_state["upstream_squelch"]
+    assert state["has_unclassified_tail"]
+    assert state["last_voiced_energy"] == 0
+    assert not state["speaking"]
+    assert state["speech_frames"] == 0
+    assert state["silence_frames"] == 0
+    assert state["suppressed_frames"] == 0
+    assert nonzero(provider) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("name,cls", PROVIDERS)
 @pytest.mark.parametrize("mode", ["enabled", "disabled", "gated", "pipeline"])
 async def test_provider_capability_and_gating_boundaries(name, cls, mode):
