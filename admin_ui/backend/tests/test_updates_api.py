@@ -273,8 +273,9 @@ async def test_updates_status_preserves_configured_source_when_remote_has_no_tag
         (1, "error: cannot open '.git/FETCH_HEAD': Permission denied\n"),
     ],
 )
+@pytest.mark.parametrize("builder", ["default", "explicit-custom"])
 def test_ephemeral_plan_keeps_success_json_clean_and_surfaces_failure_stderr(
-    monkeypatch, tmp_path, exit_code: int, expected: str
+    monkeypatch, tmp_path, exit_code: int, expected: str, builder: str
 ) -> None:
     class FakeContainer:
         def wait(self, timeout: int):
@@ -292,9 +293,12 @@ def test_ephemeral_plan_keeps_success_json_clean_and_surfaces_failure_stderr(
             assert force is True
 
     container = FakeContainer()
+    monkeypatch.setenv("BUILDX_BUILDER", builder)
 
     class FakeContainers:
-        def run(self, *_args, **_kwargs):
+        def run(self, *_args, **kwargs):
+            assert kwargs["environment"]["BUILDX_BUILDER"] == builder
+            assert "dns" not in kwargs  # retain operator-configured Docker resolvers
             return container
 
         def get(self, _name: str):

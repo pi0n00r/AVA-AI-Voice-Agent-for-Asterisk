@@ -76,6 +76,27 @@ and run `./install.sh external-pbx`. See
 [`deploy/docker/README.md`](deploy/docker/README.md) for the exact boundary,
 first-login process, and upgrade commands.
 
+### Build and update policy
+
+The inherited full-stack installer, preflight, CLI updater, Admin rebuild path,
+and rollback recovery share one Compose build policy. It preserves the selected
+project and Compose overlays, validates the requested targets, honors an
+explicit builder without changing Docker globally, and starts services only
+after the build succeeds. See [`docs/INSTALLATION.md`](docs/INSTALLATION.md),
+[`docs/CLI_TOOLS_GUIDE.md`](docs/CLI_TOOLS_GUIDE.md), and
+[`docs/BUILD_TROUBLESHOOTING.md`](docs/BUILD_TROUBLESHOOTING.md) when operating
+an inherited full-stack checkout rather than the maintained public package.
+
+For a source-based Admin bootstrap, use the maintained branch and review the
+preflight findings before allowing its explicit system/configuration repairs:
+
+```bash
+git clone --branch bajaj/maintained https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk.git
+cd AVA-AI-Voice-Agent-for-Asterisk
+sudo ./preflight.sh --apply-fixes
+./install.sh --ui
+```
+
 ### Public container packages
 
 The maintained images are publicly readable without a GitHub account:

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.7.4.5] - 2026-11-03
+
+### Changed
+
+- **Unified build policy (#807):** use the same entitlement-aware Compose build
+  path for fresh installs, preflight, CLI updates, Admin rebuilds, updater
+  bootstrap, and rollback recovery. Preserve explicit builder and Compose
+  selection, validate the selected targets, and start services only after a
+  successful build without silently changing the global Docker builder.
+- **Operator recovery guidance:** restore the upstream installation, CLI, build,
+  and troubleshooting guides required by the unified build policy and its
+  regression tests.
+
+### Fixed
+
+- **Remote PBX checklist (#806):** retain live ARI, module, and application
+  evidence while distinguishing remote-host configuration checks, skipped
+  Ava-host audits, missing manifests, and empty audit results. The UI now states
+  when restoring the manifest requires the write-enabled preflight path.
+
 ## [7.7.4.4] - 2026-11-02
 
 ### Changed
