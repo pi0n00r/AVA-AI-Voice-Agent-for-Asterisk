@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.7.4.3] - 2026-11-02
+
 ### Changed
 
 - **Admin update source:** allow deployments to select one validated Git remote
