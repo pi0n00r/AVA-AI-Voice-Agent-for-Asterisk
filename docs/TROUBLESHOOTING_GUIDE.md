@@ -76,26 +76,27 @@ Download the appropriate binary for your platform from the maintained fork's
 **Linux:**
 ```bash
 # Most servers (x86_64)
-curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.5/agent-linux-amd64
-chmod +x agent
-sudo mv agent /usr/local/bin/
+curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.5/agent-linux-amd64 && \
+  chmod +x agent && \
+  sudo mv agent /usr/local/bin/
 
 # ARM64 (Raspberry Pi, AWS Graviton)
-curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.5/agent-linux-arm64
-chmod +x agent
-sudo mv agent /usr/local/bin/
+curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.5/agent-linux-arm64 && \
+  chmod +x agent && \
+  sudo mv agent /usr/local/bin/
 ```
 
 **macOS:**
 ```bash
 # Intel Macs
-curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.5/agent-darwin-amd64
+curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.5/agent-darwin-amd64 && \
+  chmod +x agent && \
+  sudo mv agent /usr/local/bin/
 
 # Apple Silicon (M1/M2/M3)
-curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.5/agent-darwin-arm64
-
-chmod +x agent
-sudo mv agent /usr/local/bin/
+curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.5/agent-darwin-arm64 && \
+  chmod +x agent && \
+  sudo mv agent /usr/local/bin/
 ```
 
 **Windows:**
