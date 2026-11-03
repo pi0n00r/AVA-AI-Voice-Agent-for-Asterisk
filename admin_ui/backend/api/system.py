@@ -5669,7 +5669,7 @@ async def updates_plan(
     host_root = _project_host_root_from_admin_ui_container()
 
     update_remote = _configured_update_remote()
-    ref = _validate_git_ref(ref or _configured_update_default_branch())
+    ref = _validate_git_ref(ref if ref is not None else _configured_update_default_branch())
     local_changes = _validate_update_local_changes(local_changes)
     env = {
         "PROJECT_ROOT": host_root,
@@ -5779,7 +5779,7 @@ async def updates_run(body: UpdateRunRequest):
     sha = _current_project_head_sha()
     tag = _updater_image_tag_for_sha(sha)
     update_remote = _configured_update_remote()
-    ref = _validate_git_ref(body.ref or _configured_update_default_branch())
+    ref = _validate_git_ref(body.ref if body.ref is not None else _configured_update_default_branch())
     local_changes = _validate_update_local_changes(body.local_changes)
     cli_path = _validate_cli_install_path(body.cli_install_path)
     job_id = uuid.uuid4().hex

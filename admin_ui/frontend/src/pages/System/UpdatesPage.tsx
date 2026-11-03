@@ -428,7 +428,11 @@ const UpdatesPage = () => {
 
   useEffect(() => {
     if (!initialized) return;
-    if (!targetRef) return;
+    if (!targetRef) {
+      setPlan(null);
+      setPlanError(null);
+      return;
+    }
     fetchPlan(targetRef);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialized, includeUI, targetRef, targetCheckout, localChangesPolicy]);

@@ -61,6 +61,23 @@ async def test_updates_plan_uses_one_configured_remote_and_default_branch(monkey
 
 
 @pytest.mark.asyncio
+async def test_updates_plan_rejects_explicit_empty_ref(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(system, "_project_host_root_from_admin_ui_container", lambda: str(tmp_path))
+    with pytest.raises(HTTPException) as exc:
+        await system.updates_plan(ref="")
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_updates_run_rejects_explicit_empty_ref(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(system, "_project_host_root_from_admin_ui_container", lambda: str(tmp_path))
+    monkeypatch.setattr(system, "_docker_sock_host_path_from_admin_ui_container", lambda: "/var/run/docker.sock")
+    with pytest.raises(HTTPException) as exc:
+        await system.updates_run(system.UpdateRunRequest(ref=""))
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_updates_branches_uses_configured_remote(monkeypatch, tmp_path) -> None:
     captured: dict = {}
 
