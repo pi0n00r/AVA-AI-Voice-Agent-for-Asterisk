@@ -1,0 +1,1693 @@
+# Troubleshooting Guide
+
+Complete guide to diagnosing and fixing issues with Asterisk AI Voice Agent.
+
+## v7.7.1 recovery checks
+
+- For a failed build after Git advanced, inspect [same-version update recovery](CLI_TOOLS_GUIDE.md#interrupted-docker-builds-and-same-version-recovery).
+  Replacing source does not replace an old CLI/updater image. Do not delete pending
+  actions or bypass unknown-call-state and backup failures to make an upgrade pass.
+- [Transcription errors](OpenAI-Compatible-Transcription.md#errors-and-troubleshooting)
+  use separate speech credentials. A model list or healthy service is not an
+  inference test; live calls can reject/preempt batch work.
+- [HTTP/Pushover previews](HTTP-Tool-Templates.md) are synthetic, not delivery tests.
+  Inspect safe preparation codes when a tool is skipped or omitted at startup.
+  Invalid reloads retain the last running generation; fix the saved template and apply.
+- Google modular model/sampling behavior differs from native Google Live. See
+  [provider controls](ADMIN_UI_GUIDE.md#providers). Ollama now retains the resolved
+  system prompt in long histories; that fix is not a qualification of every model.
+- Local Asterisk farewell handling waits for the matching playback's terminal
+  state; an ARI `done` event alone is not proof of audible/uninterrupted delivery.
+  Google Live transfer recovery distinguishes initiation from terminal outcomes;
+  #793's two-attempt policy and original PBX cause remain follow-up, not automatic retries.
+
+## v7.7 integration and UI checks
+
+- Refresh after Admin image replacement; new Agent editor routes do not exist in old UI.
+- **Update tool** stages changes; **Save & Apply** publishes them. Partial-apply errors
+  are not full success. See [Admin UI](ADMIN_UI_GUIDE.md).
+- Calendly uncertainty requires [retained-request recovery](Calendly-calendar-tool.md#pending-submissions),
+  not another booking POST. History erasure does not cancel remote appointments.
+- [Pushover](Pushover.md) distinguishes generation and recipient delivery. API acceptance
+  is not phone acknowledgement; do not automatically retry an uncertain send.
+- [Summary failures](In-Call-Summaries.md) follow the configured continue/abort policy.
+- [Endpoint discovery](ARI-Endpoint-Discovery.md) is a temporary snapshot, not
+  proof of dialability or Agent authorization.
+- Protect [journal/credentials](INTEGRATION_BACKUPS.md) during recovery. An old
+  snapshot cannot establish that a remote write never occurred.
+
+## Table of Contents
+
+- [Installation](#installation)
+- [Quick Diagnostics](#quick-diagnostics)
+- [Bounded Diagnostic Audio Capture](#bounded-diagnostic-audio-capture)
+- [Common Issues](#common-issues)
+- [Troubleshooting Tools](#troubleshooting-tools)
+- [Log Analysis](#log-analysis)
+- [Provider-Specific Issues](#provider-specific-issues)
+- [Performance Issues](#performance-issues)
+- [Network Issues](#network-issues)
+- [IPv6 (GA policy)](#ipv6-ga-policy)
+- [Getting Help](#getting-help)
+
+---
+
+## Installation
+
+The `agent` CLI tools are available as pre-built binaries for easy installation (v4.1+).
+
+### Quick Install (Linux/macOS)
+
+```bash
+curl -sSL https://raw.githubusercontent.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/v7.7.4.5/scripts/install-cli.sh | AGENT_VERSION=v7.7.4.5 bash
+```
+
+This will:
+- Auto-detect your platform
+- Download the latest binary
+- Verify checksums
+- Install to `/usr/local/bin`
+
+### Manual Installation
+
+Download the appropriate binary for your platform from the maintained fork's
+[v7.7.4.5 release](https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/tag/v7.7.4.5):
+
+**Linux:**
+```bash
+# Most servers (x86_64)
+curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.5/agent-linux-amd64 && \
+  chmod +x agent && \
+  sudo mv agent /usr/local/bin/
+
+# ARM64 (Raspberry Pi, AWS Graviton)
+curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.5/agent-linux-arm64 && \
+  chmod +x agent && \
+  sudo mv agent /usr/local/bin/
+```
+
+**macOS:**
+```bash
+# Intel Macs
+curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.5/agent-darwin-amd64 && \
+  chmod +x agent && \
+  sudo mv agent /usr/local/bin/
+
+# Apple Silicon (M1/M2/M3)
+curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.5/agent-darwin-arm64 && \
+  chmod +x agent && \
+  sudo mv agent /usr/local/bin/
+```
+
+**Windows:**
+Download `agent-windows-amd64.exe` from the maintained fork's
+[v7.7.4.5 release](https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/tag/v7.7.4.5)
+and add it to your PATH.
+
+### Verify Installation
+
+```bash
+agent version
+```
+
+You should see:
+```
+Asterisk AI Voice Agent CLI
+Version:    vX.Y.Z
+Built:      YYYY-MM-DDTHH:MM:SSZ
+Repository: https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk
+```
+
+Note: The CLI binary and the Python engine may have different version strings depending on how the release was built.
+
+### Available Tools
+
+- **`agent setup`** - Interactive setup wizard
+- **`agent check`** - Standard diagnostics report
+- **`agent rca`** - Post-call root cause analysis
+- **`agent config validate`** - Validate providers, pipelines, models, transport, and audio settings
+- **`agent dialplan`** - Generate an `AI_AGENT` dialplan snippet
+- **`agent update`** - Pull latest code + rebuild/restart as needed (v5.1+)
+
+Legacy aliases (hidden from `--help`):
+- `agent init` → `agent setup`
+- `agent doctor` → `agent check`
+- `agent troubleshoot` → `agent rca`
+
+---
+
+## Quick Diagnostics
+
+### Step 1: Run Health Check
+
+```bash
+agent check
+```
+
+This performs comprehensive system checks:
+- ✅ Docker containers running
+- ✅ Asterisk ARI connectivity
+- ✅ AudioSocket/RTP availability
+- ✅ Configuration validation
+- ✅ Provider API connectivity
+- ✅ Recent call history
+
+For full-local demos, also run:
+
+```bash
+agent check --local
+```
+
+This validates `local_ai_server` STT/LLM/TTS and reports the active Faster-Whisper device/compute, LLM context/max tokens/tool capability, GPU runtime status, and runtime flags such as `LOCAL_ENABLE_FILLER_AUDIO` and `LOCAL_LLM_STREAMING_TTS_OVERLAP`. For a CPU-only demo, the fast baseline is Faster-Whisper `tiny.en` on `cpu/int8`, Piper TTS, and a small GGUF LLM such as Qwen 2.5 0.5B or 1.5B.
+
+**Exit codes:**
+- `0` - All checks passed
+- `1` - Warnings (non-critical issues)
+- `2` - Failures (critical issues)
+
+### Call History DB (if missing or empty)
+
+Call History is stored in a SQLite DB under `./data` on the host (mounted into `ai_engine` as `/app/data`).
+
+Quick checks:
+```bash
+ls -la ./data
+docker compose logs ai_engine | grep -i \"call history\" | tail -n 20
+```
+
+Common fixes:
+- Run `sudo ./preflight.sh --apply-fixes` (creates `./data` and `./models/*`, fixes permissions, applies SELinux contexts where applicable).
+- Avoid non-local filesystems for `./data` (some NFS setups can break SQLite locking).
+
+### Admin UI Shows “AI Engine/Local AI Server Error” But Containers Are Running (Tier 3 / Best-effort)
+
+This is most common on Tier 3 hosts (Docker Desktop, Podman, unsupported distros) where:
+- the Admin UI can’t reach the Docker API socket, and/or
+- the Admin UI health probes are using URLs that aren’t reachable from inside the `admin_ui` container.
+
+Quick checks:
+```bash
+docker compose ps
+```
+
+If container control (start/stop/restart) fails from the UI:
+- Ensure the Docker socket is mounted and set in `.env` (varies by host):
+  - Docker Desktop: `DOCKER_SOCK=/var/run/docker.sock`
+  - Rootless Docker/Podman: often `DOCKER_SOCK=/run/user/<uid>/docker.sock`
+- Then recreate the Admin UI container so the mount updates:
+```bash
+docker compose up -d --force-recreate admin_ui
+```
+
+If the UI shows a 500 error and `admin_ui` logs contain `PermissionError: [Errno 13] Permission denied` for `/var/run/docker.sock`:
+- Your host’s `docker` group GID may not be `999` (Debian often differs), so the Admin UI user (UID 1000) can’t open the socket.
+- Fix by setting `DOCKER_GID` to the socket’s group ID and recreating `admin_ui`:
+```bash
+ls -ln /var/run/docker.sock
+DOCKER_GID=$(ls -ln /var/run/docker.sock | awk '{print $4}')
+grep -qE '^[# ]*DOCKER_GID=' .env && sed -i.bak -E "s/^[# ]*DOCKER_GID=.*/DOCKER_GID=$DOCKER_GID/" .env || echo "DOCKER_GID=$DOCKER_GID" >> .env
+docker compose up -d --force-recreate admin_ui
+```
+
+If containers are running but the UI shows “unreachable”:
+- Set explicit health probe URLs in `.env` (values must be reachable from `admin_ui`):
+```bash
+HEALTH_CHECK_AI_ENGINE_URL=http://ai_engine:15000/health
+HEALTH_CHECK_LOCAL_AI_URL=ws://local_ai_server:8765
+```
+
+Notes:
+- The **Local AI Server is optional** unless you plan to use local STT/TTS models.
+- If you run **bridge networking** and want Local AI Server reachable across containers, set:
+  - `LOCAL_WS_HOST=0.0.0.0`
+  - `LOCAL_WS_AUTH_TOKEN=...` (required; server refuses to start if exposed without auth)
+
+### Export a Support Package for One Call
+
+For a problem tied to a specific call, use the Admin UI before collecting broad
+system logs:
+
+1. Open **Call History**, select the affected call, and click **Troubleshoot**.
+2. Review the diagnostic summary, lifecycle coverage, effective settings, tool
+   counts, and technical evidence.
+3. Leave the optional sources selected unless the page says they are probably
+   not needed, then click **Download Support Package**.
+4. Attach the ZIP to the GitHub issue or share it with support on Discord.
+
+The call package contains only evidence correlated to that call: AI Engine
+lifecycle logs, selected Local AI Server/Admin UI entries that reference the
+call ID, sanitized conversation text, pre-call/in-call/post-call tool execution
+details, basic system information, and the call-time provider, pipeline, Audio
+Profile, transport, codec, VAD, barge-in, and streaming settings. It never
+contains a recording, caller name, phone number, API key, password, prompt, or
+secret value.
+
+New calls keep an immutable settings snapshot. Older calls remain exportable,
+but the package notes when that snapshot was not captured. Console and JSON log
+formats are both supported, including mixed retained logs. DEBUG is not
+required: the snapshot and lifecycle header are captured independently at INFO;
+the package manifest reports the log formats and levels that were actually
+available.
+
+Use **System Logs → Export → System diagnostics** only when an issue is not tied
+to one call. That advanced package is time-bounded and sanitized, but it may
+contain operational events from multiple calls. **Download current view** saves
+only the raw lines visible after the current container, level, and search
+filters.
+
+### Bounded Diagnostic Audio Capture
+
+For assistant-guided investigations, follow the
+[diagnostic playbook](contributing/debugging-guide.md): the user controls enabling
+and restoring logging/audio capture, and the assistant verifies the effective
+settings and analyzes privately archived evidence.
+
+Diagnostic WAVs can contain caller audio, agent audio, names, phone numbers, or
+other sensitive content. Enable them only for a short, controlled reproduction
+and handle the resulting files according to your retention policy.
+
+1. Set `DIAG_ENABLE_TAPS=true`, recreate `ai_engine` to load the changed environment,
+   and reproduce the issue once. Playback taps use `/tmp/ai-engine-taps`; full-call RCA streams use
+   `/tmp/ai-engine-captures/<call_id>/`.
+2. Privately collect only the required call's audio and bounded logs using the
+   [diagnostic collection workflow](contributing/debugging-guide.md#archive-before-analyzing).
+   `agent rca <call_id>` produces a report, not a raw audio archive.
+   Review `scripts/rca_collect.sh` before using it: it can collect broader history,
+   configuration, transcripts, and recordings.
+3. Restore the previous diagnostic settings (normally `DIAG_ENABLE_TAPS=false`)
+   and recreate `ai_engine` before returning the system to normal service.
+4. Remove retained WAVs explicitly when the investigation is complete.
+
+Disabling diagnostics prevents new per-call writes; it never deletes historical
+artifacts. The restricted empty capture root may remain present. The legacy
+`AAVA_AUDIO_DIAGNOSTICS` switch can independently enable playback taps, so leave
+both settings false or unset for a no-write call path. Enabled writers reject
+symlinked, foreign-owned, or unsafe writable directory paths and disable only the
+affected diagnostic writer rather than failing the call.
+
+### Step 2: Analyze Recent Call
+
+```bash
+agent rca
+```
+
+Automatically analyzes your most recent call with:
+- Canonical outcome, provider/pipeline, duration, and latency from Call History
+- Call-scoped log collection and parsing
+- Metrics extraction
+- Format alignment check
+- Baseline comparison
+- Optional AI-powered interpretation
+
+**How it works:**
+- Reads the persisted Call History record first so unrelated provider names in other log lines cannot select the wrong baseline
+- Reads logs directly from Docker: `docker logs ai_engine`
+- Analyzes calls from last 24 hours
+- No file logging required (LOG_TO_FILE not needed)
+- Requires `ai_engine` container to be running
+- Works with both console and JSON log formats
+- Treats delivery drift as observational; drift alone does not make a successful call fail
+
+**Log Format Recommendation:**
+For best troubleshooting results, use JSON format in `.env`:
+```bash
+LOG_FORMAT=json  # Recommended for structured analysis
+```
+
+Console format works too, but JSON provides:
+- More reliable parsing (no ANSI color codes)
+- Structured data for better analysis
+- Easier field extraction
+
+**Analyze most recent call:**
+```bash
+agent rca
+```
+
+**Advanced (legacy alias): list recent calls:**
+```bash
+agent troubleshoot --list
+```
+
+---
+
+## Common Issues
+
+### 0. Docker Build Fails (apt-get / DNS)
+
+Use the [Docker build checks and recovery guide](BUILD_TROUBLESHOOTING.md).
+It distinguishes the host, Docker daemon/BuildKit metadata, and build-step
+networks. Begin with read-only preflight under the same user as the build.
+Do not replace `daemon.json` or restart a working Docker daemon as a generic fix.
+
+### 1. No Audio (Complete Silence)
+
+**Symptoms:** Neither caller nor agent can hear anything.
+
+**Quick Check:**
+```bash
+agent rca
+```
+
+**Common Causes:**
+
+#### Transport Configuration Issue
+```bash
+# Check transport mode
+grep audio_transport config/ai-agent.yaml
+
+# Check container logs for transport startup
+docker logs ai_engine | grep -iE "transport|audiosocket|externalmedia"
+```
+
+**Fix:** Verify your transport matches your provider:
+```yaml
+# For full agents (Deepgram, OpenAI Realtime)
+audio_transport: audiosocket
+audiosocket:
+  host: "0.0.0.0"
+  port: 8090
+  format: "ulaw"  # or "slin16"
+
+# For pipelines (hybrid, local_only)
+audio_transport: externalmedia
+external_media:
+  rtp_host: "0.0.0.0"
+  rtp_port: 18080
+  # Optional: allocate per-call RTP ports
+  # port_range: "18080:18099"
+
+# Opt-in, version-gated Asterisk Media WebSocket — see docs/WebSocket-Transport.md
+# audio_transport: websocket
+```
+
+#### Dialplan Not Passing to Stasis
+**Check** your dialplan in `/etc/asterisk/extensions_custom.conf`:
+```
+[from-ai-agent]
+exten => s,1,NoOp(AI Voice Agent)
+ same => n,Answer()
+ same => n,Stasis(asterisk-ai-voice-agent)  ; ← Must pass to Stasis app
+ same => n,Hangup()
+```
+
+**Fix:** Ensure you're calling `Stasis(asterisk-ai-voice-agent)`, not `AudioSocket()`.
+The `ai_engine` service creates AudioSocket/RTP channels automatically via ARI.
+
+#### Container Not Running
+```bash
+docker ps | grep ai_engine
+```
+
+**Fix:** Start container:
+```bash
+docker compose up -d ai_engine
+```
+
+---
+
+### 2. Garbled/Distorted Audio
+
+**Symptoms:** Audio is fast, slow, choppy, robotic, or distorted.
+
+**Quick Check:**
+```bash
+agent rca
+```
+
+**Common Causes:**
+
+#### Audio Format Configuration
+Check your transport format configuration.
+
+**Check logs:**
+```bash
+docker logs ai_engine | grep -i "format\|transport"
+```
+
+**For AudioSocket transport (full agents):**
+```yaml
+audiosocket:
+  format: "slin"  # PCM16 format
+```
+
+**For ExternalMedia RTP (pipelines):**
+Format is automatically managed based on provider configuration.
+
+#### Jitter Buffer Underflows
+**Symptoms:** Choppy, stuttering audio.
+
+**Check logs:**
+```bash
+docker logs ai_engine | grep -i underflow
+```
+
+**Fix:** Increase buffer size in `config/ai-agent.yaml`:
+```yaml
+streaming:
+  jitter_buffer_ms: 100  # Increase if underflows occur (default: 50)
+```
+
+#### Provider Bytes Pacing Bug
+**Check with troubleshoot:**
+```bash
+agent rca
+```
+
+Look for: "Provider bytes ratio" should be `~1.0`.
+- ❌ Ratio `<0.95` or `>1.05` = CRITICAL pacing bug
+
+**Fix:** This usually indicates a code bug. Check:
+- Provider output format matches expected
+- No duplicate byte counting
+- Streaming manager receiving correct byte counts
+
+#### Sample Rate Mismatch
+**Expected flow:**
+- Asterisk → AudioSocket: 8kHz PCM16 (slin)
+- `ai_engine` ↔ Provider: Provider's native rate
+- `ai_engine` → Asterisk: 8kHz PCM16 (slin)
+
+**Check config:**
+```yaml
+streaming:
+  sample_rate: 8000  # Must be 8kHz for telephony
+```
+
+---
+
+### 3. Echo (Agent Hears Itself)
+
+**Symptoms:** Agent responds to its own output, creating confusion or loops.
+
+**Quick Check:**
+```bash
+agent rca
+```
+
+**Common Causes:**
+
+#### VAD Too Sensitive (OpenAI Realtime)
+**CRITICAL SETTING** for OpenAI Realtime API:
+
+```yaml
+vad:
+  webrtc_aggressiveness: 1  # NOT 0!
+```
+
+**Why:** Level 0 detects echo as "speech", causing gate flutter.
+
+**Verify:**
+```bash
+docker logs ai_engine | grep "webrtc_aggressiveness"
+```
+
+**Expected:** `webrtc_aggressiveness=1`
+
+#### Audio Gate Flutter
+**Symptoms:** Gate opening/closing rapidly (50+ times per call).
+
+**Check:**
+```bash
+agent rca
+```
+
+Look for: "Gate closures: XX"
+- ✅ `<5` closures = Normal
+- ⚠️ `5-20` closures = Elevated
+- ❌ `>20` closures = Flutter (echo leakage)
+
+**Fix:**
+```yaml
+vad:
+  webrtc_aggressiveness: 1
+  confidence_threshold: 0.6
+  post_tts_end_protection_ms: 250  # Prevents premature reopening
+```
+
+#### Provider Echo Cancellation Not Working
+**For OpenAI Realtime:** Has built-in server-side echo cancellation.
+**Solution:** Let OpenAI handle it, keep local VAD at level 1.
+
+**For Deepgram:** May need to adjust settings or use barge-in config.
+
+---
+
+### 4. Self-Interruption Loop
+
+**Symptoms:** Agent cuts itself off mid-sentence repeatedly.
+
+**Quick Check:**
+```bash
+agent rca
+```
+
+**Cause:** This is a variant of echo issue - agent hearing its own audio.
+
+**Fix:** Same as Echo troubleshooting above:
+1. Set `webrtc_aggressiveness: 1`
+2. Increase `post_tts_end_protection_ms`
+3. Check for gate flutter
+
+---
+
+### 5. One-Way Audio
+
+**Symptoms:** Only caller OR only agent can be heard.
+
+**Quick Check:**
+```bash
+agent rca
+```
+
+**Diagnose Direction:**
+
+#### Caller Can't Hear Agent (TTS Issue)
+**Check:**
+```bash
+docker logs ai_engine | grep -i "playback\|tts\|playing"
+```
+
+**No playback logs?**
+- Provider API key invalid or missing
+- TTS provider down or unreachable
+- Format encoding issue (check transport mode)
+
+**Fix:**
+```bash
+# Verify API keys in .env
+grep -E "OPENAI_API_KEY|DEEPGRAM_API_KEY" .env
+
+# Test provider connectivity
+curl https://api.openai.com/v1/models -H "Authorization: Bearer $OPENAI_API_KEY"
+```
+
+#### Agent Can't Hear Caller (STT Issue)
+**Check:**
+```bash
+docker logs ai_engine | grep -i "transcript\|stt\|speech"
+```
+
+**No transcription logs?**
+- Provider API key invalid
+- AudioSocket not receiving audio
+- Format mismatch preventing STT
+
+**Fix:**
+1. Verify API keys
+2. Check AudioSocket connectivity
+3. Verify format: `slin` at 8kHz
+
+---
+
+### 6. Caller Inactivity Watchdog Does Not Check In or Hang Up
+
+**Expected v7.3.1 behavior:** once the call is ready and both sides are idle, the inbound watchdog asks “Are you still there?” after 30 seconds, waits 15 seconds, speaks the full final warning, then records `no_input_timeout` and hangs up.
+
+Check the effective configuration:
+
+```yaml
+no_input:
+  enabled: true
+  inbound_enabled: true
+  initial_timeout_sec: 30
+  grace_timeout_sec: 15
+  max_check_ins: 1
+```
+
+Then search the call logs for:
+
+```text
+Caller inactivity watchdog registered
+Caller inactivity check-in
+Caller-facing audio drain complete
+Caller inactivity timeout reached
+Executing terminal ARI hangup
+```
+
+If the timer never starts, check for a stuck `processing`, caller-input, transfer, or output-active state. If announcements play but hangup is late, upgrade to v7.3.1 or newer; older native-AEC paths could wait 25 seconds because output completion was coupled to TTS gating. For ElevenLabs, enable `agent_response_complete`, set its hosted turn timeout to 30 seconds, and disable provider silence hangup (`silence_end_call_timeout: -1`). Outbound calls require an explicit per-agent `outbound_enabled: true` override.
+
+## Troubleshooting Tools
+
+### agent check
+
+**System health check and diagnostics.**
+
+```bash
+# Basic health check
+agent check
+
+# JSON output (for scripts)
+agent check --json
+
+# Verbose output
+agent check -v
+```
+
+**What it checks:**
+- Docker containers (`ai_engine`, `local_ai_server`, monitoring)
+- Asterisk ARI (connectivity, authentication)
+- AudioSocket (port 8090 availability)
+- Configuration (YAML validation, required fields)
+- Provider APIs (key validation, connectivity)
+- Recent calls (last 24 hours)
+
+**Exit Codes:**
+- `0` = All checks passed
+- `1` = Warnings detected
+- `2` = Critical failures
+
+**Use Cases:**
+- Pre-flight checks before deployment
+- CI/CD validation
+- Post-deployment verification
+- Scheduled monitoring
+
+---
+
+### agent rca
+
+**Post-call analysis and root cause analysis.**
+
+```bash
+# Analyze most recent call
+agent rca
+
+# Analyze specific call
+agent rca --call 1761424308.2043
+
+# JSON output (JSON only)
+agent rca --json
+
+# Verbose output
+agent rca -v
+
+# Force LLM analysis (even for healthy calls)
+agent rca --llm
+
+# Deterministic evidence only (recommended for automation)
+agent rca --call 1761424308.2043 --no-llm --json
+
+# Latest persisted local/pipeline call and Community Test Matrix data
+agent rca --local
+```
+
+**What it analyzes:**
+- **Call History:** Canonical provider/pipeline, outcome, duration, turns, latency, routing, and codec result
+- **Call Logs:** Filters diagnostic evidence for the selected call ID
+- **Metrics:** Provider bytes, drift, underflows, SNR
+- **Format Alignment:** AudioSocket, provider, frame sizes
+- **VAD Settings:** Aggressiveness, thresholds
+- **Audio Gating:** Gate closures, flutter detection
+- **Baseline Comparison:** vs golden configs
+- **Quality Score:** Deterministic score based on actionable metrics
+- **LLM Diagnosis:** AI-powered root cause analysis
+
+Delivery wall time includes pauses, barge-in, synthesis, and queue waits. RCA therefore reports drift as evidence but does not fail a call or invoke LLM diagnosis from drift alone. Modular pipeline wall time and very short/empty segments are excluded from drift assessment. Underflows are rated against the estimated number of 20 ms frames rather than by raw count alone.
+
+**Symptoms Supported:**
+- `no-audio` - Complete silence
+- `garbled` - Distorted/fast/slow audio
+- `echo` - Agent hears itself
+- `interruption` - Self-interruption loop
+- `one-way` - Only one direction works
+
+**Output Sections:**
+1. Pipeline Status (AudioSocket, Transcription, Playback)
+2. Audio Issues (underflows, format mismatches)
+3. Errors & Warnings
+4. Symptom Analysis (if specified)
+5. Detailed Metrics (RCA-level)
+6. Call Quality Verdict (0-100 score)
+7. AI Diagnosis (if enabled)
+
+Note: Advanced `agent troubleshoot` flags (list/symptoms/collect-only/etc.) remain as a hidden compatibility path, but `agent rca` is the recommended surface.
+
+---
+
+### agent demo (legacy)
+
+`agent demo` is a hidden compatibility alias for `agent check`. The old `--wav`, `--loop`, and `--save` workflow is no longer implemented; those flags return an explicit error. Validate a real audio path with a test call followed by `agent rca`.
+
+---
+
+### agent setup
+
+**Interactive setup wizard.**
+
+```bash
+# Run setup wizard
+agent setup
+
+# Show targets discovered from base and local configuration without changing files
+agent setup --list-targets
+```
+
+**What it configures:**
+- Asterisk ARI credentials
+- Audio transport (AudioSocket/ExternalMedia)
+- AI provider selection
+- Pipeline configuration
+- Configuration validation
+
+The wizard writes operator changes to `config/ai-agent.local.yaml`. Switching from a pipeline to a full-agent provider clears the previous `active_pipeline` override.
+
+---
+
+## Outbound Lead Context Is Missing
+
+**Symptoms:** an AAVA-managed outbound attempt has nonempty `custom_vars`, but
+the Agent does not receive a `## Lead Context` block, or the attempt ends with
+`outbound custom_vars could not be confirmed after answer`.
+
+1. Find the attempt, lead, and channel identifiers in **Call Scheduling** and
+   the AI Engine logs. AAVA deliberately does not log the context payload.
+2. While the call is ringing, list the matching Local channels and inspect both
+   halves:
+
+   ```bash
+   asterisk -rx "core show channels concise" | grep 'Local/'
+   for half in 1 2; do
+     if asterisk -rx "core show channel <local-channel>;$half" \
+       | grep -q 'AAVA_CUSTOM_VARS_JSON'; then
+       echo "Local channel ;$half: AAVA_CUSTOM_VARS_JSON present"
+     else
+       echo "Local channel ;$half: AAVA_CUSTOM_VARS_JSON missing"
+     fi
+   done
+   ```
+
+   Keep this check presence-only. Printing the variable would expose the lead
+   context in the terminal and any retained RCA transcript.
+
+3. After answer, check for the sanitized confirmation or rejection markers:
+
+   ```bash
+   docker compose -p asterisk-ai-voice-agent logs ai_engine 2>&1 \
+     | grep -Ei \
+       'outbound custom_vars could not be confirmed after answer|outbound attempt metadata unavailable after answer|outbound custom_vars metadata is invalid after answer'
+   ```
+
+4. If the lead failed before dialing, reduce `custom_vars` below the 8,192-byte
+   serialized limit and retry with a new or recycled lead. Do not place secrets
+   in this field.
+5. If the variable is absent despite a current engine build, verify ARI write
+   permissions and retain the attempt/channel identifiers for RCA collection.
+
+AAVA fails closed for nonempty unconfirmed context: the attempt becomes
+`error`, the lead becomes `failed`, the answered channel is hung up, and the AI
+provider is not started.
+
+---
+
+## Debugging Tool Execution Issues
+
+**Tool execution** allows AI agents to perform actions like call transfers, hangups, and sending emails. When tools don't work, follow this debugging workflow.
+
+### HTTP Phase Tools (Pre/In/Post Call)
+
+If you are troubleshooting **pre-call HTTP lookups**, **in-call HTTP tools**, or **post-call webhooks**:
+
+- **Template variables** use the *variable name* (e.g., `{patient_id}`), not the JSON extraction path (e.g., `patient.id`).
+- In the Admin UI, the variable names you can reuse elsewhere are highlighted in the HTTP tool editors.
+- With `LOG_LEVEL=debug`, the engine emits `[HTTP_TOOL_TRACE]` logs showing the resolved request (URL/headers/body), referenced variable values, and a bounded response preview.
+
+```bash
+# Show HTTP tool request/response traces (requires LOG_LEVEL=debug)
+docker logs ai_engine 2>&1 | grep "\\[HTTP_TOOL_TRACE\\]"
+```
+
+### Quick Diagnostics for Tool Issues
+
+```bash
+# 1. Collect standard diagnostics
+agent check
+
+# 2. Review most recent call for tool execution
+agent rca
+
+# 3. Look for tool-specific errors
+docker logs ai_engine 2>&1 | grep -i "tool\|function"
+```
+
+### Common Tool Execution Problems
+
+#### Tools Not Executing (Generic)
+
+**Symptom**: AI mentions action ("I'll transfer you") but nothing happens.
+
+**Diagnostic Steps**:
+
+1. **Verify tools are configured:**
+   ```bash
+   grep -A 10 "tools:" config/ai-agent.yaml
+   ```
+   Should list enabled tools for your pipeline/provider.
+
+2. **Check tool registration in logs:**
+   ```bash
+   docker logs ai_engine 2>&1 | grep "tools configured"
+   ```
+   Expected pattern:
+   ```
+   ✅ "OpenAI session configured with 6 tools"
+   ✅ "Added tools to provider context: ['transfer', 'hangup_call', ...]"
+   ```
+
+3. **Look for tool invocation:**
+   ```bash
+   docker logs ai_engine 2>&1 | grep "function call\|tool call"
+   ```
+   Expected patterns:
+   ```
+   ✅ "OpenAI function call detected: hangup_call"
+   ✅ "Tool hangup_call executed: success"
+   ```
+
+**If No Tool Registration**:
+- Check `config/ai-agent.yaml` under your pipeline's `tools:` section
+- Ensure tools are listed (e.g., `- hangup_call`, `- transfer`)
+- Restart containers after config changes
+
+#### OpenAI Realtime: Schema Format Error
+
+**Symptom**: Error `Missing required parameter: 'session.tools[0].name'`
+
+**Root Cause**: Using Chat Completions schema format instead of Realtime API format.
+
+**Diagnostic**:
+```bash
+# Look for schema error
+docker logs ai_engine 2>&1 | grep "missing_required_parameter"
+```
+
+**Fix**: This is a code issue (should be fixed in v4.2+). If you see this error:
+- Verify you're on latest version: `agent update` (or `git pull origin main`)
+- Check that `src/tools/adapters/openai.py` uses `to_openai_realtime_schema()`
+- See [Common Pitfalls](contributing/COMMON_PITFALLS.md#pitfall-1-tool-schema-format-mismatch-openai-realtime) for details
+
+#### Deepgram: Functions Not Being Called
+
+**Symptom**: Deepgram configured but never calls functions.
+
+**Diagnostic**:
+```bash
+# Check for FunctionCallRequest events
+docker logs ai_engine 2>&1 | grep "FunctionCallRequest"
+```
+
+**Common Issues**:
+- Using `agent.think.tools` instead of `agent.think.functions` (wrong field name)
+- Event handler checking `"function_call"` instead of `"FunctionCallRequest"`
+
+**Fix**: Verify code uses Deepgram-specific naming (fixed in v4.1+).
+
+#### Hangup Tool: Call Doesn't Disconnect
+
+**Symptom**: AI says "goodbye" but call stays connected.
+
+**Diagnostic Steps**:
+
+1. **Check if tool was invoked:**
+   ```bash
+   docker logs ai_engine 2>&1 | grep -i "hangup"
+   ```
+   Expected patterns:
+   ```
+   ✅ "Hangup requested"
+   ✅ "Hangup tool executed"
+   ✅ "Call will hangup after farewell"
+   ```
+
+2. **Check for execution errors:**
+   ```bash
+   docker logs ai_engine 2>&1 | grep -i "AttributeError\|hangup.*error"
+   ```
+
+**Common Issues**:
+- Wrong ARI method (using `delete_channel` instead of `hangup_channel`)
+- Missing farewell playback (call hangs up too quickly)
+- Tool not registered with provider
+
+**Workaround**: If urgent, caller can hang up manually.
+
+#### Transfer Tool: Not Transferring
+
+**Symptom**: AI says "transferring you" but call doesn't transfer.
+
+**Diagnostic**:
+```bash
+# Check transfer execution
+docker logs ai_engine 2>&1 | grep -i "transfer"
+```
+
+Expected patterns:
+```
+✅ "Transfer tool invoked"
+✅ "Resolved destination: ringgroup 600"
+✅ "Transfer initiated"
+```
+
+**Common Issues**:
+- Destination not found (extension/queue/ringgroup doesn't exist in Asterisk)
+- ARI redirect/continue failure
+- Transfer active flag not set correctly
+
+**Verification**:
+```bash
+# Check Asterisk for destination
+asterisk -rx "core show hints" | grep <extension>
+asterisk -rx "queue show <queue-name>"
+```
+
+### Using agent rca for Tool Issues
+
+Use `agent rca` as the first stop for tool execution issues:
+
+```bash
+# Analyze most recent call (includes tool execution sections)
+agent rca
+
+# Look for these sections in output:
+# 1. Tool Registration: "Tools configured: 6"
+# 2. Tool Invocations: "function_call detected"
+# 3. Tool Results: "executed: success" or "executed: failure"
+# 4. Errors: AttributeError, missing methods, schema errors
+```
+
+### Expected Log Patterns for Successful Tool Execution
+
+**OpenAI Realtime**:
+```
+[info] Added tools to provider context: ['transfer', 'cancel_transfer', 'hangup_call', ...]
+[info] Generated OpenAI Realtime schemas for 6 tools
+[info] OpenAI session configured with 6 tools
+[info] OpenAI function call detected: hangup_call (call_id_...)
+[info] Hangup requested: farewell="Thank you for calling!"
+[info] Hangup tool executed - next response will trigger hangup
+[info] HangupReady event received - executing hangup
+```
+
+**Deepgram Voice Agent**:
+```
+[info] Configured agent.think.functions for Deepgram
+[info] FunctionCallRequest event received
+[info] Function: blind_transfer, parameters: {destination: 'sales'}
+[info] Transfer tool executed: success
+```
+
+**Pipelines (OpenAI Chat Completions)**:
+```
+[info] LLM response contains tool_calls
+[info] Tool call: hangup_call
+[info] Executing tool via tool_registry
+[info] Tool hangup_call executed: success
+```
+
+### Warning Patterns (Tool Issues)
+
+```
+⚠️ "AI used farewell phrase without invoking hangup_call tool"
+   → Tool not being called by LLM
+
+❌ "Missing required parameter: 'session.tools[0].name'"
+   → Schema format mismatch (OpenAI Realtime)
+
+❌ "AttributeError: 'Engine' object has no attribute 'app_config'"
+   → Code bug in tool context creation
+
+❌ "AttributeError: 'ARIClient' object has no attribute 'delete_channel'"
+   → Wrong ARI method name
+```
+
+### Further Help
+
+For detailed explanations of tool execution issues and fixes:
+- **[Common Pitfalls - Tool Execution](contributing/COMMON_PITFALLS.md#tool-execution-issues)**
+- **[Tool Development Guide](contributing/tool-development.md)**
+- **[Tool Calling Guide](TOOL_CALLING_GUIDE.md)** (user perspective)
+
+---
+
+## Advanced (Legacy) Symptom Flags
+
+`agent rca` is the recommended v5.0 surface. If you need symptom-focused heuristics, the hidden legacy alias `agent troubleshoot` supports:
+
+```bash
+agent troubleshoot --last --symptom <no-audio|garbled|echo|interruption|one-way>
+```
+
+---
+
+## Log Analysis
+
+### Manual Log Review
+
+```bash
+# Run these commands from deploy/docker so Compose selects the package's
+# `ava-ai-engine` container through its `ai_engine` service name.
+cd deploy/docker
+
+# Recent logs (last hour)
+docker compose logs --since 1h ai_engine
+
+# Follow logs in real-time
+docker compose logs -f ai_engine
+
+# Search for specific call
+docker compose logs ai_engine | grep "1761424308.2043"
+
+# Filter by level
+docker compose logs ai_engine | grep ERROR
+docker compose logs ai_engine | grep WARNING
+
+# Search for specific issues
+docker compose logs ai_engine | grep -i "underflow"
+docker compose logs ai_engine | grep -i "format"
+docker compose logs ai_engine | grep -i "error"
+```
+
+### Key Log Patterns
+
+#### Successful Call Indicators
+```
+✅ "AudioSocket connection accepted"
+✅ "Transcription:" or "transcript:"
+✅ "Playback started" or "playing audio"
+✅ "Provider bytes" ratio ~1.0
+✅ Drift <10%
+```
+
+#### Problem Indicators
+```
+❌ "Connection refused" or "Connection failed"
+❌ "Format mismatch" or "format error"
+❌ "Underflow" (especially >50 per call)
+❌ "Provider bytes" ratio <0.95 or >1.05
+❌ Drift >10%
+❌ Gate closures >20
+```
+
+### Log Levels
+
+For AI-assisted troubleshooting, the user applies and restores these settings;
+see the [step-by-step diagnostic workflow](contributing/debugging-guide.md#user-controlled-debug-logging).
+Preserve existing evidence first. Changes to `.env` require recreation of the
+affected container; a plain restart does not reload its environment. Record the
+previous values, collect a bounded reproduction, then restore and verify them.
+
+Adjust logging in `.env`:
+```bash
+LOG_LEVEL=debug    # Most verbose (use for troubleshooting)
+LOG_LEVEL=info     # Default (recommended)
+LOG_LEVEL=warning  # Quiet (only warnings and errors)
+LOG_LEVEL=error    # Very quiet (only errors)
+
+# Streaming-specific logging
+STREAMING_LOG_LEVEL=debug  # Detailed streaming logs
+```
+
+---
+
+## Provider-Specific Issues
+
+### Google Live: Long Responses Skip Audio or End Early
+
+For a Google Developer API call, check for `Provider streaming queue full; dropping chunk`. Small audio chunks can fill the original queue when Google generates speech faster than telephony plays it. Enable **Providers → Google Live → API Mode → Enable long-response playback**, click **Save Changes**, and restart the AI Engine once calls have finished. Existing installations keep this option off until explicitly enabled.
+
+The option is hidden in Vertex mode and ignored by actual Vertex connections. It does not change another provider or modular pipeline's queue. See the [Google setup guide](Provider-Google-Setup.md#long-response-playback-developer-api-opt-in) for the advanced capacity setting, backend fallback behavior, interruption handling and tested limits.
+
+If a farewell still cuts off, distinguish a queue/drop or drain error from an upstream WebSocket close. The opt-in path can drain already-accepted audio for up to eight seconds after an abnormal close; it cannot prevent Google's error or recover missing audio. `BARGE-IN action applied` marks local playback cancellation, while a later model reply measures a separate response delay.
+
+Collect the affected call through **Call History → Troubleshoot → Download Support Package**. Include the call ID, model/API mode, whether the option was enabled, and whether the problem involved uninterrupted speech, interruption, farewell or transfer. See [per-call support packages](#export-a-support-package-for-one-call).
+
+### Modular Provider Connection Tests
+
+In **Providers → Edit**, **Test Connection** uses the current form, including
+unsaved changes. Credential verification uses saved settings. The displayed
+destination contains the scheme, host and port; resource paths are deliberately
+omitted from diagnostics. Check the configured URL field for the full path.
+
+| Result | What to check |
+| --- | --- |
+| Cannot connect or timed out | Confirm the configured server and port are reachable from the Admin UI container. Loopback refers to its network namespace, not the browser computer. Start the inference server or correct routing/firewall settings. The test does not substitute another provider. |
+| HTTP 401/403 | Check that this provider's managed key file or explicit environment reference resolves to a key for this destination. Custom OpenAI-compatible instances do not inherit an unrelated `OPENAI_API_KEY`. |
+| Redirects are disabled | Configure the final API URL directly, including its complete API prefix. The test does not forward credentials to a redirect destination. |
+| Invalid OpenAI-compatible model list | The LLM probe expects `GET {chat_base_url}/models` to return a JSON object with a `data` array. Check that the URL is an API root rather than a web console or a complete `/chat/completions` resource. |
+| Provider URL rejected | Use an absolute HTTP(S) URL without embedded credentials, whitespace, query or fragment. Public endpoints require HTTPS; LAN/loopback HTTP is supported. Metadata and special-use destinations are blocked. |
+| Speech endpoint reachable; authentication and transcription/synthesis were not verified | The GET/405 probe reached the configured speech resource. Validate actual speech behavior with the saved/applied configuration and a call. |
+
+For custom servers that intentionally require no authentication, configure
+`type: openai` and `api_key: not-needed`; the probe still contacts that server
+and sends no Authorization header. An empty key is not the no-auth sentinel.
+An editor result disappears after settings change; retest the new settings.
+
+Safe probe diagnostics are in the **Admin UI** container logs:
+
+```bash
+docker compose -p asterisk-ai-voice-agent logs --since 10m admin_ui \
+  | grep 'Provider validation'
+```
+
+These events record provider, implementation kind, role, destination origin,
+outcome, HTTP status, validation level and elapsed time. They exclude keys,
+headers, response bodies and arbitrary endpoint paths. See the
+[configuration reference](Configuration-Reference.md#admin-ui-modular-http-provider-tests)
+for credential precedence and timeout limits.
+
+### OpenAI Realtime
+
+#### Common Issues
+
+**1. WebRTC VAD Sample Rate Error**
+```
+ERROR: WebRTC VAD error - sample rate must be 8000, 16000, or 32000
+```
+
+**Cause:** OpenAI outputs 24kHz, incompatible with WebRTC VAD.
+
+**Fix:** Not yet fixed - tracked in AAVA-27.
+
+**2. Model Not Found**
+```
+ERROR: received 4000 (private use) invalid_request_error.missing_model
+```
+
+**Cause:** Wrong model specified for Realtime API.
+
+**Fix:** Use a current GA Realtime model (OpenAI sunset the Beta Realtime API on 2026-05-12 and removed `gpt-4o-realtime-preview-*` snapshots on 2026-05-07):
+```yaml
+providers:
+  openai_realtime:
+    api_version: ga
+    model: gpt-realtime         # NOT gpt-4o, NOT gpt-4o-realtime-preview-*
+    # Other current GA options: gpt-realtime-1.5 (best audio quality),
+    #                           gpt-realtime-2 (reasoning voice model),
+    #                           gpt-realtime-mini (cost-optimized).
+```
+If you see `error.code: model_not_found` despite a valid key, your OpenAI org may not have Realtime API access enabled — check **OpenAI Console → Settings → Limits**.
+
+**3. Authentication Failed**
+```
+ERROR: 401 Unauthorized
+```
+
+**Fix:** Verify API key in `.env`:
+```bash
+OPENAI_API_KEY=sk-proj-...
+```
+
+### Deepgram Voice Agent
+
+#### Common Issues
+
+**1. Low RMS Warnings (Spam)**
+```
+WARNING: Low RMS level detected in audio
+```
+
+**Cause:** Deepgram API sensitivity - not actually a problem.
+
+**Fix:** These warnings are suppressed by default. If seeing many:
+- Check actual audio quality with test call
+- Ignore if audio sounds good
+
+**2. Connection Timeout**
+```
+ERROR: Deepgram connection timeout
+```
+
+**Fix:**
+- Check API key: `grep DEEPGRAM_API_KEY .env`
+- Verify network connectivity
+- Check Deepgram service status
+
+**3. Format Encoding Issues**
+```
+ERROR: Unsupported audio format
+```
+
+**Fix:** Verify config:
+```yaml
+providers:
+  deepgram:
+    encoding: "mulaw"  # or "linear16"
+    sample_rate: 8000
+```
+
+### Local AI (Vosk + Phi-3 + Piper)
+
+#### First Local/Hybrid Turn Is Slow Despite Healthy Readiness
+
+A healthy `/ready` response does not mean that the next call's modular
+`local_stt` or `local_tts` WebSocket is already open. The
+[local pipeline adapter](../src/pipelines/local.py) creates a call-scoped
+session in `open_call`; starting the adapter alone does not open that session.
+Distinguish this setup delay from slow LLM generation before changing models
+or timeouts. See [the first-turn report](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/439).
+
+Use the call ID and time window to compare these stages in the existing engine
+and Local AI logs:
+
+| Stage | Evidence and relevant adapter option |
+| --- | --- |
+| Socket opening/authentication | `Opening local adapter session`; when authentication is configured, look for `Local adapter authenticated` or `Local adapter auth failed`; inspect the effective `ws_url` and `connect_timeout_sec` |
+| Mode negotiation | `Local adapter set_mode sent`, then `Local adapter handshake complete`; the acknowledgement wait uses `handshake_timeout_sec`, defaulting to at least five seconds |
+| STT audio/transcription | Confirm audio reaches the selected STT adapter and a transcription follows; an open connection alone does not prove transcription works |
+| TTS synthesis | Confirm the selected TTS adapter receives text and returns synthesized audio; an open connection alone does not prove synthesis works |
+
+`Local adapter handshake not confirmed; proceeding without mode_ready` means
+the mode acknowledgement was not confirmed; the current adapter logs the warning
+and continues. It is different from failing to open the socket. Preserve the
+surrounding evidence before restarting anything, and follow the
+[diagnostic workflow](contributing/debugging-guide.md) for a bounded support
+package. Do not assume increasing a timeout fixes a wrong URL, authentication
+failure, or an unavailable model.
+
+#### Common Issues
+
+**1. Models Not Loading**
+```
+ERROR: Model file not found
+```
+
+**Fix:** Run model setup:
+```bash
+make model-setup
+```
+
+If you see permission errors (for example `PermissionError: [Errno 13] Permission denied` when the UI tries to download models), fix host mounts/permissions first:
+```bash
+sudo ./preflight.sh --apply-fixes
+docker compose up -d --force-recreate local_ai_server
+```
+
+Or check specific paths in `.env`:
+```bash
+LOCAL_STT_MODEL_PATH=/app/models/stt/vosk-model-en-us-0.22
+LOCAL_LLM_MODEL_PATH=/app/models/llm/phi-3-mini-4k-instruct.Q4_K_M.gguf
+LOCAL_TTS_MODEL_PATH=/app/models/tts/en_US-lessac-medium.onnx
+```
+
+**2. Slow LLM Responses (>10 seconds)**
+
+**Cause:** CPU performance - Phi-3 needs modern hardware.
+
+**Hardware Requirements:**
+- CPU: 2020+ (Ryzen 9 5950X / i9-11900K or newer)
+- RAM: 8GB+
+- GPU: Optional (RTX 3060+) for faster inference
+
+**Fix:**
+- Reduce context: `LOCAL_LLM_CONTEXT=2048`
+- Reduce max tokens: `LOCAL_LLM_MAX_TOKENS=32`
+- Or switch to local_hybrid (local STT/TTS, cloud LLM)
+
+**3. Container Restart Loop**
+```
+docker ps  # local_ai_server keeps restarting
+```
+
+**Check logs:**
+```bash
+docker logs local_ai_server
+```
+
+Common causes:
+- Insufficient RAM (needs 8GB+)
+- Missing model files
+- Port conflict (8765)
+
+---
+
+## Performance Issues
+
+### High Latency
+
+**Symptoms:** >2 second delay between speech and response.
+
+**Diagnose:**
+```bash
+agent rca
+```
+
+Look for:
+- Provider API response times
+- Network latency
+- LLM generation time
+
+**Fixes:**
+
+#### Cloud Providers (OpenAI, Deepgram)
+- Check network connectivity
+- Verify API endpoints accessible
+- Use geographically closer regions if available
+
+#### Local AI
+- Reduce LLM context size
+- Reduce max_tokens
+- Enable GPU acceleration (if available)
+- Consider hybrid mode (cloud LLM only)
+
+### High CPU/Memory Usage
+
+**Check resource usage:**
+```bash
+docker stats ai_engine local_ai_server
+```
+
+**Normal Usage:**
+- `ai_engine`: <20% CPU, <512MB RAM
+- local_ai_server: 50-100% CPU (during inference), 4-8GB RAM
+
+**High usage causes:**
+- Multiple concurrent calls
+- Large LLM models
+- Debug logging enabled
+
+**Fixes:**
+- Scale horizontally (multiple containers)
+- Use smaller models
+- Reduce logging: `LOG_LEVEL=warning`
+- Enable GPU acceleration
+
+### Audio Quality Degradation
+
+**Check metrics:**
+```bash
+agent rca
+```
+
+**Key Metrics:**
+- **Drift:** Should be <10%
+- **Underflows:** <1% of frames
+- **Provider bytes ratio:** 0.99-1.01
+- **Quality Score:** >70
+
+**If score <70:**
+1. Check format alignment
+2. Increase jitter buffer
+3. Verify network stability
+4. Check provider API health
+
+---
+
+## Network Issues
+
+### Connectivity Problems
+
+#### Can't Reach Asterisk ARI
+```bash
+# Test ARI connectivity
+curl -u asterisk:asterisk http://127.0.0.1:8088/ari/asterisk/info
+
+# Container-side ARI probe (recommended in v5.0; avoids requiring curl/ping in ai_engine)
+agent check
+```
+
+**Fix:** Update `.env`:
+```bash
+ASTERISK_HOST=127.0.0.1  # or remote IP/hostname
+```
+
+#### AudioSocket Port Not Accessible
+```bash
+# Check if port 8090 is listening
+netstat -tuln | grep 8090
+
+# Check firewall
+sudo ufw status | grep 8090
+
+# Test from Asterisk
+telnet engine-host 8090
+```
+
+**Fix:** Open firewall port:
+```bash
+sudo ufw allow 8090/tcp
+```
+
+#### Provider API Unreachable
+```bash
+# Test OpenAI
+curl https://api.openai.com/v1/models \
+  -H "Authorization: Bearer $OPENAI_API_KEY"
+
+# Test Deepgram
+curl https://api.deepgram.com/v1/listen \
+  -H "Authorization: Token $DEEPGRAM_API_KEY"
+```
+
+**Fix:**
+- Check API keys
+- Verify internet connectivity
+- Check corporate firewall/proxy
+
+### Docker Networking
+
+#### Host Network (Default in `docker-compose.yml`)
+
+Most deployments use host networking for telephony/low-latency behavior.
+
+**Verify:**
+```bash
+docker compose ps
+```
+
+#### Bridge Network (Advanced / Optional)
+
+If you run a custom bridge-network compose (not the default), port mappings are required:
+```yaml
+ports:
+  - "8090:8090"      # AudioSocket
+  - "18080:18080/udp"  # RTP
+  - "15000:15000"    # Health
+```
+
+**Verify:**
+```bash
+docker ps | grep ai_engine
+# Should show port mappings
+```
+
+**Security:** Bridge mode still requires strict firewall rules and allowlisting as appropriate for your deployment.
+
+See: [docs/PRODUCTION_DEPLOYMENT.md](PRODUCTION_DEPLOYMENT.md)
+
+### IPv6 (GA policy)
+
+For GA stability, AAVA treats IPv6 as **best-effort**.
+
+If IPv6 is enabled but not fully functional in your environment, you may see intermittent DNS/connectivity issues (especially in host-network Docker setups).
+
+**Recommendation (host-level):** disable IPv6 on the host running AAVA.
+
+Temporary (until reboot):
+```bash
+sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
+sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1
+```
+
+Persistent:
+```bash
+cat <<'EOF' | sudo tee /etc/sysctl.d/99-disable-ipv6.conf
+net.ipv6.conf.all.disable_ipv6=1
+net.ipv6.conf.default.disable_ipv6=1
+EOF
+sudo sysctl --system
+```
+
+---
+
+## Docker Build Issues
+
+### DNS Resolution Failure During Build
+
+See [Docker build checks and recovery](BUILD_TROUBLESHOOTING.md). Registry
+metadata timeouts and package-download DNS failures occur in different network
+layers; `network.host` on a build step cannot repair a custom BuildKit daemon's
+DNS. Keep existing Docker settings and schedule any necessary daemon restart
+with the operator after diagnosing the failing layer.
+
+### Build timeout or slow download
+
+Check the failing registry/package repository, proxy and TLS path in the build
+output. AVA does not retry an unrelated download failure with extra privileges.
+Retry the explicit service after connectivity is restored; inspect disk space
+before repeating a large Local AI build. See [build recovery](BUILD_TROUBLESHOOTING.md).
+
+### docker-compose vs docker compose
+
+AVA selects the Docker Compose plugin when available, then standalone Compose
+2+. Compose v1 is unsupported. Check `docker compose version` or
+`docker-compose version` and run `./preflight.sh --build-check` with the same
+identity before installation. Use `AAVA_COMPOSE_BIN=docker-compose` to select
+standalone explicitly when running the manual helper.
+
+## Getting Help
+
+### 1. Collect Diagnostics
+
+```bash
+# Run standard diagnostics report (recommended)
+agent check > agent-check.txt
+
+# Analyze most recent call
+agent rca > agent-rca.txt
+
+# Collect logs
+docker logs --since 1h ai_engine > ai_engine.log 2>&1
+```
+
+### 2. Check Documentation
+
+- **[CLI Tools Guide](../cli/README.md)** - Complete CLI reference
+- **[Production Deployment](PRODUCTION_DEPLOYMENT.md)** - Security & networking
+- **[Configuration Reference](Configuration-Reference.md)** - All settings explained
+- **[Golden Baselines](baselines/golden/)** - Validated configurations
+
+### 3. Search GitHub Issues
+
+https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues
+
+Search for:
+- Error messages
+- Symptoms
+- Provider names
+
+### 4. Create GitHub Issue
+
+**Include:**
+1. Symptom description
+2. Output from `agent check`
+3. Output from `agent rca`
+4. Relevant log excerpts (redact API keys!)
+5. Configuration (redact credentials!)
+6. Environment details (OS, Docker version, Asterisk version)
+
+**Template:**
+```
+**Symptom:**
+Garbled audio - sounds robotic and fast
+
+**Environment:**
+- OS: Ubuntu 22.04
+- Docker: 24.0.7
+- Asterisk: 18.20.0
+- `ai_engine` version: v4.0.0
+
+**Configuration:**
+Provider: OpenAI Realtime
+Transport: AudioSocket
+Network: Bridge mode
+
+**Diagnostics:**
+[Attach doctor-report.txt]
+[Attach troubleshoot-report.txt]
+
+**Logs:**
+[Attach relevant log excerpts]
+```
+
+### 5. Community Support
+
+- **Discussions:** https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/discussions
+- **Discord:** (coming soon)
+
+---
+
+## Quick Reference
+
+### Essential Commands
+
+```bash
+# Standard diagnostics report (share this output when asking for help)
+agent check
+
+# Post-call RCA (most recent call)
+agent rca
+
+# Advanced (legacy alias): list recent calls / symptom heuristics
+# agent troubleshoot --list
+# agent troubleshoot --last --symptom garbled
+
+# View logs
+docker logs -f ai_engine
+
+# Restart services
+docker compose restart ai_engine
+```
+
+### Essential Configs
+
+```yaml
+# Correct AudioSocket format
+audiosocket:
+  host: "0.0.0.0"
+  port: 8090
+  format: "slin"  # CRITICAL
+
+# Optimal VAD for OpenAI
+vad:
+  webrtc_aggressiveness: 1  # NOT 0
+  confidence_threshold: 0.6
+
+# Buffer for stability
+streaming:
+  jitter_buffer_ms: 100
+  sample_rate: 8000
+```
+
+### Essential Asterisk Dialplan
+
+**The dialplan is the same regardless of transport mode.** Just pass the call to the Stasis application:
+
+```
+[from-ai-agent]
+exten => s,1,NoOp(AI Voice Agent)
+ same => n,Answer()
+ same => n,Set(AI_AGENT=default)         ; Select an operator-managed agent
+ ; same => n,Set(AI_PROVIDER=deepgram)  ; Optional provider/pipeline override
+ same => n,Stasis(asterisk-ai-voice-agent)
+ same => n,Hangup()
+```
+
+**Transport is controlled in config, not dialplan:**
+- Set `audio_transport: externalmedia` for **pipelines** (hybrid, local_only)
+- Set `audio_transport: audiosocket` for **full agents** (Deepgram, OpenAI Realtime)
+- Set `audio_transport: websocket` only for the opt-in, version-gated Asterisk Media WebSocket transport — see [WebSocket-Transport.md](WebSocket-Transport.md)
+
+The `ai_engine` service automatically creates the AudioSocket server, RTP endpoint, or WebSocket listener based on your config. You don't need to add `AudioSocket()` to the dialplan.
+
+**Agent Selection:**
+Use `AI_AGENT` to select an operator-managed agent. Normally its configured target is authoritative; set `AI_PROVIDER` only for an intentional per-call provider or pipeline override. Generate a current snippet with `agent dialplan --agent <slug>`.
+
+See [docs/Transport-Mode-Compatibility.md](Transport-Mode-Compatibility.md) for transport mode details.
+
+---
+
+## Appendix: Metric Thresholds
+
+### Quality Metrics (from agent rca)
+
+| Metric | Excellent | Acceptable | Poor | Critical |
+|--------|-----------|------------|------|----------|
+| **Provider Bytes Ratio** | 0.99-1.01 | 0.95-1.05 | 0.90-1.10 | <0.90 or >1.10 |
+| **Delivery drift** | Observational | Correlate with caller experience | Investigate with format/underflow evidence | Never critical by itself |
+| **Underflow Rate** | 0% | <1% | 1-5% | >5% |
+| **Gate Closures** | <5 | 5-20 | 20-50 | >50 |
+| **Quality Score** | >90 | 70-90 | 50-70 | <50 |
+
+### Performance Metrics
+
+| Metric | Target | Warning | Critical |
+|--------|--------|---------|----------|
+| **Response Latency** | <1s | 1-2s | >2s |
+| **CPU Usage** | <20% | 20-50% | >50% |
+| **Memory Usage** | <512MB | 512MB-1GB | >1GB |
+| **Network Latency** | <50ms | 50-200ms | >200ms |
+
+---
+
+**Last Updated:** June 2026
+**Version:** v7.2.0
