@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -18,6 +19,81 @@ def _jobs_dir(root: Path) -> Path:
     jobs = root / ".agent" / "updates" / "jobs"
     jobs.mkdir(parents=True, exist_ok=True)
     return jobs
+
+
+def test_configured_update_source_accepts_named_fork_remote(monkeypatch) -> None:
+    monkeypatch.setenv("AAVA_UPDATE_REMOTE", "public")
+    monkeypatch.setenv("AAVA_UPDATE_DEFAULT_BRANCH", "bajaj/maintained")
+
+    assert system._configured_update_remote() == "public"
+    assert system._configured_update_default_branch() == "bajaj/maintained"
+
+
+@pytest.mark.parametrize("remote", ["-public", "public remote", "../public", "public/@{bad}"])
+def test_configured_update_remote_rejects_unsafe_names(monkeypatch, remote: str) -> None:
+    monkeypatch.setenv("AAVA_UPDATE_REMOTE", remote)
+    with pytest.raises(HTTPException, match="Invalid configured update remote"):
+        system._configured_update_remote()
+
+
+@pytest.mark.asyncio
+async def test_updates_plan_uses_one_configured_remote_and_default_branch(monkeypatch, tmp_path) -> None:
+    captured: dict = {}
+
+    def fake_run(*_args, **kwargs):
+        captured.update(kwargs)
+        return 0, '{"dirty": false}'
+
+    async def fake_active_calls():
+        return {"active_calls": 0, "reachable": True}
+
+    monkeypatch.setenv("AAVA_UPDATE_REMOTE", "public")
+    monkeypatch.setenv("AAVA_UPDATE_DEFAULT_BRANCH", "bajaj/maintained")
+    monkeypatch.setattr(system, "_project_host_root_from_admin_ui_container", lambda: str(tmp_path))
+    monkeypatch.setattr(system, "_run_updater_ephemeral", fake_run)
+    monkeypatch.setattr(system, "_check_active_calls", fake_active_calls)
+
+    response = await system.updates_plan(ref=None)
+
+    assert response.plan["active_calls"] == 0
+    assert captured["env"]["AAVA_UPDATE_REMOTE"] == "public"
+    assert captured["env"]["AAVA_UPDATE_REF"] == "bajaj/maintained"
+    assert captured["prefer_pull_ref"] is None
+
+
+@pytest.mark.asyncio
+async def test_updates_plan_rejects_explicit_empty_ref(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(system, "_project_host_root_from_admin_ui_container", lambda: str(tmp_path))
+    with pytest.raises(HTTPException) as exc:
+        await system.updates_plan(ref="")
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_updates_run_rejects_explicit_empty_ref(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(system, "_project_host_root_from_admin_ui_container", lambda: str(tmp_path))
+    monkeypatch.setattr(system, "_docker_sock_host_path_from_admin_ui_container", lambda: "/var/run/docker.sock")
+    with pytest.raises(HTTPException) as exc:
+        await system.updates_run(system.UpdateRunRequest(ref=""))
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_updates_branches_uses_configured_remote(monkeypatch, tmp_path) -> None:
+    captured: dict = {}
+
+    def fake_run(*_args, **kwargs):
+        captured.update(kwargs)
+        return 0, "abc123\trefs/heads/bajaj/maintained\n"
+
+    monkeypatch.setenv("AAVA_UPDATE_REMOTE", "public")
+    monkeypatch.setattr(system, "_project_host_root_from_admin_ui_container", lambda: str(tmp_path))
+    monkeypatch.setattr(system, "_run_updater_ephemeral", fake_run)
+
+    response = await system.updates_branches()
+
+    assert response.branches == ["bajaj/maintained"]
+    assert "ls-remote --heads public" in captured["command"]
 
 
 def test_cli_install_path_validation_accepts_simple_absolute_path() -> None:
@@ -48,6 +124,146 @@ def test_update_local_changes_validation_rejects_unknown_mode() -> None:
 )
 def test_updater_pull_preference_only_for_release_targets(ref: str, expected: str | None) -> None:
     assert system._updater_prefer_pull_ref_for_update_target(ref) == expected
+
+
+@pytest.mark.parametrize("ref", ["v7.7.4.3-extra", "v7.7.4.3;touch-x", "v7.7", "release-v7.7.4"])
+def test_release_tag_detection_rejects_partial_or_suffixed_values(ref: str) -> None:
+    assert system._is_semver_tag(ref) is False
+    assert system._parse_semver_tag(ref) is None
+
+
+def test_resolve_update_ref_uses_source_specific_namespace(monkeypatch, tmp_path) -> None:
+    calls: list[list[str]] = []
+    expected_sha = "a" * 40
+
+    def fake_run(args, **_kwargs):
+        calls.append(args)
+        if "ls-remote" in args:
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout=f"{expected_sha}\trefs/heads/bajaj/maintained\n",
+                stderr="",
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setattr(system, "_git_available", lambda: True)
+    monkeypatch.setattr(system.subprocess, "run", fake_run)
+
+    assert system._resolve_update_ref_sha("bajaj/maintained", "public") == expected_sha
+    lookup = calls[0]
+    assert lookup[-2:] == ["public", "refs/heads/bajaj/maintained"]
+    assert "ls-remote" in lookup
+    assert all("fetch" not in call for call in calls)
+    assert all("refs/remotes/origin" not in arg for call in calls for arg in call)
+
+
+def test_remote_updater_context_does_not_write_mounted_checkout(monkeypatch, tmp_path) -> None:
+    remote = tmp_path / "remote"
+    checkout = tmp_path / "checkout"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(remote)], check=True)
+    subprocess.run(["git", "-C", str(remote), "config", "user.name", "Ava test"], check=True)
+    subprocess.run(["git", "-C", str(remote), "config", "user.email", "ava-test@example.invalid"], check=True)
+    (remote / "updater").mkdir()
+    (remote / "updater" / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(remote), "add", "updater/Dockerfile"], check=True)
+    subprocess.run(["git", "-C", str(remote), "commit", "-qm", "fixture"], check=True)
+    subprocess.run(["git", "clone", "-q", str(remote), str(checkout)], check=True)
+    refs_before = subprocess.run(
+        ["git", "-C", str(checkout), "show-ref"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    monkeypatch.setenv("PROJECT_ROOT", str(checkout))
+
+    sha = system._resolve_update_ref_sha("main", "origin")
+    assert sha == subprocess.run(
+        ["git", "-C", str(remote), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    context = system._materialize_remote_context(str(checkout), "origin", "main", sha)
+    try:
+        assert Path(context, "updater", "Dockerfile").read_text(encoding="utf-8") == "FROM scratch\n"
+        assert not Path(context, ".git").exists()
+    finally:
+        system.shutil.rmtree(context, ignore_errors=True)
+
+    refs_after = subprocess.run(
+        ["git", "-C", str(checkout), "show-ref"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert refs_after == refs_before
+
+
+@pytest.mark.parametrize("failure", ["nonzero", "called-process-error", "timeout"])
+def test_remote_updater_context_redacts_clone_credentials(
+    monkeypatch, tmp_path, failure: str,
+) -> None:
+    remote_url = "https://token-value@example.invalid/private/ava.git"
+    context_dir = tmp_path / "clone-context"
+    calls = 0
+
+    def fake_run(args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return subprocess.CompletedProcess(args, 0, stdout=remote_url + "\n", stderr="")
+        if failure == "nonzero":
+            return subprocess.CompletedProcess(
+                args, 128, stdout="", stderr=f"unable to access {remote_url}",
+            )
+        if failure == "called-process-error":
+            raise subprocess.CalledProcessError(
+                128, args, stderr=f"unable to access {remote_url}",
+            )
+        raise subprocess.TimeoutExpired(args, 180)
+
+    monkeypatch.setattr(system.subprocess, "run", fake_run)
+    monkeypatch.setattr(tempfile, "mkdtemp", lambda **_kwargs: str(context_dir))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        system._materialize_remote_context(
+            str(tmp_path), "public", "bajaj/maintained", "a" * 40,
+        )
+
+    message = str(exc_info.value)
+    assert "token-value" not in message
+    assert remote_url not in message
+    assert exc_info.value.__context__ is None
+    assert message.endswith("timeout" if failure == "timeout" else "exit 128")
+    assert not context_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_updates_status_preserves_configured_source_when_remote_has_no_tags(monkeypatch, tmp_path) -> None:
+    outputs = iter(
+        [
+            (0, "bajaj/maintained\n" + "a" * 40 + "\nv7.7.4.3\nv7.7.4.3\n"),
+            (0, ""),
+        ]
+    )
+
+    monkeypatch.setenv("AAVA_UPDATE_REMOTE", "public")
+    monkeypatch.setenv("AAVA_UPDATE_DEFAULT_BRANCH", "bajaj/maintained")
+    monkeypatch.setattr(system, "_project_host_root_from_admin_ui_container", lambda: str(tmp_path))
+    monkeypatch.setattr(system, "_run_updater_ephemeral", lambda *_args, **_kwargs: next(outputs))
+    system._UPDATES_STATUS_CACHE.clear()
+
+    response = await system.updates_status(check_remote=True, force=True)
+
+    assert response.remote == {
+        "name": "public",
+        "default_branch": "bajaj/maintained",
+        "latest_tag": "",
+        "latest_tag_sha": "",
+    }
+    assert response.error == "No v* tags found on remote"
 
 
 @pytest.mark.parametrize(
@@ -118,7 +334,9 @@ async def test_updates_plan_failure_returns_exact_error_and_cli_recovery(monkeyp
     assert "Updater error:" in detail
     assert "mkdir: cannot create directory '/root': Permission denied" in detail
     assert f"AAVA_REPO={tmp_path}" in detail
-    assert "AGENT_VERSION=v7.4.0" in detail
+    assert "AAVA_CLI_REF=v7.4.0" in detail
+    assert "raw.githubusercontent.com/hkjarral" not in detail
+    assert 'aava_git ls-remote --get-url origin' in detail
     assert (
         'aava_git status --short '
         '|| { echo "Failed to inspect checkout changes; update not attempted" '
@@ -131,7 +349,7 @@ async def test_updates_plan_failure_returns_exact_error_and_cli_recovery(monkeyp
     assert (
         'aava_git diff --binary | sudo tee -a "$AAVA_RECOVERY_PATCH" >/dev/null'
     ) in detail
-    assert detail.count("set -o pipefail") == 4
+    assert detail.count("set -o pipefail") == 3
     assert (
         ') || { echo "Failed to preserve staged tracked edits; update not attempted" '
         ">&2; exit 2; }"
@@ -140,10 +358,7 @@ async def test_updates_plan_failure_returns_exact_error_and_cli_recovery(monkeyp
         ') || { echo "Failed to preserve unstaged tracked edits; update not attempted" '
         ">&2; exit 2; }"
     ) in detail
-    assert (
-        ') || { echo "Failed to install requested agent CLI; update not attempted" '
-        ">&2; exit 2; }"
-    ) in detail
+    assert "Failed to install selected-ref CLI; update not attempted" in detail
     assert (
         'sudo /usr/local/bin/agent version || { echo "Installed agent CLI is not '
         'runnable; update not attempted" >&2; exit 2; }'
@@ -541,7 +756,9 @@ def test_update_plan_failure_normalizes_recovery_cli_release_tag(tmp_path, ref: 
         updater_output="plan failed",
     )
 
-    assert "AGENT_VERSION=v7.4.0 INSTALL_DIR=/usr/local/bin" in detail
+    assert "AAVA_CLI_REF=v7.4.0" in detail
+    assert 'git clone --quiet --depth 1 --single-branch --branch "$AAVA_CLI_REF"' in detail
+    assert "raw.githubusercontent.com/hkjarral" not in detail
     assert f"agent update --ref {ref}" in detail
 
 
