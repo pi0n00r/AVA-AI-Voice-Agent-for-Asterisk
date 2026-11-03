@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 
 import pytest
@@ -304,6 +305,11 @@ printf '%s\\n' "${FIX_CMDS[@]}"
 def test_ui_bootstrap_prepares_directories_without_leaking_private_umask(tmp_path, initial_umask, existing_directories):
     """Fresh and partially prepared mounts stay usable without changing DB files."""
     env, _ = prepare_project(tmp_path, "none")
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    docker_socket = socket.socket(socket.AF_UNIX)
+    docker_socket.bind(str(runtime_dir / "docker.sock"))
+    env["XDG_RUNTIME_DIR"] = str(runtime_dir)
     source = (ROOT / "install.sh").read_text().rsplit('\nmain "$@"', 1)[0]
     (tmp_path / "install-functions.sh").write_text(source)
     (tmp_path / ".env.example").write_text("JWT_SECRET=\nPROVIDER_SECRET=synthetic-retained\n")
@@ -332,7 +338,10 @@ printf 'RESTORED_UMASK=%s\\n' "$(umask)"
         assert (tmp_path / name).stat().st_mode & 0o2775 == 0o2775
     assert (tmp_path / "secrets").stat().st_mode & 0o2770 == 0o2770
     assert (tmp_path / ".env").stat().st_mode & 0o777 == 0o640
-    assert "PROVIDER_SECRET=synthetic-retained" in (tmp_path / ".env").read_text()
+    env_text = (tmp_path / ".env").read_text()
+    assert "PROVIDER_SECRET=synthetic-retained" in env_text
+    assert f"DOCKER_SOCK={runtime_dir / 'docker.sock'}" in env_text
+    assert f"DOCKER_GID={os.stat(runtime_dir / 'docker.sock').st_gid}" in env_text
     if existing_directories:
         assert sentinel.read_bytes() == b"private fixture: leave unchanged"
         assert sentinel.stat().st_mode & 0o777 == 0o600

@@ -501,7 +501,7 @@ ensure_docker_sock_env() {
     fi
 
     local current_sock=""
-    current_sock="$(grep -E '^[# ]*DOCKER_SOCK=' .env 2>/dev/null | tail -n1 | sed -E 's/^[# ]*DOCKER_SOCK=//')"
+    current_sock="$(grep -E '^DOCKER_SOCK=' .env 2>/dev/null | tail -n1 | sed -E 's/^DOCKER_SOCK=//')"
     current_sock="$(echo "$current_sock" | tr -d '\r' | xargs 2>/dev/null || echo "$current_sock")"
 
     # If an explicit socket is already configured and valid, keep it.
@@ -1832,11 +1832,13 @@ bootstrap_ui() {
     ( umask 077; ensure_env_file ) || return 1
     # Preserve existing values; a fresh .env must bind host operations to this
     # checkout rather than the example's maintainer path.
-    local host_root socket_gid jwt
+    local host_root env_sock socket_path socket_gid jwt
     host_root="$(pwd -P)"
     upsert_env HOST_PROJECT_ROOT "$host_root"
     ensure_docker_sock_env
-    socket_gid="$(stat -c '%g' "${DOCKER_SOCK:-/var/run/docker.sock}" 2>/dev/null || stat -f '%g' "${DOCKER_SOCK:-/var/run/docker.sock}" 2>/dev/null || true)"
+    env_sock="$(grep -E '^DOCKER_SOCK=' .env 2>/dev/null | tail -n1 | sed -E 's/^DOCKER_SOCK=//')"
+    socket_path="${DOCKER_SOCK:-${env_sock:-/var/run/docker.sock}}"
+    socket_gid="$(stat -c '%g' "$socket_path" 2>/dev/null || stat -f '%g' "$socket_path" 2>/dev/null || true)"
     [ -z "$socket_gid" ] || upsert_env DOCKER_GID "$socket_gid"
     if ! grep -qE '^JWT_SECRET=.+$' .env || grep -qE '^JWT_SECRET=(changeme|change-me-please)$' .env; then
         jwt="$(python3 -c 'import secrets; print(secrets.token_hex(32))')" || return 1

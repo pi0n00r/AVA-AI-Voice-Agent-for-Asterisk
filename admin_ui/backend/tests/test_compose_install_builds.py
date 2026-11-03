@@ -82,7 +82,7 @@ assert args[args.index("--pull") + 1] == "never"
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("action,exists,build_fails", [
-    ("start", False, False), ("start", False, True),
+    ("start", False, False), ("start", False, True), ("start", True, False),
     ("rebuild", False, False), ("rebuild", True, False),
     ("restart", True, False),
 ])
@@ -132,6 +132,9 @@ async def test_wizard_engine_builds_once_before_start(monkeypatch, action, exist
     assert len(starts) == int(not build_fails)
     if starts:
         assert "--no-build --pull never" in starts[0]
+        assert ("--force-recreate" in starts[0]) == (
+            exists and action in {"restart", "rebuild"}
+        )
 
 
 @pytest.mark.asyncio

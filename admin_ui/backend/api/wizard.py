@@ -953,7 +953,11 @@ async def start_engine(action: str = "start"):
             host_root,
             env={"PROJECT_ROOT": host_root},
             command=_compose_service_command(
-                "ai_engine", build=False, recreate=container_exists,
+                "ai_engine",
+                build=False,
+                recreate=container_exists and (
+                    action in {"restart", "rebuild"} or container.status != "running"
+                ),
             ),
             timeout_sec=60,
         )
