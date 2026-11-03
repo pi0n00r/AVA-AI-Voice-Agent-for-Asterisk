@@ -169,8 +169,8 @@ const AsteriskPage = () => {
         if (!manifest?.checks || Object.keys(manifest.checks).length === 0) {
             return (
                 <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                    <CheckCircle2 className="w-4 h-4 text-green-500" />
-                    No configuration issues detected
+                    <AlertCircle className="w-4 h-4 text-amber-500" />
+                    Preflight did not produce configuration check results.
                 </div>
             );
         }

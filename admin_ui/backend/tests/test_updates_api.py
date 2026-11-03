@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -198,6 +199,45 @@ def test_remote_updater_context_does_not_write_mounted_checkout(monkeypatch, tmp
         text=True,
     ).stdout
     assert refs_after == refs_before
+
+
+@pytest.mark.parametrize("failure", ["nonzero", "called-process-error", "timeout"])
+def test_remote_updater_context_redacts_clone_credentials(
+    monkeypatch, tmp_path, failure: str,
+) -> None:
+    remote_url = "https://token-value@example.invalid/private/ava.git"
+    context_dir = tmp_path / "clone-context"
+    calls = 0
+
+    def fake_run(args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return subprocess.CompletedProcess(args, 0, stdout=remote_url + "\n", stderr="")
+        if failure == "nonzero":
+            return subprocess.CompletedProcess(
+                args, 128, stdout="", stderr=f"unable to access {remote_url}",
+            )
+        if failure == "called-process-error":
+            raise subprocess.CalledProcessError(
+                128, args, stderr=f"unable to access {remote_url}",
+            )
+        raise subprocess.TimeoutExpired(args, 180)
+
+    monkeypatch.setattr(system.subprocess, "run", fake_run)
+    monkeypatch.setattr(tempfile, "mkdtemp", lambda **_kwargs: str(context_dir))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        system._materialize_remote_context(
+            str(tmp_path), "public", "bajaj/maintained", "a" * 40,
+        )
+
+    message = str(exc_info.value)
+    assert "token-value" not in message
+    assert remote_url not in message
+    assert exc_info.value.__context__ is None
+    assert message.endswith("timeout" if failure == "timeout" else "exit 128")
+    assert not context_dir.exists()
 
 
 @pytest.mark.asyncio

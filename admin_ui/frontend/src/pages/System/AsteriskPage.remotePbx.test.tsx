@@ -78,6 +78,25 @@ describe('AsteriskPage remote PBX checklist', () => {
         expect(screen.getByText(/Local Asterisk audit completed on Ava host/)).toBeInTheDocument();
     });
 
+    it('does not report an empty Ava-host audit as successful', async () => {
+        mockedGet.mockResolvedValue({
+            data: {
+                ...remoteStatus,
+                manifest: {
+                    ...remoteStatus.manifest,
+                    asterisk_found: true,
+                    checks: {},
+                },
+            },
+        });
+
+        render(<AsteriskPage />);
+
+        await waitFor(() => expect(screen.getByText('Remote')).toBeInTheDocument());
+        expect(screen.getByText('Preflight did not produce configuration check results.')).toBeInTheDocument();
+        expect(screen.queryByText('No configuration issues detected')).not.toBeInTheDocument();
+    });
+
     it('distinguishes a missing Ava-host manifest from a skipped audit', async () => {
         mockedGet.mockResolvedValue({ data: { ...remoteStatus, manifest: null } });
 

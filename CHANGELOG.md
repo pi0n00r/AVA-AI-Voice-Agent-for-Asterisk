@@ -24,7 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   manifest as an error when Ava is configured to use Asterisk on a separate
   host; retain live ARI/module status and identify PBX configuration checks as
   remote-host work. Ava-host audit results, skipped audits, and missing
-  manifests are now reported as distinct states.
+  manifests are now reported as distinct states, and an empty audit is never
+  reported as a successful configuration check.
+
+- **Updater diagnostics:** redact credential-bearing remote URLs from clone
+  failure details while preserving bounded operator-facing error context.
 
 ## [7.7.4.2] - 2026-11-02
 

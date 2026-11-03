@@ -4573,16 +4573,29 @@ def _materialize_remote_context(build_root: str, remote: str, ref: str, sha: str
         clone_ref = ref.strip()
         if _is_semver_tag(clone_ref) and not clone_ref.startswith("v"):
             clone_ref = f"v{clone_ref}"
-        subprocess.run(
-            [
-                "git", "clone", "--quiet", "--depth", "1", "--single-branch",
-                "--branch", clone_ref, "--", remote_url, context_dir,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=180,
-            check=True,
-        )
+        clone_failure = ""
+        try:
+            clone_proc = subprocess.run(
+                [
+                    "git", "clone", "--quiet", "--depth", "1", "--single-branch",
+                    "--branch", clone_ref, "--", remote_url, context_dir,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=180,
+                check=False,
+            )
+            if clone_proc.returncode != 0:
+                clone_failure = f"exit {clone_proc.returncode}"
+        except subprocess.CalledProcessError as exc:
+            clone_failure = f"exit {exc.returncode}"
+        except subprocess.TimeoutExpired:
+            clone_failure = "timeout"
+        if clone_failure:
+            raise RuntimeError(
+                f"git clone of {remote}/{clone_ref} failed: "
+                f"{clone_failure}"
+            )
         head_proc = subprocess.run(
             ["git", "-C", context_dir, "rev-parse", "HEAD"],
             capture_output=True,
