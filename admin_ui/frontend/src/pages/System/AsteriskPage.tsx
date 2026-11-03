@@ -423,7 +423,7 @@ const AsteriskPage = () => {
                             <AlertCircle className="w-4 h-4 text-amber-500" />
                             <div>
                                 <p>Preflight checks were not run (or produced no check results).</p>
-                                <p className="mt-1">Review <code className="px-1.5 py-0.5 rounded bg-muted text-xs font-mono">./preflight.sh</code> output first, then run <code className="px-1.5 py-0.5 rounded bg-muted text-xs font-mono">sudo ./preflight.sh --apply-fixes</code> on the host to generate a manifest with checks.</p>
+                                <p className="mt-1">Review <code className="px-1.5 py-0.5 rounded bg-muted text-xs font-mono">./preflight.sh</code> output first, then run <code className="px-1.5 py-0.5 rounded bg-muted text-xs font-mono">sudo ./preflight.sh --apply-fixes</code> on the host to refresh the manifest. Hosts without local Asterisk remain without configuration checks.</p>
                             </div>
                         </div>
                     ) : (

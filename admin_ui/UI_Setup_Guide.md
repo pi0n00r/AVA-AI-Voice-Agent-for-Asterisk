@@ -51,6 +51,11 @@ fi
 
 # Explicitly authorize the suggested system/configuration repairs, then install.
 sudo ./preflight.sh --apply-fixes
+repair_status=$?
+if [ "$repair_status" -ne 0 ]; then
+  echo "Write-enabled preflight failed; installation has not started." >&2
+  exit "$repair_status"
+fi
 ./install.sh --ui
 ```
 
@@ -287,20 +292,19 @@ kill $(cat admin_ui.pid) && nohup python main.py > admin_ui.log 2>&1 &
 
 **If you forget your password**:
 ```bash
-# Delete the users file. On next start a new one-time password is generated and
-# printed to Docker logs, or the process/systemd logs for a non-Docker installation.
+# Docker installation (run from the project root)
 rm config/users.json
-
-# Docker installation
 docker compose restart admin_ui
 
 # Standalone nohup installation (run from admin_ui/backend)
+rm ../../config/users.json
 kill "$(cat admin_ui.pid)"
 nohup python main.py > admin_ui.log 2>&1 &
 echo $! > admin_ui.pid
 
-# systemd installation (replace the unit only if your installation uses another name)
-sudo systemctl restart ava-admin-ui.service
+# systemd installation created by this guide (remove the project-root file first)
+rm /path/to/Asterisk-AI-Voice-Agent/config/users.json
+sudo systemctl restart admin-ui.service
 ```
 
 ---

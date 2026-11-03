@@ -96,6 +96,11 @@ cd AVA-AI-Voice-Agent-for-Asterisk
 ./preflight.sh
 # Review the complete findings before authorizing changes.
 sudo ./preflight.sh --apply-fixes
+repair_status=$?
+if [ "$repair_status" -ne 0 ]; then
+  echo "Write-enabled preflight failed; installation has not started." >&2
+  exit "$repair_status"
+fi
 ./install.sh --ui
 ```
 
