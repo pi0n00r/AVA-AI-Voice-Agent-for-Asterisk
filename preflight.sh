@@ -1561,8 +1561,14 @@ check_env() {
         log_ok ".env file exists"
         log_info "  Tip: For local_only pipeline, no API keys needed!"
     elif [ -f "$SCRIPT_DIR/.env.example" ]; then
-        # Creating .env is repo-local and safe; do it automatically (no sudo needed).
-        cp "$SCRIPT_DIR/.env.example" "$SCRIPT_DIR/.env"
+        # Create the secret-bearing file owner-only from its first write. When
+        # preflight runs under sudo, retain ownership for the invoking user so
+        # the later non-root installer reads the same JWT secret.
+        (umask 077 && cp "$SCRIPT_DIR/.env.example" "$SCRIPT_DIR/.env")
+        chmod 600 "$SCRIPT_DIR/.env"
+        if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_UID:-}" ] && [ -n "${SUDO_GID:-}" ]; then
+            chown "$SUDO_UID:$SUDO_GID" "$SCRIPT_DIR/.env"
+        fi
         log_ok "Created .env from .env.example"
         log_info "  Tip: For local_only pipeline, no API keys needed!"
         log_info "  For cloud providers, edit .env to add your API keys"
@@ -1774,11 +1780,15 @@ check_asterisk() {
                         ASTERISK_FOUND=true
                         log_ok "Asterisk config: $ASTERISK_DIR (user provided)"
                         
-                        # Save to .env for future use
+                        # Persist only when the operator explicitly authorized
+                        # configuration changes. Check-only mode reports the
+                        # value without changing .env.
                         if [ -f "$SCRIPT_DIR/.env" ]; then
-                            if ! grep -q "ASTERISK_CONFIG_DIR" "$SCRIPT_DIR/.env"; then
+                            if [ "$APPLY_FIXES" = true ] && ! grep -q "ASTERISK_CONFIG_DIR" "$SCRIPT_DIR/.env"; then
                                 echo "ASTERISK_CONFIG_DIR=$ASTERISK_DIR" >> "$SCRIPT_DIR/.env"
                                 log_ok "Saved ASTERISK_CONFIG_DIR to .env"
+                            elif [ "$APPLY_FIXES" != true ] && ! grep -q "ASTERISK_CONFIG_DIR" "$SCRIPT_DIR/.env"; then
+                                log_info "  Run sudo ./preflight.sh --apply-fixes to save this path"
                             fi
                         fi
                     else

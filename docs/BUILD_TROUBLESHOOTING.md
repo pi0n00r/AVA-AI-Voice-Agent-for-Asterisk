@@ -6,8 +6,11 @@ the [legacy recovery commands](CLI_TOOLS_GUIDE.md#standalone-compose-and-older-h
 ## Check before building
 
 Run `./preflight.sh` for system, resource, permissions, network and PBX checks.
-It is read-only by default; review suggested changes before explicitly running
-`sudo ./preflight.sh --apply-fixes`. No build check edits Docker configuration,
+It does not persist configuration changes by default; review suggested changes
+before explicitly running `sudo ./preflight.sh --apply-fixes`. Full preflight
+creates and removes `data/.call_history_sqlite_test.db` to verify SQLite writes,
+but check-only mode does not retain that probe or save a custom Asterisk path.
+No build check edits Docker configuration,
 creates an insecure builder, restarts Docker or pulls base images.
 
 Run this as the user who will install/update AVA:
@@ -18,7 +21,10 @@ Run this as the user who will install/update AVA:
 
 The JSON report contains builder, driver, context, UID, engine ID, node status
 and `connectivity: not-probed`. It checks Docker access, the actual builder,
-Compose `build --print`, and Bake `--allow`/`--load` capabilities. A stopped
+Compose `build --print`, and Bake `--allow`/`--load` capabilities. The unified
+helper requires Python 3 and those capabilities for every invocation so it can
+validate the selected builder and remain ready for the narrowly scoped
+`network.host` retry without changing policy after a failed build. A stopped
 container builder is reported without bootstrapping it. A real build is still
 required to verify registry access, package downloads and image loading.
 

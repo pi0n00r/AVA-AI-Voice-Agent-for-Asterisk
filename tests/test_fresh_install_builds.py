@@ -157,7 +157,10 @@ def test_copied_quick_start_retains_compose_selection(tmp_path, guide, failure, 
     blocks = re.findall(r"^```bash\n(.*?)^```", source, re.S | re.M)
     bootstrap = next(block for block in blocks if "./install.sh --ui" in block)
     shutil.copy(ROOT / "install.sh", tmp_path / "install.sh")
-    shutil.copy(ROOT / "preflight.sh", tmp_path / "preflight.sh")
+    # Keep host preparation outside this installer fixture while preserving the
+    # copied guide's explicit review gate.
+    (tmp_path / "preflight.sh").write_text("#!/bin/sh\nexit 0\n")
+    (tmp_path / "preflight.sh").chmod(0o700)
     (tmp_path / ".env.example").write_text("JWT_SECRET=\nPROVIDER_SECRET=synthetic-retained\n")
     env["INSTALL_NONINTERACTIVE"] = "1"
     # Keep system preparation out of this fixture; exercise the real installer
@@ -238,6 +241,18 @@ _write_asterisk_manifest false unknown /synthetic false unknown '{}'
     if existing:
         assert (tmp_path / ".env").read_text() == before
     assert not (tmp_path / "data").exists()
+
+
+def test_apply_fixes_creates_env_owner_only(tmp_path):
+    (tmp_path / ".env.example").write_text("JWT_SECRET=\nPROVIDER_SECRET=synthetic-retained\n")
+    script = _preflight_function("check_env") + '''
+log_ok() { :; }; log_warn() { :; }; log_info() { :; }
+APPLY_FIXES=true; SCRIPT_DIR="$1"; LOCAL_AI_MODE_OVERRIDE=""
+check_env
+'''
+    subprocess.run(["bash", "-c", script, "fixture", str(tmp_path)], check=True, capture_output=True)
+    assert (tmp_path / ".env").stat().st_mode & 0o777 == 0o600
+    assert "PROVIDER_SECRET=synthetic-retained" in (tmp_path / ".env").read_text()
 
 
 def test_preflight_accepts_standalone_compose_new_major(tmp_path):

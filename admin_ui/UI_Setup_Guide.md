@@ -41,7 +41,15 @@ and [upgrade instructions](../docs/INSTALLATION.md#upgrade-to-v770-existing-chec
 For source checkouts containing the unreleased #802 fixes:
 
 ```bash
-# From the project root; review preflight findings before proceeding.
+# From the project root, capture and review the non-blocking and blocking findings.
+./preflight.sh
+preflight_status=$?
+if [ "$preflight_status" -eq 2 ]; then
+  echo "Preflight found blocking failures; resolve them before installation." >&2
+  exit 2
+fi
+
+# Explicitly authorize the suggested system/configuration repairs, then install.
 sudo ./preflight.sh --apply-fixes
 ./install.sh --ui
 ```
@@ -283,8 +291,16 @@ kill $(cat admin_ui.pid) && nohup python main.py > admin_ui.log 2>&1 &
 # printed to Docker logs, or the process/systemd logs for a non-Docker installation.
 rm config/users.json
 
-# Restart admin-ui
+# Docker installation
 docker compose restart admin_ui
+
+# Standalone nohup installation (run from admin_ui/backend)
+kill "$(cat admin_ui.pid)"
+nohup python main.py > admin_ui.log 2>&1 &
+echo $! > admin_ui.pid
+
+# systemd installation (replace the unit only if your installation uses another name)
+sudo systemctl restart ava-admin-ui.service
 ```
 
 ---

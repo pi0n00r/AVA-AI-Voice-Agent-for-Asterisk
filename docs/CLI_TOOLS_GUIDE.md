@@ -1,6 +1,6 @@
 # Agent CLI Tools Guide
 
-Operator reference for the `agent` command prepared for Asterisk AI Voice Agent v7.7.1.
+Operator reference for the `agent` command prepared for the maintained fork release v7.7.4.5.
 
 Run commands from the repository root on the Docker Compose host. Global flags are `--verbose` and `--no-color`.
 
@@ -21,7 +21,7 @@ Run commands from the repository root on the Docker Compose host. Global flags a
 The normal project installer includes the CLI. To install only a released binary on Linux or macOS:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/main/scripts/install-cli.sh | bash
+curl -sSL https://raw.githubusercontent.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/v7.7.4.5/scripts/install-cli.sh | AGENT_VERSION=v7.7.4.5 bash
 agent version
 ```
 
@@ -151,7 +151,7 @@ Apply an update:
 
 ```bash
 agent update
-agent update --ref v7.7.1   # Only after this tag/artifacts are published
+agent update --ref v7.7.4.5
 agent update --checkout --ref main
 agent update --rebuild auto
 agent update --rebuild none
@@ -266,6 +266,12 @@ Compose plugin (`docker compose`); preflight
 and the installer retain standalone Compose selection through
 `AAVA_COMPOSE_BIN=docker-compose`. See Docker's [build options](https://docs.docker.com/reference/cli/docker/compose/build/)
 and [Bake host-network grant](https://docs.docker.com/build/bake/reference/#targetnetwork).
+
+The unified helper requires Python 3, Compose `build --print`, and Buildx Bake
+`--allow`/`--load` even when the first plain build succeeds. It validates the
+selected builder before building and keeps the narrowly scoped `network.host`
+retry capability fixed for the entire operation instead of changing policy only
+after a failure.
 
 The helper honors `COMPOSE_FILE` and `COMPOSE_PROJECT_NAME`; use the same settings
 for the build and recreation. Build Local AI only when it is installed/selected,

@@ -1,11 +1,11 @@
 #!/bin/bash
 # Install script for Asterisk AI Voice Agent CLI tools
-# Usage: curl -sSL https://raw.githubusercontent.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/main/scripts/install-cli.sh | bash
+# Usage: curl -sSL https://raw.githubusercontent.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/v7.7.4.5/scripts/install-cli.sh | AGENT_VERSION=v7.7.4.5 bash
 
 set -e
 
 # Configuration
-REPO="hkjarral/AVA-AI-Voice-Agent-for-Asterisk"
+REPO="pi0n00r/AVA-AI-Voice-Agent-for-Asterisk"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 VERSION="${AGENT_VERSION:-latest}"
 

@@ -93,6 +93,8 @@ preflight findings before allowing its explicit system/configuration repairs:
 ```bash
 git clone --branch bajaj/maintained https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk.git
 cd AVA-AI-Voice-Agent-for-Asterisk
+./preflight.sh
+# Review the complete findings before authorizing changes.
 sudo ./preflight.sh --apply-fixes
 ./install.sh --ui
 ```
