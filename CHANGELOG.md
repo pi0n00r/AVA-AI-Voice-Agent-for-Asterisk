@@ -7,21 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [7.7.4.3] - 2026-11-02
+## [7.7.4.4] - 2026-11-02
 
 ### Changed
 
 - **Admin update source:** allow deployments to select one validated Git remote
   and maintained branch for release checks, branch discovery, update planning,
   and execution. The Updates page now displays that effective source instead of
-  assuming `origin/main`.
+  assuming `origin/main`. Updater builds and recovery commands resolve that
+  selected source without writing to a root-owned checkout or falling back to
+  an unrelated upstream release installer.
 
 ### Fixed
 
 - **Remote PBX checklist:** stop presenting an empty local Asterisk preflight
   manifest as an error when Ava is configured to use Asterisk on a separate
   host; retain live ARI/module status and identify PBX configuration checks as
-  remote-host work.
+  remote-host work. Ava-host audit results, skipped audits, and missing
+  manifests are now reported as distinct states.
 
 ## [7.7.4.2] - 2026-11-02
 
