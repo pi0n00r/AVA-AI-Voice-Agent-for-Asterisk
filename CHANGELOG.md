@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and execution. The Updates page now displays that effective source instead of
   assuming `origin/main`.
 
+### Fixed
+
+- **Remote PBX checklist:** stop presenting an empty local Asterisk preflight
+  manifest as an error when Ava is configured to use Asterisk on a separate
+  host; retain live ARI/module status and identify PBX configuration checks as
+  remote-host work.
+
 ## [7.7.4.2] - 2026-11-02
 
 ### Fixed
