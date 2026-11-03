@@ -269,9 +269,9 @@ and [Bake host-network grant](https://docs.docker.com/build/bake/reference/#targ
 
 The unified helper requires Python 3, Compose `build --print`, and Buildx Bake
 `--allow`/`--load` even when the first plain build succeeds. It validates the
-selected builder before building and keeps the narrowly scoped `network.host`
-retry capability fixed for the entire operation instead of changing policy only
-after a failure.
+selected builder before building. Bake validates entitlement support before the
+build; Compose starts without the `network.host` grant and retries with that
+scoped grant only after the matching entitlement error.
 
 The helper honors `COMPOSE_FILE` and `COMPOSE_PROJECT_NAME`; use the same settings
 for the build and recreation. Build Local AI only when it is installed/selected,
