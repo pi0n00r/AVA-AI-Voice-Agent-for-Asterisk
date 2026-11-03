@@ -92,6 +92,8 @@ services:
     environment:
       PROJECT_ROOT: /app/project
       HOST_PROJECT_ROOT: ${HOST_PROJECT_ROOT}
+      AAVA_UPDATE_REMOTE: ${AAVA_UPDATE_REMOTE:-origin}
+      AAVA_UPDATE_DEFAULT_BRANCH: ${AAVA_UPDATE_DEFAULT_BRANCH:-bajaj/maintained}
       UVICORN_HOST: "::"
       UVICORN_PORT: "3003"
       HEALTH_CHECK_AI_ENGINE_URL: http://ai_engine:15000

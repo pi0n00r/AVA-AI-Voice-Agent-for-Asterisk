@@ -20,6 +20,63 @@ def _jobs_dir(root: Path) -> Path:
     return jobs
 
 
+def test_configured_update_source_accepts_named_fork_remote(monkeypatch) -> None:
+    monkeypatch.setenv("AAVA_UPDATE_REMOTE", "public")
+    monkeypatch.setenv("AAVA_UPDATE_DEFAULT_BRANCH", "bajaj/maintained")
+
+    assert system._configured_update_remote() == "public"
+    assert system._configured_update_default_branch() == "bajaj/maintained"
+
+
+@pytest.mark.parametrize("remote", ["-public", "public remote", "../public", "public/@{bad}"])
+def test_configured_update_remote_rejects_unsafe_names(monkeypatch, remote: str) -> None:
+    monkeypatch.setenv("AAVA_UPDATE_REMOTE", remote)
+    with pytest.raises(HTTPException, match="Invalid configured update remote"):
+        system._configured_update_remote()
+
+
+@pytest.mark.asyncio
+async def test_updates_plan_uses_one_configured_remote_and_default_branch(monkeypatch, tmp_path) -> None:
+    captured: dict = {}
+
+    def fake_run(*_args, **kwargs):
+        captured.update(kwargs)
+        return 0, '{"dirty": false}'
+
+    async def fake_active_calls():
+        return {"active_calls": 0, "reachable": True}
+
+    monkeypatch.setenv("AAVA_UPDATE_REMOTE", "public")
+    monkeypatch.setenv("AAVA_UPDATE_DEFAULT_BRANCH", "bajaj/maintained")
+    monkeypatch.setattr(system, "_project_host_root_from_admin_ui_container", lambda: str(tmp_path))
+    monkeypatch.setattr(system, "_run_updater_ephemeral", fake_run)
+    monkeypatch.setattr(system, "_check_active_calls", fake_active_calls)
+
+    response = await system.updates_plan(ref=None)
+
+    assert response.plan["active_calls"] == 0
+    assert captured["env"]["AAVA_UPDATE_REMOTE"] == "public"
+    assert captured["env"]["AAVA_UPDATE_REF"] == "bajaj/maintained"
+
+
+@pytest.mark.asyncio
+async def test_updates_branches_uses_configured_remote(monkeypatch, tmp_path) -> None:
+    captured: dict = {}
+
+    def fake_run(*_args, **kwargs):
+        captured.update(kwargs)
+        return 0, "abc123\trefs/heads/bajaj/maintained\n"
+
+    monkeypatch.setenv("AAVA_UPDATE_REMOTE", "public")
+    monkeypatch.setattr(system, "_project_host_root_from_admin_ui_container", lambda: str(tmp_path))
+    monkeypatch.setattr(system, "_run_updater_ephemeral", fake_run)
+
+    response = await system.updates_branches()
+
+    assert response.branches == ["bajaj/maintained"]
+    assert "ls-remote --heads public" in captured["command"]
+
+
 def test_cli_install_path_validation_accepts_simple_absolute_path() -> None:
     assert system._validate_cli_install_path("/usr/local/bin/agent") == "/usr/local/bin/agent"
     assert system._validate_cli_install_path("  /opt/aava-agent_1.2/bin/agent  ") == "/opt/aava-agent_1.2/bin/agent"

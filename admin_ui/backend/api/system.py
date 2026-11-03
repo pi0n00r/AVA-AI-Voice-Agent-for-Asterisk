@@ -33,6 +33,30 @@ def _validate_git_ref(ref: str) -> str:
     return r
 
 
+_GIT_REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+
+
+def _configured_update_remote() -> str:
+    """Return the operator-selected Git remote used by every Admin update path."""
+    remote = (os.getenv("AAVA_UPDATE_REMOTE") or "origin").strip()
+    if (
+        not _GIT_REMOTE_NAME_RE.fullmatch(remote)
+        or remote.endswith("/")
+        or ".." in remote
+        or "@{" in remote
+    ):
+        raise HTTPException(status_code=500, detail="Invalid configured update remote")
+    return remote
+
+
+def _configured_update_default_branch() -> str:
+    """Return the branch selected by the Admin UI's maintained-code target."""
+    try:
+        return _validate_git_ref(os.getenv("AAVA_UPDATE_DEFAULT_BRANCH") or "main")
+    except HTTPException as exc:
+        raise HTTPException(status_code=500, detail="Invalid configured update default branch") from exc
+
+
 def _extract_mounts(container) -> List[dict]:
     """
     Normalize Docker mount info into a stable, UI-friendly shape.
@@ -4982,6 +5006,7 @@ def _update_plan_failure_detail(
     include_ui: bool,
     checkout: bool,
     updater_output: str,
+    remote: str = "origin",
 ) -> str:
     """Build an actionable plan error without polluting successful plan JSON."""
     import shlex
@@ -4989,6 +5014,8 @@ def _update_plan_failure_detail(
     output = (updater_output or "Updater exited without an error message").strip()
     quoted_root = shlex.quote(host_root)
     quoted_ref = shlex.quote(ref)
+    quoted_remote = shlex.quote(remote)
+    update_remote_flag = "" if remote == "origin" else f"--remote {quoted_remote} "
     release_ref = (ref or "").strip()
     if _is_semver_tag(release_ref):
         release_tag = release_ref if release_ref.startswith("v") else f"v{release_ref}"
@@ -5011,7 +5038,7 @@ def _update_plan_failure_detail(
             "trap 'exit 129' HUP\n"
             "trap 'exit 130' INT\n"
             "trap 'exit 143' TERM\n"
-            'AAVA_CLI_REMOTE="$(aava_git ls-remote --get-url origin)" || { '
+            f'AAVA_CLI_REMOTE="$(aava_git ls-remote --get-url {quoted_remote})" || {{ '
             'echo "Failed to resolve '
             'checkout origin for CLI source; update not attempted" >&2; exit 2; }\n'
             'git clone --quiet --depth 1 --single-branch --branch "$AAVA_CLI_REF" '
@@ -5191,7 +5218,7 @@ def _update_plan_failure_detail(
         f"  sudo \"$AAVA_SETPRIV\" --reuid=\"$AAVA_UID\" --regid=\"$AAVA_GID\" "
         f"--groups=\"$AAVA_GROUPS\" /usr/bin/env HOME=\"$AAVA_HOME\" /bin/sh -c "
         f"'cd \"$1\" && shift && exec \"$@\"' sh \"$AAVA_REPO\" "
-        f"/usr/local/bin/agent update --ref {quoted_ref} "
+        f"/usr/local/bin/agent update {update_remote_flag}--ref {quoted_ref} "
         f"--checkout={checkout_flag} "
         f"--include-ui={include_ui_flag} --local-changes=retain --self-update=false\n"
         ")\n\n"
@@ -5294,6 +5321,10 @@ async def updates_status(check_remote: bool = False, build_updater: bool = False
             changelog_latest=None,
             error="Not checked",
         )
+
+    update_remote = _configured_update_remote()
+    default_branch = _configured_update_default_branch()
+    quoted_remote = shlex.quote(update_remote)
 
     # Cache (best-effort)
     try:
@@ -5401,7 +5432,7 @@ async def updates_status(check_remote: bool = False, build_updater: bool = False
             command=(
                 "set -euo pipefail; "
                 "cd \"$PROJECT_ROOT\"; "
-                "git -c safe.directory=\"$PROJECT_ROOT\" ls-remote --tags origin 'refs/tags/v*'"
+                f"git -c safe.directory=\"$PROJECT_ROOT\" ls-remote --tags {quoted_remote} 'refs/tags/v*'"
             ),
             timeout_sec=15,
             prefer_pull_ref="latest",
@@ -5455,7 +5486,7 @@ async def updates_status(check_remote: bool = False, build_updater: bool = False
 
     rel_cmd = (
         "cd \"$PROJECT_ROOT\"; "
-        f"git -c safe.directory=\"$PROJECT_ROOT\" fetch -q origin refs/tags/{tag}:refs/tags/{tag} >/dev/null 2>&1 || true; "
+        f"git -c safe.directory=\"$PROJECT_ROOT\" fetch -q {quoted_remote} refs/tags/{tag}:refs/tags/{tag} >/dev/null 2>&1 || true; "
         f"head='{head_sha.strip()}'; target='{tag_sha.strip()}'; "
         "git -c safe.directory=\"$PROJECT_ROOT\" cat-file -e \"$target^{commit}\" >/dev/null 2>&1 || { echo unknown; exit 0; }; "
         "if [ \"$head\" = \"$target\" ]; then echo equal; exit 0; fi; "
@@ -5503,7 +5534,7 @@ async def updates_status(check_remote: bool = False, build_updater: bool = False
             command=(
                 "set -euo pipefail; "
                 "cd \"$PROJECT_ROOT\"; "
-                f"git -c safe.directory=\"$PROJECT_ROOT\" fetch -q origin refs/tags/{tag}:refs/tags/{tag} >/dev/null 2>&1 || true; "
+                f"git -c safe.directory=\"$PROJECT_ROOT\" fetch -q {quoted_remote} refs/tags/{tag}:refs/tags/{tag} >/dev/null 2>&1 || true; "
                 f"git -c safe.directory=\"$PROJECT_ROOT\" show {tag}:CHANGELOG.md 2>/dev/null || true"
             ),
             timeout_sec=20,
@@ -5517,7 +5548,12 @@ async def updates_status(check_remote: bool = False, build_updater: bool = False
 
     payload = {
         "local": {"branch": branch, "head_sha": head_sha, "describe": describe, "deployed_tag": deployed_tag},
-        "remote": {"latest_tag": tag, "latest_tag_sha": tag_sha},
+        "remote": {
+            "name": update_remote,
+            "default_branch": default_branch,
+            "latest_tag": tag,
+            "latest_tag_sha": tag_sha,
+        },
         "update_available": update_available,
         "changelog_latest": changelog_latest,
         "error": error,
@@ -5549,6 +5585,8 @@ async def updates_branches(build_updater: bool = False):
     Return the list of remote branches on origin for the Updates UI dropdown.
     """
     host_root = _project_host_root_from_admin_ui_container()
+    update_remote = _configured_update_remote()
+    quoted_remote = shlex.quote(update_remote)
 
     try:
         code, out = await asyncio.to_thread(
@@ -5558,7 +5596,7 @@ async def updates_branches(build_updater: bool = False):
             command=(
                 "set -euo pipefail; "
                 "cd \"$PROJECT_ROOT\"; "
-                "git -c safe.directory=\"$PROJECT_ROOT\" ls-remote --heads origin"
+                f"git -c safe.directory=\"$PROJECT_ROOT\" ls-remote --heads {quoted_remote}"
             ),
             timeout_sec=20,
             prefer_pull_ref="latest",
@@ -5591,7 +5629,7 @@ async def updates_branches(build_updater: bool = False):
 
 @router.get("/updates/plan", response_model=UpdatePlanResponse)
 async def updates_plan(
-    ref: str = "main",
+    ref: Optional[str] = None,
     include_ui: bool = False,
     checkout: bool = True,
     local_changes: str = "ask",
@@ -5601,13 +5639,14 @@ async def updates_plan(
     """
     host_root = _project_host_root_from_admin_ui_container()
 
-    ref = _validate_git_ref(ref)
+    update_remote = _configured_update_remote()
+    ref = _validate_git_ref(ref or _configured_update_default_branch())
     local_changes = _validate_update_local_changes(local_changes)
     env = {
         "PROJECT_ROOT": host_root,
         "AAVA_UPDATE_MODE": "plan",
         "AAVA_UPDATE_INCLUDE_UI": "true" if include_ui else "false",
-        "AAVA_UPDATE_REMOTE": "origin",
+        "AAVA_UPDATE_REMOTE": update_remote,
         "AAVA_UPDATE_REF": ref,
         "AAVA_UPDATE_CHECKOUT": "true" if checkout else "false",
         "AAVA_UPDATE_LOCAL_CHANGES": local_changes,
@@ -5631,6 +5670,7 @@ async def updates_plan(
                 include_ui=include_ui,
                 checkout=checkout,
                 updater_output=out,
+                remote=update_remote,
             ),
         )
 
@@ -5651,7 +5691,7 @@ async def updates_plan(
 
 class UpdateRunRequest(BaseModel):
     include_ui: bool = False
-    ref: str = "main"
+    ref: Optional[str] = None
     checkout: bool = True
     local_changes: str = "ask"
     update_cli_host: bool = True
@@ -5708,7 +5748,8 @@ async def updates_run(body: UpdateRunRequest):
     host_docker_sock = _docker_sock_host_path_from_admin_ui_container()
     sha = _current_project_head_sha()
     tag = _updater_image_tag_for_sha(sha)
-    ref = _validate_git_ref(body.ref or "main")
+    update_remote = _configured_update_remote()
+    ref = _validate_git_ref(body.ref or _configured_update_default_branch())
     local_changes = _validate_update_local_changes(body.local_changes)
     cli_path = _validate_cli_install_path(body.cli_install_path)
     job_id = uuid.uuid4().hex
@@ -5733,6 +5774,7 @@ async def updates_run(body: UpdateRunRequest):
                 "exit_code": None,
                 "log_path": log_path,
                 "ref": ref,
+                "remote": update_remote,
                 "checkout": bool(body.checkout),
                 "local_changes": local_changes,
                 "update_cli_host": bool(body.update_cli_host),
@@ -5777,7 +5819,7 @@ async def updates_run(body: UpdateRunRequest):
         "AAVA_UPDATE_MODE": "run",
         "AAVA_UPDATE_JOB_ID": job_id,
         "AAVA_UPDATE_INCLUDE_UI": "true" if body.include_ui else "false",
-        "AAVA_UPDATE_REMOTE": "origin",
+        "AAVA_UPDATE_REMOTE": update_remote,
         "AAVA_UPDATE_REF": ref,
         "AAVA_UPDATE_CHECKOUT": "true" if body.checkout else "false",
         "AAVA_UPDATE_LOCAL_CHANGES": local_changes,

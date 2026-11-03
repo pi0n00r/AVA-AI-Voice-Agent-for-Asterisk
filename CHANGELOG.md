@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Admin update source:** allow deployments to select one validated Git remote
+  and maintained branch for release checks, branch discovery, update planning,
+  and execution. The Updates page now displays that effective source instead of
+  assuming `origin/main`.
+
 ## [7.7.4.2] - 2026-11-02
 
 ### Fixed

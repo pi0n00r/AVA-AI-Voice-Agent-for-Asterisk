@@ -729,6 +729,21 @@ cat admin_ui.log
 
 ### Updating the Admin UI
 
+The Updates page uses one configured Git remote for release checks, branch
+discovery, update planning, and update execution. Set these values in the
+deployment `.env` before recreating the Admin container:
+
+```dotenv
+# Public maintained fork (when the checkout names that remote "public")
+AAVA_UPDATE_REMOTE=public
+AAVA_UPDATE_DEFAULT_BRANCH=bajaj/maintained
+```
+
+`AAVA_UPDATE_REMOTE` is a remote name already present in the mounted checkout,
+not a URL. A public clone normally uses `origin` instead. The Updates page
+shows the effective remote and maintained branch so an operator can verify the
+source before running a plan.
+
 **Docker deployment**:
 ```bash
 # Recommended: update the whole deployment (code + containers)

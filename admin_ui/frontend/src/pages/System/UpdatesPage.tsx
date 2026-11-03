@@ -10,7 +10,7 @@ type UpdateAvailable = boolean | null;
 
 interface UpdatesStatus {
   local: { branch?: string; head_sha: string; describe: string; deployed_tag?: string | null };
-  remote?: { latest_tag: string; latest_tag_sha: string } | null;
+  remote?: { name?: string; default_branch?: string; latest_tag: string; latest_tag_sha: string } | null;
   update_available?: UpdateAvailable;
   changelog_latest?: string | null;
   error?: string | null;
@@ -133,7 +133,7 @@ const UpdatesPage = () => {
 
   const targetRef = useMemo(() => {
     if (targetMode === 'stable') return status?.remote?.latest_tag || '';
-    if (targetMode === 'main') return 'main';
+    if (targetMode === 'main') return status?.remote?.default_branch || 'main';
     return selectedBranch;
   }, [targetMode, status, selectedBranch]);
 
@@ -607,7 +607,9 @@ const UpdatesPage = () => {
                 <div className="font-mono text-xs break-all">{status.local?.deployed_tag || 'Unknown'}</div>
               </div>
               <div>
-                <div className="text-xs text-muted-foreground">Remote (latest v*)</div>
+                <div className="text-xs text-muted-foreground">
+                  Remote {status.remote?.name ? `(${status.remote.name})` : ''} (latest v*)
+                </div>
                 <div className="font-mono text-xs break-all">{status.remote?.latest_tag || 'Unknown'}</div>
               </div>
             </div>
@@ -665,8 +667,10 @@ const UpdatesPage = () => {
                     onChange={() => setTargetMode('main')}
                     className="rounded border-border"
                   />
-                  Main (hotfixes)
-                  <span className="ml-auto font-mono text-xs text-muted-foreground">main</span>
+                  Maintained branch
+                  <span className="ml-auto font-mono text-xs text-muted-foreground">
+                    {status?.remote?.default_branch || 'main'}
+                  </span>
                 </label>
                 <label className="flex items-center gap-2">
                   <input
