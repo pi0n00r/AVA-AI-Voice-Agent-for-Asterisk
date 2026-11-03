@@ -137,8 +137,13 @@ def test_resolve_update_ref_uses_source_specific_namespace(monkeypatch, tmp_path
 
     def fake_run(args, **_kwargs):
         calls.append(args)
-        if "rev-parse" in args:
-            return subprocess.CompletedProcess(args, 0, stdout=f"{expected_sha}\n", stderr="")
+        if "ls-remote" in args:
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout=f"{expected_sha}\trefs/heads/bajaj/maintained\n",
+                stderr="",
+            )
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
     monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
@@ -146,9 +151,53 @@ def test_resolve_update_ref_uses_source_specific_namespace(monkeypatch, tmp_path
     monkeypatch.setattr(system.subprocess, "run", fake_run)
 
     assert system._resolve_update_ref_sha("bajaj/maintained", "public") == expected_sha
-    fetch = calls[0]
-    assert fetch[-2:] == ["public", "+refs/heads/bajaj/maintained:refs/aava-update/remotes/public/heads/bajaj/maintained"]
+    lookup = calls[0]
+    assert lookup[-2:] == ["public", "refs/heads/bajaj/maintained"]
+    assert "ls-remote" in lookup
+    assert all("fetch" not in call for call in calls)
     assert all("refs/remotes/origin" not in arg for call in calls for arg in call)
+
+
+def test_remote_updater_context_does_not_write_mounted_checkout(monkeypatch, tmp_path) -> None:
+    remote = tmp_path / "remote"
+    checkout = tmp_path / "checkout"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(remote)], check=True)
+    subprocess.run(["git", "-C", str(remote), "config", "user.name", "Ava test"], check=True)
+    subprocess.run(["git", "-C", str(remote), "config", "user.email", "ava-test@example.invalid"], check=True)
+    (remote / "updater").mkdir()
+    (remote / "updater" / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(remote), "add", "updater/Dockerfile"], check=True)
+    subprocess.run(["git", "-C", str(remote), "commit", "-qm", "fixture"], check=True)
+    subprocess.run(["git", "clone", "-q", str(remote), str(checkout)], check=True)
+    refs_before = subprocess.run(
+        ["git", "-C", str(checkout), "show-ref"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    monkeypatch.setenv("PROJECT_ROOT", str(checkout))
+
+    sha = system._resolve_update_ref_sha("main", "origin")
+    assert sha == subprocess.run(
+        ["git", "-C", str(remote), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    context = system._materialize_remote_context(str(checkout), "origin", "main", sha)
+    try:
+        assert Path(context, "updater", "Dockerfile").read_text(encoding="utf-8") == "FROM scratch\n"
+        assert not Path(context, ".git").exists()
+    finally:
+        system.shutil.rmtree(context, ignore_errors=True)
+
+    refs_after = subprocess.run(
+        ["git", "-C", str(checkout), "show-ref"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert refs_after == refs_before
 
 
 @pytest.mark.asyncio
@@ -245,7 +294,9 @@ async def test_updates_plan_failure_returns_exact_error_and_cli_recovery(monkeyp
     assert "Updater error:" in detail
     assert "mkdir: cannot create directory '/root': Permission denied" in detail
     assert f"AAVA_REPO={tmp_path}" in detail
-    assert "AGENT_VERSION=v7.4.0" in detail
+    assert "AAVA_CLI_REF=v7.4.0" in detail
+    assert "raw.githubusercontent.com/hkjarral" not in detail
+    assert 'aava_git ls-remote --get-url origin' in detail
     assert (
         'aava_git status --short '
         '|| { echo "Failed to inspect checkout changes; update not attempted" '
@@ -258,7 +309,7 @@ async def test_updates_plan_failure_returns_exact_error_and_cli_recovery(monkeyp
     assert (
         'aava_git diff --binary | sudo tee -a "$AAVA_RECOVERY_PATCH" >/dev/null'
     ) in detail
-    assert detail.count("set -o pipefail") == 4
+    assert detail.count("set -o pipefail") == 3
     assert (
         ') || { echo "Failed to preserve staged tracked edits; update not attempted" '
         ">&2; exit 2; }"
@@ -267,10 +318,7 @@ async def test_updates_plan_failure_returns_exact_error_and_cli_recovery(monkeyp
         ') || { echo "Failed to preserve unstaged tracked edits; update not attempted" '
         ">&2; exit 2; }"
     ) in detail
-    assert (
-        ') || { echo "Failed to install requested agent CLI; update not attempted" '
-        ">&2; exit 2; }"
-    ) in detail
+    assert "Failed to install selected-ref CLI; update not attempted" in detail
     assert (
         'sudo /usr/local/bin/agent version || { echo "Installed agent CLI is not '
         'runnable; update not attempted" >&2; exit 2; }'
@@ -668,7 +716,9 @@ def test_update_plan_failure_normalizes_recovery_cli_release_tag(tmp_path, ref: 
         updater_output="plan failed",
     )
 
-    assert "AGENT_VERSION=v7.4.0 INSTALL_DIR=/usr/local/bin" in detail
+    assert "AAVA_CLI_REF=v7.4.0" in detail
+    assert 'git clone --quiet --depth 1 --single-branch --branch "$AAVA_CLI_REF"' in detail
+    assert "raw.githubusercontent.com/hkjarral" not in detail
     assert f"agent update --ref {ref}" in detail
 
 

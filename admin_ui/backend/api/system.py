@@ -4513,8 +4513,9 @@ def _resolve_update_ref_sha(ref: str, remote: str = "origin") -> Optional[str]:
     """
     Resolve an update target ref to a commit SHA in the mounted project checkout.
 
-    Branch/main updater images must be built from the target ref, not from the currently
-    deployed checkout. This helper keeps that path best-effort but deterministic.
+    Updater images must be built from the target ref, not from the currently deployed
+    checkout. Resolve the advertised remote ref without writing Git metadata in the
+    mounted checkout; the Admin process may not own its root-owned .git directory.
     """
     r = (ref or "").strip()
     if not r or not _git_available():
@@ -4523,11 +4524,14 @@ def _resolve_update_ref_sha(ref: str, remote: str = "origin") -> Optional[str]:
     safe_dir = f"safe.directory={build_root}"
 
     try:
-        fetch_source, fetched_ref = _update_source_ref(remote, r)
+        fetch_source, _fetched_ref = _update_source_ref(remote, r)
+        candidates = [fetch_source]
+        if fetch_source.startswith("refs/tags/"):
+            candidates.insert(0, f"{fetch_source}^{{}}")
         proc = subprocess.run(
             [
-                "git", "-c", safe_dir, "-C", build_root, "fetch", "-q", "--no-tags",
-                remote, f"+{fetch_source}:{fetched_ref}",
+                "git", "-c", safe_dir, "-C", build_root, "ls-remote", remote,
+                *candidates,
             ],
             capture_output=True,
             text=True,
@@ -4535,79 +4539,60 @@ def _resolve_update_ref_sha(ref: str, remote: str = "origin") -> Optional[str]:
         )
         if proc.returncode != 0:
             return None
-        proc = subprocess.run(
-            ["git", "-c", safe_dir, "-C", build_root, "rev-parse", "--verify", f"{fetched_ref}^{{commit}}"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if proc.returncode == 0:
-            sha = (proc.stdout or "").strip()
-            if re.fullmatch(r"[0-9a-fA-F]{40}", sha):
-                return sha.lower()
+        refs = {}
+        for line in (proc.stdout or "").splitlines():
+            try:
+                sha, advertised_ref = line.split("\t", 1)
+            except ValueError:
+                continue
+            refs[advertised_ref.strip()] = sha.strip()
+        sha = refs.get(f"{fetch_source}^{{}}") or refs.get(fetch_source)
+        if sha and re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+            return sha.lower()
     except Exception:
         return None
     return None
 
 
-def _materialize_git_archive_context(build_root: str, ref: str, sha: str) -> str:
-    import tarfile
+def _materialize_remote_context(build_root: str, remote: str, ref: str, sha: str) -> str:
     import tempfile
 
-    contexts_root = os.path.join(build_root, ".agent", "updates", "build-contexts")
-    os.makedirs(contexts_root, exist_ok=True)
-    context_dir = tempfile.mkdtemp(prefix=f"updater-{sha[:12]}-", dir=contexts_root)
-    archive_path = os.path.join(context_dir, ".source.tar")
     safe_dir = f"safe.directory={build_root}"
+    context_dir = tempfile.mkdtemp(prefix=f"aava-updater-{sha[:12]}-")
     try:
-        with open(archive_path, "wb") as f:
-            subprocess.run(
-                ["git", "-c", safe_dir, "-C", build_root, "archive", "--format=tar", sha],
-                stdout=f,
-                stderr=subprocess.PIPE,
-                text=False,
-                timeout=90,
-                check=True,
-            )
-        root_abs = os.path.abspath(context_dir)
-        with tarfile.open(archive_path, "r") as tar:
-            for member in tar.getmembers():
-                member_name = os.path.normpath(member.name)
-                if (
-                    member_name in ("", ".")
-                    or os.path.isabs(member.name)
-                    or member_name == ".."
-                    or member_name.startswith(f"..{os.sep}")
-                ):
-                    raise RuntimeError(f"unsafe path in git archive for {ref}")
-                target = os.path.abspath(os.path.join(context_dir, member_name))
-                if target != root_abs and not target.startswith(root_abs + os.sep):
-                    raise RuntimeError(f"unsafe path in git archive for {ref}")
-
-                if member.isdir():
-                    os.makedirs(target, exist_ok=True)
-                    continue
-                if member.isfile():
-                    os.makedirs(os.path.dirname(target), exist_ok=True)
-                    src = tar.extractfile(member)
-                    if src is None:
-                        raise RuntimeError(f"invalid file in git archive for {ref}")
-                    with src, open(target, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
-                    os.chmod(target, member.mode & 0o777)
-                    continue
-                if member.issym():
-                    link_target = member.linkname or ""
-                    link_abs = os.path.abspath(os.path.join(os.path.dirname(target), link_target))
-                    if os.path.isabs(link_target) or (
-                        link_abs != root_abs and not link_abs.startswith(root_abs + os.sep)
-                    ):
-                        raise RuntimeError(f"unsafe symlink in git archive for {ref}")
-                    os.makedirs(os.path.dirname(target), exist_ok=True)
-                    os.symlink(link_target, target)
-                    continue
-                raise RuntimeError(f"unsupported entry in git archive for {ref}")
-        os.remove(archive_path)
+        remote_proc = subprocess.run(
+            ["git", "-c", safe_dir, "-C", build_root, "remote", "get-url", remote],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        remote_url = (remote_proc.stdout or "").strip()
+        if not remote_url:
+            raise RuntimeError(f"empty remote URL for {remote}")
+        clone_ref = ref.strip()
+        if _is_semver_tag(clone_ref) and not clone_ref.startswith("v"):
+            clone_ref = f"v{clone_ref}"
+        subprocess.run(
+            [
+                "git", "clone", "--quiet", "--depth", "1", "--single-branch",
+                "--branch", clone_ref, "--", remote_url, context_dir,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=True,
+        )
+        head_proc = subprocess.run(
+            ["git", "-C", context_dir, "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        if (head_proc.stdout or "").strip().lower() != sha.lower():
+            raise RuntimeError(f"selected remote ref moved while preparing updater source: {ref}")
+        shutil.rmtree(os.path.join(context_dir, ".git"), ignore_errors=True)
         return context_dir
     except Exception:
         shutil.rmtree(context_dir, ignore_errors=True)
@@ -4621,6 +4606,7 @@ def _ensure_updater_image_for_sha(
     require_local_source: bool = False,
     source_ref: Optional[str] = None,
     source_sha: Optional[str] = None,
+    source_remote: str = "origin",
 ) -> str:
     lock = _updater_lock()
     with lock:
@@ -4660,7 +4646,12 @@ def _ensure_updater_image_for_sha(
             if source_ref:
                 if not source_sha:
                     raise HTTPException(status_code=500, detail=f"Failed to resolve updater source ref: {source_ref}")
-                build_context = _materialize_git_archive_context(build_root, source_ref, source_sha)
+                build_context = _materialize_remote_context(
+                    build_root,
+                    source_remote,
+                    source_ref,
+                    source_sha,
+                )
                 cleanup_context = build_context
                 source_label = "ref"
             # Avoid docker-py image build streaming decode issues by using Docker CLI.
@@ -4754,6 +4745,7 @@ def _ensure_updater_image_for_ref(
                 require_local_source=True,
                 source_ref=source_ref,
                 source_sha=source_sha,
+                source_remote=source_remote,
             )
         try:
             client.images.get(local_tag)
@@ -5019,51 +5011,41 @@ def _update_plan_failure_detail(
     quoted_ref = shlex.quote(ref)
     quoted_remote = shlex.quote(remote)
     update_remote_flag = "" if remote == "origin" else f"--remote {quoted_remote} "
-    release_ref = (ref or "").strip()
-    if _is_semver_tag(release_ref):
-        release_tag = release_ref if release_ref.startswith("v") else f"v{release_ref}"
-        version_env = f"AGENT_VERSION={shlex.quote(release_tag)} "
-        cli_bootstrap = (
-            "(\n"
-            "  set -o pipefail\n"
-            "  curl -sSL https://raw.githubusercontent.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/main/scripts/install-cli.sh \\\n"
-            f"    | sudo env {version_env}INSTALL_DIR=/usr/local/bin bash\n"
-            ') || { echo "Failed to install requested agent CLI; update not attempted" '
-            ">&2; exit 2; }\n"
-        )
-    else:
-        cli_bootstrap = (
-            f"AAVA_CLI_REF={quoted_ref}\n"
-            'AAVA_CLI_SRC="$(mktemp -d)" || { echo "Failed to create temporary CLI '
-            'build directory; update not attempted" >&2; exit 2; }\n'
-            "aava_cleanup_cli_source() { sudo rm -rf -- \"$AAVA_CLI_SRC\"; }\n"
-            "trap 'aava_cleanup_cli_source' EXIT\n"
-            "trap 'exit 129' HUP\n"
-            "trap 'exit 130' INT\n"
-            "trap 'exit 143' TERM\n"
-            f'AAVA_CLI_REMOTE="$(aava_git ls-remote --get-url {quoted_remote})" || {{ '
-            'echo "Failed to resolve '
-            'checkout origin for CLI source; update not attempted" >&2; exit 2; }\n'
-            'git clone --quiet --depth 1 --single-branch --branch "$AAVA_CLI_REF" '
-            '-- "$AAVA_CLI_REMOTE" '
-            '"$AAVA_CLI_SRC/repo" || { echo "Failed to fetch selected CLI source; '
-            'update not attempted" >&2; exit 2; }\n'
-            'mkdir -p "$AAVA_CLI_SRC/out" || exit 2\n'
-            'sudo docker run --rm -v "$AAVA_CLI_SRC/repo/cli:/src:ro" '
-            '-v "$AAVA_CLI_SRC/out:/out" -w /src -e HOME=/tmp '
-            '-e GOCACHE=/tmp/go-build -e GOMODCACHE=/tmp/go-mod '
-            '-e AAVA_CLI_VERSION="$AAVA_CLI_REF" golang:1.22-bookworm '
-            "bash -c 'go mod download && CGO_ENABLED=0 go build -buildvcs=false "
-            '-ldflags "-X main.version=$AAVA_CLI_VERSION" -o /out/agent ./cmd/agent\' '
-            '|| { echo "Failed to build CLI from selected ref; update not attempted" '
-            ">&2; exit 2; }\n"
-            'sudo install -m 0755 "$AAVA_CLI_SRC/out/agent" /usr/local/bin/agent '
-            '|| { echo "Failed to install selected-ref CLI; update not attempted" '
-            ">&2; exit 2; }\n"
-            'aava_cleanup_cli_source || { echo "Failed to clean temporary CLI source" '
-            ">&2; exit 2; }\n"
-            "trap - EXIT HUP INT TERM\n"
-        )
+    cli_ref = (ref or "").strip()
+    if _is_semver_tag(cli_ref) and not cli_ref.startswith("v"):
+        cli_ref = f"v{cli_ref}"
+    cli_bootstrap = (
+        f"AAVA_CLI_REF={shlex.quote(cli_ref)}\n"
+        'AAVA_CLI_SRC="$(mktemp -d)" || { echo "Failed to create temporary CLI '
+        'build directory; update not attempted" >&2; exit 2; }\n'
+        "aava_cleanup_cli_source() { sudo rm -rf -- \"$AAVA_CLI_SRC\"; }\n"
+        "trap 'aava_cleanup_cli_source' EXIT\n"
+        "trap 'exit 129' HUP\n"
+        "trap 'exit 130' INT\n"
+        "trap 'exit 143' TERM\n"
+        f'AAVA_CLI_REMOTE="$(aava_git ls-remote --get-url {quoted_remote})" || {{ '
+        'echo "Failed to resolve selected remote for CLI source; update not attempted" '
+        '>&2; exit 2; }\n'
+        'git clone --quiet --depth 1 --single-branch --branch "$AAVA_CLI_REF" '
+        '-- "$AAVA_CLI_REMOTE" '
+        '"$AAVA_CLI_SRC/repo" || { echo "Failed to fetch selected CLI source; '
+        'update not attempted" >&2; exit 2; }\n'
+        'mkdir -p "$AAVA_CLI_SRC/out" || exit 2\n'
+        'sudo docker run --rm -v "$AAVA_CLI_SRC/repo/cli:/src:ro" '
+        '-v "$AAVA_CLI_SRC/out:/out" -w /src -e HOME=/tmp '
+        '-e GOCACHE=/tmp/go-build -e GOMODCACHE=/tmp/go-mod '
+        '-e AAVA_CLI_VERSION="$AAVA_CLI_REF" golang:1.22-bookworm '
+        "bash -c 'go mod download && CGO_ENABLED=0 go build -buildvcs=false "
+        '-ldflags "-X main.version=$AAVA_CLI_VERSION" -o /out/agent ./cmd/agent\' '
+        '|| { echo "Failed to build CLI from selected ref; update not attempted" '
+        '>&2; exit 2; }\n'
+        'sudo install -m 0755 "$AAVA_CLI_SRC/out/agent" /usr/local/bin/agent '
+        '|| { echo "Failed to install selected-ref CLI; update not attempted" '
+        '>&2; exit 2; }\n'
+        'aava_cleanup_cli_source || { echo "Failed to clean temporary CLI source" '
+        '>&2; exit 2; }\n'
+        "trap - EXIT HUP INT TERM\n"
+    )
     checkout_flag = "true" if checkout else "false"
     include_ui_flag = "true" if include_ui else "false"
 
