@@ -1063,8 +1063,8 @@ docker compose logs ai_engine | grep WARNING
 
 # Search for specific issues
 docker compose logs ai_engine | grep -i "underflow"
-docker logs ai_engine | grep -i "format"
-docker logs ai_engine | grep -i "error"
+docker compose logs ai_engine | grep -i "format"
+docker compose logs ai_engine | grep -i "error"
 ```
 
 ### Key Log Patterns
