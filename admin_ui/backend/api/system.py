@@ -28,7 +28,14 @@ def _validate_git_ref(ref: str) -> str:
     rely on `git` to enforce full refname rules.
     """
     r = (ref or "").strip()
-    if not r or r.startswith("-") or any(c.isspace() for c in r):
+    if (
+        not r
+        or r.startswith("-")
+        or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in r)
+        or any(token in r for token in ("..", "@{", "\\", ":", "~", "^", "?", "*", "["))
+        or r.endswith(("/", "."))
+        or "//" in r
+    ):
         raise HTTPException(status_code=400, detail="Invalid ref")
     return r
 
@@ -36,17 +43,22 @@ def _validate_git_ref(ref: str) -> str:
 _GIT_REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 
 
+def _validate_git_remote_name(remote: str) -> str:
+    value = (remote or "").strip()
+    if (
+        not _GIT_REMOTE_NAME_RE.fullmatch(value)
+        or value.endswith("/")
+        or ".." in value
+        or "@{" in value
+    ):
+        raise HTTPException(status_code=500, detail="Invalid configured update remote")
+    return value
+
+
 def _configured_update_remote() -> str:
     """Return the operator-selected Git remote used by every Admin update path."""
     remote = (os.getenv("AAVA_UPDATE_REMOTE") or "origin").strip()
-    if (
-        not _GIT_REMOTE_NAME_RE.fullmatch(remote)
-        or remote.endswith("/")
-        or ".." in remote
-        or "@{" in remote
-    ):
-        raise HTTPException(status_code=500, detail="Invalid configured update remote")
-    return remote
+    return _validate_git_remote_name(remote)
 
 
 def _configured_update_default_branch() -> str:
@@ -4261,11 +4273,7 @@ def _run_docker_with_updater_status(
 
 def _is_semver_tag(ref: str) -> bool:
     r = (ref or "").strip()
-    if not r:
-        return False
-    if r.startswith("v"):
-        r = r[1:]
-    return bool(re.match(r"^[0-9]+\.[0-9]+\.[0-9]+$", r))
+    return bool(re.fullmatch(r"v?[0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?", r))
 
 
 def _updater_prefer_pull_ref_for_update_target(ref: str) -> Optional[str]:
@@ -4490,7 +4498,18 @@ def _git_available() -> bool:
     return bool(shutil.which("git"))
 
 
-def _resolve_update_ref_sha(ref: str) -> Optional[str]:
+def _update_source_ref(remote: str, ref: str) -> tuple[str, str]:
+    """Return the exact fetch source and private destination for one update selector."""
+    safe_remote = _validate_git_remote_name(remote)
+    safe_ref = _validate_git_ref(ref)
+    namespace = f"refs/aava-update/remotes/{safe_remote}"
+    if _is_semver_tag(safe_ref):
+        tag = safe_ref if safe_ref.startswith("v") else f"v{safe_ref}"
+        return f"refs/tags/{tag}", f"{namespace}/tags/{tag}"
+    return f"refs/heads/{safe_ref}", f"{namespace}/heads/{safe_ref}"
+
+
+def _resolve_update_ref_sha(ref: str, remote: str = "origin") -> Optional[str]:
     """
     Resolve an update target ref to a commit SHA in the mounted project checkout.
 
@@ -4503,44 +4522,31 @@ def _resolve_update_ref_sha(ref: str) -> Optional[str]:
     build_root = os.getenv("PROJECT_ROOT", "/app/project")
     safe_dir = f"safe.directory={build_root}"
 
-    fetch_specs = []
-    if not _is_semver_tag(r):
-        fetch_specs.append(f"refs/heads/{r}:refs/remotes/origin/{r}")
-    fetch_specs.append(r)
-    for spec in fetch_specs:
-        try:
-            proc = subprocess.run(
-                ["git", "-c", safe_dir, "-C", build_root, "fetch", "-q", "origin", spec],
-                capture_output=True,
-                text=True,
-                timeout=90,
-            )
-            if proc.returncode == 0:
-                break
-        except Exception:
-            continue
-
-    candidates = [
-        f"refs/remotes/origin/{r}",
-        f"origin/{r}",
-        f"refs/heads/{r}",
-        r,
-        "FETCH_HEAD",
-    ]
-    for candidate in candidates:
-        try:
-            proc = subprocess.run(
-                ["git", "-c", safe_dir, "-C", build_root, "rev-parse", "--verify", f"{candidate}^{{commit}}"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-        except Exception:
-            continue
+    try:
+        fetch_source, fetched_ref = _update_source_ref(remote, r)
+        proc = subprocess.run(
+            [
+                "git", "-c", safe_dir, "-C", build_root, "fetch", "-q", "--no-tags",
+                remote, f"+{fetch_source}:{fetched_ref}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        if proc.returncode != 0:
+            return None
+        proc = subprocess.run(
+            ["git", "-c", safe_dir, "-C", build_root, "rev-parse", "--verify", f"{fetched_ref}^{{commit}}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
         if proc.returncode == 0:
             sha = (proc.stdout or "").strip()
             if re.fullmatch(r"[0-9a-fA-F]{40}", sha):
                 return sha.lower()
+    except Exception:
+        return None
     return None
 
 
@@ -4729,6 +4735,7 @@ def _ensure_updater_image_for_ref(
     prefer_pull_ref: Optional[str],
     allow_build: bool,
     source_ref: Optional[str] = None,
+    source_remote: str = "origin",
 ) -> str:
     """
     Ensure the updater image exists locally under `local_tag`.
@@ -4739,7 +4746,7 @@ def _ensure_updater_image_for_ref(
     client = docker.from_env()
     if not prefer_pull_ref:
         if allow_build:
-            source_sha = _resolve_update_ref_sha(source_ref or "") if source_ref else None
+            source_sha = _resolve_update_ref_sha(source_ref or "", source_remote) if source_ref else None
             tag = _updater_image_tag_for_sha(source_sha) if source_sha else local_tag
             return _ensure_updater_image_for_sha(
                 host_project_root,
@@ -4854,12 +4861,14 @@ def _run_updater_ephemeral(
         sha = _current_project_head_sha()
         tag = _updater_image_tag_for_sha(sha)
         source_ref = None if prefer_pull_ref else (env or {}).get("AAVA_UPDATE_REF")
+        source_remote = (env or {}).get("AAVA_UPDATE_REMOTE") or "origin"
         tag = _ensure_updater_image_for_ref(
             host_project_root,
             tag,
             prefer_pull_ref=prefer_pull_ref,
             allow_build=allow_build,
             source_ref=source_ref,
+            source_remote=source_remote,
         )
 
     client = docker.from_env()
@@ -4940,17 +4949,11 @@ def _run_updater_ephemeral(
             pass
 
 
-def _parse_semver_tag(tag: str) -> Optional[tuple[int, int, int]]:
+def _parse_semver_tag(tag: str) -> Optional[tuple[int, ...]]:
     tag = (tag or "").strip()
-    if not tag.startswith("v"):
+    if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?", tag):
         return None
-    parts = tag[1:].split(".")
-    if len(parts) < 3:
-        return None
-    try:
-        return int(parts[0]), int(parts[1]), int(parts[2])
-    except Exception:
-        return None
+    return tuple(int(part) for part in tag[1:].split("."))
 
 
 def _select_latest_v_tag(ls_remote_text: str) -> Optional[dict]:
@@ -5276,6 +5279,15 @@ async def updates_status(check_remote: bool = False, build_updater: bool = False
     - By default, this endpoint does NOT build the updater image and does NOT contact the remote.
     - The Updates page opts in by setting `check_remote=true` (and optionally `build_updater=true`).
     """
+    update_remote = _configured_update_remote()
+    default_branch = _configured_update_default_branch()
+    remote_identity = {
+        "name": update_remote,
+        "default_branch": default_branch,
+        "latest_tag": "",
+        "latest_tag_sha": "",
+    }
+
     if not build_updater and not check_remote:
         project_root = os.getenv("PROJECT_ROOT", "/app/project")
 
@@ -5316,14 +5328,12 @@ async def updates_status(check_remote: bool = False, build_updater: bool = False
         describe = head_sha[:12] if isinstance(head_sha, str) and head_sha not in ("", "unknown") else "unknown"
         return UpdateStatusResponse(
             local={"branch": branch, "head_sha": head_sha, "describe": describe},
-            remote=None,
+            remote=remote_identity,
             update_available=None,
             changelog_latest=None,
             error="Not checked",
         )
 
-    update_remote = _configured_update_remote()
-    default_branch = _configured_update_default_branch()
     quoted_remote = shlex.quote(update_remote)
 
     # Cache (best-effort)
@@ -5335,7 +5345,12 @@ async def updates_status(check_remote: bool = False, build_updater: bool = False
             cached = _UPDATES_STATUS_CACHE.get("data")
             checked_at = float(_UPDATES_STATUS_CACHE.get("checked_at") or 0.0)
             cached_remote = bool(_UPDATES_STATUS_CACHE.get("checked_remote"))
-        if not force and cached and (now - checked_at) < _UPDATES_STATUS_CACHE_TTL_SEC:
+        cached_identity = (cached or {}).get("remote") or {}
+        same_source = (
+            cached_identity.get("name") == update_remote
+            and cached_identity.get("default_branch") == default_branch
+        )
+        if not force and cached and same_source and (now - checked_at) < _UPDATES_STATUS_CACHE_TTL_SEC:
             if not check_remote or cached_remote:
                 return UpdateStatusResponse(**cached)
     except Exception:
@@ -5364,7 +5379,7 @@ async def updates_status(check_remote: bool = False, build_updater: bool = False
     except HTTPException as e:
         return UpdateStatusResponse(
             local={"branch": "unknown", "head_sha": "unknown", "describe": "unknown"},
-            remote=None,
+            remote=remote_identity,
             update_available=None,
             changelog_latest=None,
             error=(str(getattr(e, "detail", None) or "Local status unavailable"))[:400],
@@ -5372,7 +5387,7 @@ async def updates_status(check_remote: bool = False, build_updater: bool = False
     except Exception:
         return UpdateStatusResponse(
             local={"branch": "unknown", "head_sha": "unknown", "describe": "unknown"},
-            remote=None,
+            remote=remote_identity,
             update_available=None,
             changelog_latest=None,
             error="Local status unavailable",
@@ -5381,7 +5396,7 @@ async def updates_status(check_remote: bool = False, build_updater: bool = False
     if code != 0:
         return UpdateStatusResponse(
             local={"branch": "unknown", "head_sha": "unknown", "describe": "unknown"},
-            remote=None,
+            remote=remote_identity,
             update_available=None,
             changelog_latest=None,
             error="Local status unavailable (updater image not ready)",
@@ -5391,7 +5406,7 @@ async def updates_status(check_remote: bool = False, build_updater: bool = False
     if len(lines) < 3:
         return UpdateStatusResponse(
             local={"branch": "unknown", "head_sha": "unknown", "describe": "unknown"},
-            remote=None,
+            remote=remote_identity,
             update_available=None,
             changelog_latest=None,
             error="Local status unavailable (unexpected git output)",
@@ -5407,7 +5422,7 @@ async def updates_status(check_remote: bool = False, build_updater: bool = False
     if not check_remote:
         payload = {
             "local": {"branch": branch, "head_sha": head_sha, "describe": describe, "deployed_tag": deployed_tag},
-            "remote": None,
+            "remote": remote_identity,
             "update_available": None,
             "changelog_latest": None,
             "error": None,
@@ -5445,7 +5460,7 @@ async def updates_status(check_remote: bool = False, build_updater: bool = False
     if code2 != 0:
         payload = {
             "local": {"branch": branch, "head_sha": head_sha, "describe": describe, "deployed_tag": deployed_tag},
-            "remote": None,
+            "remote": remote_identity,
             "update_available": None,
             "changelog_latest": None,
             "error": "Remote unavailable (offline or blocked)",
@@ -5465,7 +5480,7 @@ async def updates_status(check_remote: bool = False, build_updater: bool = False
     if not latest:
         payload = {
             "local": {"branch": branch, "head_sha": head_sha, "describe": describe, "deployed_tag": deployed_tag},
-            "remote": None,
+            "remote": remote_identity,
             "update_available": None,
             "changelog_latest": None,
             "error": "No v* tags found on remote",
@@ -5483,11 +5498,24 @@ async def updates_status(check_remote: bool = False, build_updater: bool = False
 
     tag = latest["tag"]
     tag_sha = latest["sha"]
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", tag_sha or ""):
+        return UpdateStatusResponse(
+            local={"branch": branch, "head_sha": head_sha, "describe": describe, "deployed_tag": deployed_tag},
+            remote=remote_identity,
+            update_available=None,
+            changelog_latest=None,
+            error="Remote returned an invalid release object",
+        )
+    fetch_source, fetched_ref = _update_source_ref(update_remote, tag)
+    quoted_fetch_source = shlex.quote(fetch_source)
+    quoted_fetched_ref = shlex.quote(fetched_ref)
+    quoted_tag_sha = shlex.quote(tag_sha)
 
     rel_cmd = (
-        "cd \"$PROJECT_ROOT\"; "
-        f"git -c safe.directory=\"$PROJECT_ROOT\" fetch -q {quoted_remote} refs/tags/{tag}:refs/tags/{tag} >/dev/null 2>&1 || true; "
-        f"head='{head_sha.strip()}'; target='{tag_sha.strip()}'; "
+        "set -euo pipefail; cd \"$PROJECT_ROOT\"; "
+        f"git -c safe.directory=\"$PROJECT_ROOT\" fetch -q --no-tags {quoted_remote} "+
+        f"+{quoted_fetch_source}:{quoted_fetched_ref}; "
+        f"head={shlex.quote(head_sha.strip())}; target={quoted_tag_sha}; "
         "git -c safe.directory=\"$PROJECT_ROOT\" cat-file -e \"$target^{commit}\" >/dev/null 2>&1 || { echo unknown; exit 0; }; "
         "if [ \"$head\" = \"$target\" ]; then echo equal; exit 0; fi; "
         "git -c safe.directory=\"$PROJECT_ROOT\" merge-base --is-ancestor \"$head\" \"$target\" >/dev/null 2>&1 && { echo behind; exit 0; }; "
@@ -5534,8 +5562,9 @@ async def updates_status(check_remote: bool = False, build_updater: bool = False
             command=(
                 "set -euo pipefail; "
                 "cd \"$PROJECT_ROOT\"; "
-                f"git -c safe.directory=\"$PROJECT_ROOT\" fetch -q {quoted_remote} refs/tags/{tag}:refs/tags/{tag} >/dev/null 2>&1 || true; "
-                f"git -c safe.directory=\"$PROJECT_ROOT\" show {tag}:CHANGELOG.md 2>/dev/null || true"
+                f"git -c safe.directory=\"$PROJECT_ROOT\" fetch -q --no-tags {quoted_remote} "+
+                f"+{quoted_fetch_source}:{quoted_fetched_ref}; "
+                f"git -c safe.directory=\"$PROJECT_ROOT\" show {quoted_fetched_ref}:CHANGELOG.md"
             ),
             timeout_sec=20,
             prefer_pull_ref="latest",
@@ -5651,14 +5680,15 @@ async def updates_plan(
         "AAVA_UPDATE_CHECKOUT": "true" if checkout else "false",
         "AAVA_UPDATE_LOCAL_CHANGES": local_changes,
     }
-    # Capture stdout only so JSON output isn't polluted by installer/self-update hints on stderr.
+    # Build the updater from the exact selected remote commit. A same-named image tag
+    # published by another repository is not sufficient provenance for an update.
     code, out = await asyncio.to_thread(
         _run_updater_ephemeral,
         host_root,
         env=env,
         timeout_sec=120,
         capture_stderr=False,
-        prefer_pull_ref=_updater_prefer_pull_ref_for_update_target(ref),
+        prefer_pull_ref=None,
         allow_build=True,
     )
     if code != 0:
@@ -5786,17 +5816,15 @@ async def updates_run(body: UpdateRunRequest):
         except Exception as e:
             logger.exception("Failed to reserve update job: %s", e)
             raise HTTPException(status_code=500, detail="Failed to reserve update job")
-    # Stable releases can use published updater images; branch/main/custom targets build
-    # the updater from local source so branch-specific updater changes are exercised.
-    prefer_pull = _updater_prefer_pull_ref_for_update_target(ref)
     try:
         tag = await asyncio.to_thread(
             _ensure_updater_image_for_ref,
             host_root,
             tag,
-            prefer_pull_ref=prefer_pull,
+            prefer_pull_ref=None,
             allow_build=True,
-            source_ref=None if prefer_pull else ref,
+            source_ref=ref,
+            source_remote=update_remote,
         )
     except HTTPException as e:
         _mark_update_job_failed(job_id, str(e.detail))

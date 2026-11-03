@@ -57,6 +57,7 @@ async def test_updates_plan_uses_one_configured_remote_and_default_branch(monkey
     assert response.plan["active_calls"] == 0
     assert captured["env"]["AAVA_UPDATE_REMOTE"] == "public"
     assert captured["env"]["AAVA_UPDATE_REF"] == "bajaj/maintained"
+    assert captured["prefer_pull_ref"] is None
 
 
 @pytest.mark.asyncio
@@ -105,6 +106,58 @@ def test_update_local_changes_validation_rejects_unknown_mode() -> None:
 )
 def test_updater_pull_preference_only_for_release_targets(ref: str, expected: str | None) -> None:
     assert system._updater_prefer_pull_ref_for_update_target(ref) == expected
+
+
+@pytest.mark.parametrize("ref", ["v7.7.4.3-extra", "v7.7.4.3;touch-x", "v7.7", "release-v7.7.4"])
+def test_release_tag_detection_rejects_partial_or_suffixed_values(ref: str) -> None:
+    assert system._is_semver_tag(ref) is False
+    assert system._parse_semver_tag(ref) is None
+
+
+def test_resolve_update_ref_uses_source_specific_namespace(monkeypatch, tmp_path) -> None:
+    calls: list[list[str]] = []
+    expected_sha = "a" * 40
+
+    def fake_run(args, **_kwargs):
+        calls.append(args)
+        if "rev-parse" in args:
+            return subprocess.CompletedProcess(args, 0, stdout=f"{expected_sha}\n", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setattr(system, "_git_available", lambda: True)
+    monkeypatch.setattr(system.subprocess, "run", fake_run)
+
+    assert system._resolve_update_ref_sha("bajaj/maintained", "public") == expected_sha
+    fetch = calls[0]
+    assert fetch[-2:] == ["public", "+refs/heads/bajaj/maintained:refs/aava-update/remotes/public/heads/bajaj/maintained"]
+    assert all("refs/remotes/origin" not in arg for call in calls for arg in call)
+
+
+@pytest.mark.asyncio
+async def test_updates_status_preserves_configured_source_when_remote_has_no_tags(monkeypatch, tmp_path) -> None:
+    outputs = iter(
+        [
+            (0, "bajaj/maintained\n" + "a" * 40 + "\nv7.7.4.3\nv7.7.4.3\n"),
+            (0, ""),
+        ]
+    )
+
+    monkeypatch.setenv("AAVA_UPDATE_REMOTE", "public")
+    monkeypatch.setenv("AAVA_UPDATE_DEFAULT_BRANCH", "bajaj/maintained")
+    monkeypatch.setattr(system, "_project_host_root_from_admin_ui_container", lambda: str(tmp_path))
+    monkeypatch.setattr(system, "_run_updater_ephemeral", lambda *_args, **_kwargs: next(outputs))
+    system._UPDATES_STATUS_CACHE.clear()
+
+    response = await system.updates_status(check_remote=True, force=True)
+
+    assert response.remote == {
+        "name": "public",
+        "default_branch": "bajaj/maintained",
+        "latest_tag": "",
+        "latest_tag_sha": "",
+    }
+    assert response.error == "No v* tags found on remote"
 
 
 @pytest.mark.parametrize(
