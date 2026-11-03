@@ -76,12 +76,12 @@ Download the appropriate binary for your platform from the maintained fork's
 **Linux:**
 ```bash
 # Most servers (x86_64)
-curl -L -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.5/agent-linux-amd64
+curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.5/agent-linux-amd64
 chmod +x agent
 sudo mv agent /usr/local/bin/
 
 # ARM64 (Raspberry Pi, AWS Graviton)
-curl -L -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.5/agent-linux-arm64
+curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.5/agent-linux-arm64
 chmod +x agent
 sudo mv agent /usr/local/bin/
 ```
@@ -89,10 +89,10 @@ sudo mv agent /usr/local/bin/
 **macOS:**
 ```bash
 # Intel Macs
-curl -L -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.5/agent-darwin-amd64
+curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.5/agent-darwin-amd64
 
 # Apple Silicon (M1/M2/M3)
-curl -L -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.5/agent-darwin-arm64
+curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.5/agent-darwin-arm64
 
 chmod +x agent
 sudo mv agent /usr/local/bin/
@@ -1043,21 +1043,25 @@ agent troubleshoot --last --symptom <no-audio|garbled|echo|interruption|one-way>
 ### Manual Log Review
 
 ```bash
+# Run these commands from deploy/docker so Compose selects the package's
+# `ava-ai-engine` container through its `ai_engine` service name.
+cd deploy/docker
+
 # Recent logs (last hour)
-docker logs --since 1h ai_engine
+docker compose logs --since 1h ai_engine
 
 # Follow logs in real-time
-docker logs -f ai_engine
+docker compose logs -f ai_engine
 
 # Search for specific call
-docker logs ai_engine | grep "1761424308.2043"
+docker compose logs ai_engine | grep "1761424308.2043"
 
 # Filter by level
-docker logs ai_engine | grep ERROR
-docker logs ai_engine | grep WARNING
+docker compose logs ai_engine | grep ERROR
+docker compose logs ai_engine | grep WARNING
 
 # Search for specific issues
-docker logs ai_engine | grep -i "underflow"
+docker compose logs ai_engine | grep -i "underflow"
 docker logs ai_engine | grep -i "format"
 docker logs ai_engine | grep -i "error"
 ```
