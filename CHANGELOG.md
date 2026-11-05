@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.7.4.6] - 2026-11-04
+
+### Changed
+
+- **Upstream audio catch-up (#811):** merge upstream commit `66b38654` into
+  the maintained line, connecting its Asterisk-owned WebSocket output pacing,
+  OpenAI audio-tail preservation, Grok playback fences, operator controls,
+  regression coverage, and rollback guidance to the fork's existing private
+  audio and caller-wait behavior. The default pacing mode remains `legacy`.
+
 ## [7.7.4.5] - 2026-11-03
 
 ### Changed

@@ -1,6 +1,6 @@
 # Agent CLI Tools Guide
 
-Operator reference for the `agent` command prepared for the maintained fork release v7.7.4.5.
+Operator reference for the `agent` command prepared for the maintained fork release v7.7.4.6.
 
 Run commands from the repository root on the Docker Compose host. Global flags are `--verbose` and `--no-color`.
 
@@ -21,7 +21,7 @@ Run commands from the repository root on the Docker Compose host. Global flags a
 The normal project installer includes the CLI. To install only a released binary on Linux or macOS:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/v7.7.4.5/scripts/install-cli.sh | AGENT_VERSION=v7.7.4.5 bash
+curl -sSL https://raw.githubusercontent.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/v7.7.4.6/scripts/install-cli.sh | AGENT_VERSION=v7.7.4.6 bash
 agent version
 ```
 
@@ -151,7 +151,7 @@ Apply an update:
 
 ```bash
 agent update
-agent update --ref v7.7.4.5
+agent update --ref v7.7.4.6
 agent update --checkout --ref main
 agent update --rebuild auto
 agent update --rebuild none
