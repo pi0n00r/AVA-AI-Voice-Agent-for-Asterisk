@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.7.4.7] - 2026-11-06
+
 ### Added
 
 - **A2A agent delegation:** add an optional YAML-configured in-call tool that
