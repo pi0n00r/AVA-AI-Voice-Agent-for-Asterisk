@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A2A agent delegation:** add an optional YAML-configured in-call tool that
+  delegates one bounded text request to a separately deployed Agent2Agent 1.0
+  service through the official SDK. Agent Card discovery is public; authenticated
+  task traffic stays on the configured origin, credentials come only from the
+  Engine environment, and uncertain requests are never retried automatically.
+  Keep other tools available when an A2A entry is invalid at startup or Admin
+  cannot reach the Engine. Cancel known remote work on Google Live teardown
+  and preserve uncertain outcomes when a task connection is lost.
+
 ## [7.7.4.6] - 2026-11-04
 
 ### Changed
@@ -49,6 +60,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an unrelated upstream release installer.
 
 ### Fixed
+
+- **Local config comments (#809):** Admin UI saves keep the comments an
+  operator wrote in `config/ai-agent.local.yaml` instead of rewriting the file
+  without them. Comments stay with their keys and the file keeps its indents.
+  Comments between list items are lost when that list changes. A save that
+  migrates an inline secret, encounters environment variable references, or
+  cannot verify the round trip writes the plain YAML dump. The setup wizard
+  performs the rewrite in a worker thread.
 
 - **Streaming playback (#808):** add opt-in Asterisk-owned WebSocket pacing
   (`websocket_media.output_pacing: asterisk`, default remains `legacy`), retaining
