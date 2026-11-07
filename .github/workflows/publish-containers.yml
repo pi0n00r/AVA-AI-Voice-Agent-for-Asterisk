@@ -7,6 +7,20 @@ name: Publish Docker images
 
 on:
   workflow_dispatch:
+    inputs:
+      release_version:
+        description: Existing release tag to add to immutable SHA images (for example, v7.7.4.7)
+        required: false
+        type: string
+      source_sha:
+        description: Full 40-character commit SHA identifying existing sha-* images
+        required: false
+        type: string
+      mark_latest:
+        description: Also point latest at the same immutable images
+        required: false
+        default: true
+        type: boolean
   pull_request:
     branches: [bajaj/maintained]
     paths:
@@ -39,7 +53,6 @@ on:
       - scripts/build_docker_bundle.py
       - scripts/model_setup.sh
       - src/**
-      - .github/workflows/publish-containers.yml
 
 permissions:
   contents: read
@@ -47,6 +60,7 @@ permissions:
 
 jobs:
   validate:
+    if: github.event_name != 'workflow_dispatch' || inputs.release_version == ''
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -81,6 +95,7 @@ jobs:
 
   publish:
     needs: validate
+    if: github.event_name != 'workflow_dispatch' || inputs.release_version == ''
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -126,6 +141,45 @@ jobs:
           platforms: linux/amd64
           provenance: mode=max
           sbom: true
+
+  retag-release:
+    if: github.event_name == 'workflow_dispatch' && inputs.release_version != ''
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Alias immutable release images
+        env:
+          OWNER: ${{ github.repository_owner }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          MARK_LATEST: ${{ inputs.mark_latest }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*$ ]]; then
+            echo "Invalid release_version: $RELEASE_VERSION" >&2
+            exit 1
+          fi
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "source_sha must be a full lowercase commit SHA" >&2
+            exit 1
+          fi
+
+          for name in ava-ai-engine ava-admin-ui ava-local-ai ava-starter-asterisk; do
+            source="ghcr.io/${OWNER}/${name}:sha-${SOURCE_SHA}"
+            versioned="ghcr.io/${OWNER}/${name}:${RELEASE_VERSION}"
+            tags=(--tag "$versioned")
+            if [ "$MARK_LATEST" = "true" ]; then
+              tags+=(--tag "ghcr.io/${OWNER}/${name}:latest")
+            fi
+            docker buildx imagetools inspect "$source" >/dev/null
+            docker buildx imagetools create "${tags[@]}" "$source"
+            docker buildx imagetools inspect "$versioned"
+          done
 
   smoke-starter:
     if: github.event_name == 'push'
