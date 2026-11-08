@@ -19263,6 +19263,17 @@ class Engine:
                                 pass
 
                         except _PipelinePlaybackInterrupted:
+                            # Preserve the request and generated text for audit without
+                            # presenting interrupted speech as delivered conversation.
+                            conversation_history.append(_ts_msg("user", transcript_text))
+                            conversation_history.append(_ts_msg(
+                                "assistant",
+                                "[Response interrupted; delivery incomplete.]",
+                                delivery_status="interrupted",
+                                generated_text=full_response_text.strip(),
+                            ))
+                            session.conversation_history = list(conversation_history)
+                            await self.session_store.upsert_call(session)
                             logger.info(
                                 "Pipeline streaming turn interrupted; discarding remaining TTS",
                                 call_id=call_id,

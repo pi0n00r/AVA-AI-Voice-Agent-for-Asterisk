@@ -1737,7 +1737,7 @@ async def test_overlap_teardown_settles_model_and_tts_including_flush(
 
 
 @pytest.mark.asyncio
-async def test_overlap_interruption_closes_suspended_generators_not_replacement_stream(monkeypatch):
+async def test_overlap_interruption_closes_suspended_generators_not_replacement_stream(monkeypatch, tmp_path):
     engine, session, stt, llm, tts, manager = await _start_controlled_overlap(monkeypatch)
     original_put = engine._put_pipeline_stream_chunk
 
@@ -1755,6 +1755,35 @@ async def test_overlap_interruption_closes_suspended_generators_not_replacement_
         assert manager.stops == []
         assert manager.is_stream_active(session.call_id, "replacement-stream")
         assert llm.serial_calls == 0
+        retained = session.conversation_history[-2:]
+        assert retained[0]["role"] == "user"
+        assert retained[0]["content"] == "please answer this question"
+        assert retained[1]["delivery_status"] == "interrupted"
+        assert retained[1]["generated_text"] == "Hello."
+        assert retained[1]["content"] == "[Response interrupted; delivery incomplete.]"
+        from src.engine import _sanitize_for_llm
+        projected = _sanitize_for_llm(retained)
+        assert projected == [
+            {"role": "user", "content": "please answer this question"},
+            {"role": "assistant", "content": "[Response interrupted; delivery incomplete.]"},
+        ]
+        stored = await engine.session_store.get_by_call_id(session.call_id)
+        assert stored.conversation_history[-2:] == retained
+        from datetime import datetime, timezone
+        from src.core.call_history import CallHistoryStore, CallRecord
+        monkeypatch.setenv("CALL_HISTORY_ENABLED", "true")
+        db_path = str(tmp_path / "interrupted.db")
+        history = CallHistoryStore(db_path=db_path)
+        assert await history.save(CallRecord(
+            call_id=session.call_id,
+            start_time=datetime.now(timezone.utc),
+            end_time=datetime.now(timezone.utc),
+            conversation_history=stored.conversation_history,
+        ))
+        reopened = CallHistoryStore(db_path=db_path)
+        durable = await reopened.get_by_call_id(session.call_id)
+        assert durable.conversation_history[-2:] == retained
+        assert _sanitize_for_llm(durable.conversation_history[-2:]) == projected
     finally:
         await engine._cleanup_call(session.call_id)
 

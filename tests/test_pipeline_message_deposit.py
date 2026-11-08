@@ -2,6 +2,8 @@
 # AI-NOTICE:License=AGPL-3.0-or-later
 # AI-NOTICE:Project=Ava
 
+import pytest
+
 from src.core.pipeline_message_deposit import PipelineMessageDepositGuard
 
 
@@ -548,3 +550,33 @@ def test_referenced_request_does_not_change_executing_or_reconciling_attempt():
         "call-uncertain", "Leave that message for Priya.", enabled=True,
     ).kind == "pass"
     assert guard.snapshot("call-uncertain")["phase"] == "reconciling"
+
+
+
+@pytest.mark.parametrize("utterance", ["Take down the memo.", "Take a note.", "Please take down a message."])
+def test_memo_request_uses_recipient_readback_and_confirmation(utterance):
+    guard = PipelineMessageDepositGuard()
+    assert guard.decide("memo", utterance, enabled=True).kind == "speak"
+    assert guard.snapshot("memo")["phase"] == "awaiting_target"
+    guard.decide("memo", "Gary", enabled=True)
+    readback = guard.decide("memo", "The sky is red.", enabled=True)
+    assert "The sky is red." in readback.text
+    with pytest.raises(ValueError, match="not_confirmed"):
+        guard.consume_confirmed_tool_parameters("memo", {})
+    guard.decide("memo", "Yes.", enabled=True)
+    assert guard.consume_confirmed_tool_parameters("memo", {}) == {
+        "target": "Gary", "message": "The sky is red.",
+    }
+
+
+@pytest.mark.parametrize("utterance", ["I read the memo.", "The memo says take a note.", "Take down the picture.", "The memo says take a note for Gary.", "Do not take a note for Gary.", "Take a note to buy milk."])
+def test_memo_mentions_do_not_start_deposit(utterance):
+    guard = PipelineMessageDepositGuard()
+    assert guard.decide("mention", utterance, enabled=True).kind == "pass"
+    assert guard.snapshot("mention") is None
+
+
+def test_memo_request_does_not_override_disabled_tool():
+    guard = PipelineMessageDepositGuard()
+    assert guard.decide("disabled", "Take down the memo.", enabled=False).kind == "pass"
+    assert guard.snapshot("disabled") is None

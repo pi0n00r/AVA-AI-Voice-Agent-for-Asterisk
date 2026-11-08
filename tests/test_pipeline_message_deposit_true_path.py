@@ -144,7 +144,7 @@ class _MemoRequestLLM(LLMComponent):
         self.calls += 1
         assert not self.supports_streaming
         assert self.calls == 1
-        assert transcript == "Take a memo."
+        assert transcript == "I need to dictate a memo."
         return LLMResponse(text="", tool_calls=self._tool_calls())
 
     @staticmethod
@@ -159,7 +159,7 @@ class _MemoRequestLLM(LLMComponent):
         self.stream_calls += 1
         assert self.supports_streaming
         assert self.stream_calls == 1
-        assert transcript == "Take a memo."
+        assert transcript == "I need to dictate a memo."
         self._pending_tool_calls_by_call[call_id] = self._tool_calls()
         if False:
             yield ""
@@ -262,6 +262,7 @@ async def _wait_until(predicate, timeout=3.0):
         (False, False, "success"),
         (True, False, "success"),
         (False, True, "success"),
+        (False, True, "memo-request"),
         (False, True, "observed-truncated-request"),
         (False, True, "cancel"),
         (False, True, "http-failure"),
@@ -276,7 +277,7 @@ async def _wait_until(predicate, timeout=3.0):
         (False, True, "semantic-memo-streaming"),
     ],
     ids=[
-        "legacy-primary", "legacy-followup", "main-direct-confirmation",
+        "legacy-primary", "legacy-followup", "main-direct-confirmation", "main-memo-request",
         "main-observed-truncated-request",
         "main-pending-cancel", "main-http-failure", "main-invalid-direct-result",
         "main-barge-in-pending",
@@ -628,7 +629,7 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
     await asyncio.wait_for(inbound_handler_seen.wait(), timeout=2)
 
     if semantic_memo:
-        await stt.results.put("Take a memo.")
+        await stt.results.put("I need to dictate a memo.")
         await _wait_until(lambda: "Of course. What would you like me to record for Gary?" in tts.texts)
         await _wait_until(lambda: not engine.streaming_playback_manager.active_streams)
         assert requests == []
@@ -651,6 +652,8 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
     else:
         if observed_truncated_request:
             request_text = "elect to leave a message."
+        elif outcome == "memo-request":
+            request_text = "Take down the memo."
         elif direct_confirmation:
             request_text = "I'd like to leave a message."
         else:
@@ -831,7 +834,7 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
         "Thanks. I'll make sure they get it." if outcome == "barge-in-pending"
         else "I'll make sure Gary gets it." if outcome in {
             "success", "terminal-tts-correction", "terminal-tts-unchanged-retry",
-            "observed-truncated-request",
+            "observed-truncated-request", "memo-request",
             "barge-in-terminal-absence", "prior-reference-serial", "prior-reference-streaming",
             "semantic-memo", "semantic-memo-streaming",
         }
@@ -906,7 +909,7 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
     assert "Never speak this as success." not in tts.texts
     if outcome not in {
         "success", "barge-in-pending", "terminal-tts-correction", "terminal-tts-unchanged-retry",
-        "observed-truncated-request",
+        "observed-truncated-request", "memo-request",
         "barge-in-terminal-absence", "prior-reference-serial", "prior-reference-streaming",
         "semantic-memo", "semantic-memo-streaming",
     }:
@@ -949,7 +952,7 @@ async def test_exact_pipeline_worker_uses_local_http_and_real_audiosocket(
 
     if outcome in {
         "success", "barge-in-pending", "terminal-tts-correction", "terminal-tts-unchanged-retry",
-        "observed-truncated-request",
+        "observed-truncated-request", "memo-request",
         "barge-in-terminal-absence", "prior-reference-serial", "prior-reference-streaming",
         "semantic-memo", "semantic-memo-streaming",
     }:

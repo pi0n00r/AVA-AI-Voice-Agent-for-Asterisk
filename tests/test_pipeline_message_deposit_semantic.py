@@ -20,7 +20,7 @@ def test_semantic_draft_requires_fresh_confirmation_and_preserves_caller_words()
         guard.consume_confirmed_tool_parameters("call-a", {})
 
 
-@pytest.mark.parametrize("utterance", ["Take a memo.", "Please take down a note.", "I need to dictate something."])
+@pytest.mark.parametrize("utterance", ["I need to dictate a memo.", "Please record my words.", "I need to dictate something."])
 def test_semantic_start_needs_no_literal_trigger_or_ai_after_selection(utterance):
     guard = PipelineMessageDepositGuard()
     guard.decide("call-a", utterance, enabled=True)
@@ -73,7 +73,7 @@ def test_semantic_draft_cannot_replace_pending_confirmed_or_inflight_attempt():
 
 def test_semantic_recipient_stays_audible_through_correction_and_cancel():
     guard = PipelineMessageDepositGuard()
-    guard.decide("call-a", "Take a memo.", enabled=True)
+    guard.decide("call-a", "I need to dictate a memo.", enabled=True)
     prompt = guard.propose_caller_message("call-a", {"target": "Gary", "message": ""})
     assert "for Gary" in prompt.text
     guard.decide("call-a", "The sky is blue.", enabled=True)

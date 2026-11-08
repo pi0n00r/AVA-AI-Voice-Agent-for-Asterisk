@@ -32,7 +32,7 @@ _MESSAGE_REQUEST_RE = re.compile(
 _MESSAGE_REQUEST_WITHOUT_TARGET_RE = re.compile(
     r"^(?:i(?:'d| would)?\s+like\s+to\s+|i\s+want\s+to\s+|"
     r"can\s+i\s+|could\s+i\s+|may\s+i\s+|please\s+)?"
-    r"(?:leave|give|take)\s+(?:a\s+)?message"
+    r"(?:leave|give|take(?:\s+down)?)\s+(?:(?:a|the)\s+)?(?:message|memo|note)"
     r"(?:\s+please)?[.!?]*$",
     re.IGNORECASE,
 )
