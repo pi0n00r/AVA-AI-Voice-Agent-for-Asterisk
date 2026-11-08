@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.7.4.8] - 2026-11-07
+
+### Changed
+
+- **Upstream A2A acceptance:** reconnect the maintained A2A implementation to
+  upstream's merged PR #815 while retaining the fork's final lifecycle,
+  cancellation, deadline, origin-pinning, and Admin configuration corrections.
+- **Immutable container aliases:** allow an existing release tag and `latest`
+  alias to be attached to already-built SHA images without rebuilding or
+  changing their source identity.
+
 ## [7.7.4.7] - 2026-11-06
 
 ### Added
