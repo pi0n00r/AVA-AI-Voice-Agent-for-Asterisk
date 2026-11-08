@@ -59,7 +59,7 @@ The `agent` CLI tools are available as pre-built binaries for easy installation 
 ### Quick Install (Linux/macOS)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/v7.7.4.7/scripts/install-cli.sh | AGENT_VERSION=v7.7.4.7 bash
+curl -sSL https://raw.githubusercontent.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/v7.7.4.8/scripts/install-cli.sh | AGENT_VERSION=v7.7.4.8 bash
 ```
 
 This will:
@@ -71,17 +71,17 @@ This will:
 ### Manual Installation
 
 Download the appropriate binary for your platform from the maintained fork's
-[v7.7.4.7 release](https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/tag/v7.7.4.7):
+[v7.7.4.8 release](https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/tag/v7.7.4.8):
 
 **Linux:**
 ```bash
 # Most servers (x86_64)
-curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.7/agent-linux-amd64 && \
+curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.8/agent-linux-amd64 && \
   chmod +x agent && \
   sudo mv agent /usr/local/bin/
 
 # ARM64 (Raspberry Pi, AWS Graviton)
-curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.7/agent-linux-arm64 && \
+curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.8/agent-linux-arm64 && \
   chmod +x agent && \
   sudo mv agent /usr/local/bin/
 ```
@@ -89,19 +89,19 @@ curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/rel
 **macOS:**
 ```bash
 # Intel Macs
-curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.7/agent-darwin-amd64 && \
+curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.8/agent-darwin-amd64 && \
   chmod +x agent && \
   sudo mv agent /usr/local/bin/
 
 # Apple Silicon (M1/M2/M3)
-curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.7/agent-darwin-arm64 && \
+curl -fL -o agent https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/download/v7.7.4.8/agent-darwin-arm64 && \
   chmod +x agent && \
   sudo mv agent /usr/local/bin/
 ```
 
 **Windows:**
 Download `agent-windows-amd64.exe` from the maintained fork's
-[v7.7.4.7 release](https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/tag/v7.7.4.7)
+[v7.7.4.8 release](https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/releases/tag/v7.7.4.8)
 and add it to your PATH.
 
 ### Verify Installation
