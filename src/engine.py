@@ -211,6 +211,12 @@ PIPELINE_STT_ENCODING = "linear16"
 PIPELINE_STT_CHANNELS = 1
 PIPELINE_STT_BYTES_PER_SAMPLE = 2
 CONNECTION_AUDIO_HANDOFF_TIMEOUT_SECONDS = 10.0
+# Per-frame mean subtraction on inbound AudioSocket audio. It has not run since
+# v5.1.7 (an audioop scope bug) and stays off: subtracting each 20 ms frame's
+# mean leaves a step at every frame edge, measured at -15 to -30 dB relative
+# to speech on recordings that carry no DC. A proper DC blocker is a candidate
+# follow-up.
+INBOUND_DC_REMOVAL_ENABLED = False
 OUTBOUND_ATTEMPT_STALE_SECONDS_DEFAULT = 120.0
 # Keep lead context comfortably below practical ARI/dialplan payload limits.
 # The same canonical JSON is used for originate, post-answer confirmation, and
@@ -721,6 +727,10 @@ class Engine:
         self._outbound_forced_hangup_tasks: Dict[str, asyncio.Task] = {}
         self._deferred_predial_forced_hangup_tasks: Dict[str, asyncio.Task] = {}
         self._deferred_transfer_recovery_tasks: Dict[str, asyncio.Task] = {}
+        # Silent-reply watchdog per call: {"action_id": ..., "task": asyncio.Task}.
+        self._deferred_transfer_watchdogs: Dict[str, Dict[str, Any]] = {}
+        # Action ids with a commit in flight per call, so a late re-arm is ignored.
+        self._deferred_transfer_commit_actions: Dict[str, List[Any]] = {}
         # Local TTS farewells are a two-step exchange: execute hangup_call,
         # then wait for Local AI Server to synthesize the tool's farewell.
         # Keep that boundary separate from cleanup_after_tts so a stale
@@ -1442,6 +1452,21 @@ class Engine:
         attended_cfg = tools_cfg.get("attended_transfer") if isinstance(tools_cfg, dict) else None
         return attended_cfg if isinstance(attended_cfg, dict) else {}
 
+    def _attended_transfer_config_for_session(self, session: Optional[CallSession]) -> Dict[str, Any]:
+        """Attended-transfer settings for this call.
+
+        The attended_transfer tool originates the leg from the call's tool
+        snapshot, so answer handling and recovery read the same snapshot. A
+        call without a snapshot falls back to the current tool generation,
+        then to the global config. With no session at all, the global config
+        applies.
+        """
+        if session is None:
+            return self._get_attended_transfer_config()
+        tools_cfg = self._tool_config_for_session(session).get("tools") or {}
+        attended_cfg = tools_cfg.get("attended_transfer") if isinstance(tools_cfg, dict) else None
+        return attended_cfg if isinstance(attended_cfg, dict) else {}
+
     @staticmethod
     def _session_was_transferred(session: Optional["CallSession"]) -> bool:
         if not session:
@@ -2051,13 +2076,22 @@ class Engine:
             )
         return ""
 
-    def _get_attended_transfer_helper_settings(self, attended_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _get_attended_transfer_helper_settings(
+        self,
+        attended_cfg: Optional[Dict[str, Any]] = None,
+        *,
+        server_bind_host: Optional[str] = None,
+    ) -> Dict[str, Any]:
         cfg = attended_cfg if isinstance(attended_cfg, dict) else self._get_attended_transfer_config()
         helper_cfg = cfg.get("external_media_helper") if isinstance(cfg.get("external_media_helper"), dict) else {}
         global_external = getattr(self.config, "external_media", None)
 
+        # Once the shared server exists, inherited advertise addresses must
+        # follow its actual bind rather than a potentially stale call snapshot.
+        # Explicit helper/global advertise addresses still take precedence for NAT.
         bind_host = str(
-            helper_cfg.get("bind_host")
+            server_bind_host
+            or helper_cfg.get("bind_host")
             or getattr(global_external, "rtp_host", None)
             or "0.0.0.0"
         ).strip() or "0.0.0.0"
@@ -5470,10 +5504,19 @@ class Engine:
         """Helper-leg RTP audio is currently ignored; DTMF stays on the SIP/PJSIP agent channel."""
         return
 
-    async def _ensure_attended_transfer_helper_rtp_server_started(self) -> Optional[RTPServer]:
+    async def _ensure_attended_transfer_helper_rtp_server_started(
+        self, *, streaming_requested: bool = False
+    ) -> Optional[RTPServer]:
+        """Start the shared helper RTP server once per process.
+
+        Startup starts it when the global config streams. A call whose own
+        settings stream passes ``streaming_requested`` to start it on demand.
+        Bind settings always come from the global config because one server
+        serves every call.
+        """
         if self.attended_transfer_rtp_server and getattr(self.attended_transfer_rtp_server, "running", False):
             return self.attended_transfer_rtp_server
-        if not self._attended_transfer_streaming_enabled():
+        if not streaming_requested and not self._attended_transfer_streaming_enabled():
             return None
 
         async with self._attended_transfer_helper_rtp_lock:
@@ -5532,7 +5575,21 @@ class Engine:
         agent_channel_id: str,
         attended_cfg: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
-        server = await self._ensure_attended_transfer_helper_rtp_server_started()
+        # Only reached when this call's settings stream. If the server cannot
+        # start (for example malformed global helper settings), treat it like
+        # an unavailable server so the handler's existing fallback (file
+        # playback, or stream-unavailable recovery) applies. Per-call port
+        # bind failures are handled further down, in the media setup below.
+        try:
+            server = await self._ensure_attended_transfer_helper_rtp_server_started(streaming_requested=True)
+        except Exception:
+            logger.warning(
+                "Attended transfer helper RTP server failed to start",
+                call_id=call_id,
+                agent_channel_id=agent_channel_id,
+                exc_info=True,
+            )
+            server = None
         if not server:
             logger.warning(
                 "Attended transfer helper RTP server unavailable",
@@ -5545,7 +5602,9 @@ class Engine:
         if existing:
             return existing
 
-        helper_settings = self._get_attended_transfer_helper_settings(attended_cfg)
+        helper_settings = self._get_attended_transfer_helper_settings(
+            attended_cfg, server_bind_host=server.host
+        )
         if not str(helper_settings.get("advertise_host") or "").strip():
             logger.error(
                 "Attended transfer helper streaming disabled because advertise_host could not be derived",
@@ -8357,6 +8416,27 @@ class Engine:
                 except Exception:
                     pass
 
+    def _attended_transfer_leg_retired(self, call_id: str, agent_channel_id: str) -> bool:
+        """True once leg end, cancel or caller cleanup has retired this leg."""
+        return self._attended_transfer_agent_channel_to_call_id.get(agent_channel_id) != call_id
+
+    async def _leave_retired_attended_transfer_leg(self, call_id: str, agent_channel_id: str, *, stage: str) -> None:
+        """Stop screening a retired leg; whoever retired it owns the caller's recovery.
+
+        Helper media created after the abort's own cleanup would otherwise leak,
+        so release it here too (the cleanup is idempotent).
+        """
+        logger.info(
+            "Attended transfer leg retired; leaving screening",
+            call_id=call_id,
+            channel_id=agent_channel_id,
+            stage=stage,
+        )
+        try:
+            await self._cleanup_attended_transfer_helper_media(agent_channel_id)
+        except Exception:
+            logger.debug("Failed to clean up attended transfer helper media for retired leg", call_id=call_id, agent_channel_id=agent_channel_id, exc_info=True)
+
     async def _wait_for_ari_playback(self, playback_id: str, *, timeout_sec: float) -> bool:
         try:
             loop = asyncio.get_running_loop()
@@ -9103,6 +9183,14 @@ class Engine:
             return None
         except asyncio.TimeoutError:
             return None
+        except asyncio.CancelledError:
+            # Retiring the leg cancels this waiter (destination hangup,
+            # cancel_transfer, caller cleanup). That ends the wait. Only a
+            # cancellation of this task itself propagates.
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
+            return None
         finally:
             self._attended_transfer_dtmf_waiters.pop(agent_channel_id, None)
 
@@ -9802,6 +9890,85 @@ class Engine:
             logger.debug("Local AI Server TTS failed", call_id=call_id, exc_info=True)
             return None
 
+    async def _attended_transfer_tts(
+        self,
+        *,
+        call_id: str,
+        text: str,
+        timeout_sec: float,
+        attended_cfg: Optional[Dict[str, Any]],
+        session: Optional[CallSession] = None,
+    ) -> Optional[bytes]:
+        """Synthesize mu-law 8 kHz attended-transfer audio.
+
+        Without ``tools.attended_transfer.tts_provider`` this is exactly the
+        Local AI Server path. With it, the named pipeline TTS component is
+        used through ``synthesize_once``. A failure returns None so the call
+        site keeps its existing abort or skip behaviour; it never falls back
+        to Local AI Server or another provider. Errors are logged by class
+        only because provider errors can carry URLs or credentials.
+        """
+        cfg = self._attended_transfer_tts_cfg(session, attended_cfg)
+        provider = str(cfg.get("tts_provider") or "").strip()
+        if not provider:
+            return await self._local_ai_server_tts(call_id=call_id, text=text, timeout_sec=timeout_sec)
+
+        orchestrator = getattr(self, "pipeline_orchestrator", None)
+        if orchestrator is None or not hasattr(orchestrator, "synthesize_once"):
+            logger.warning(
+                "attended_transfer_tts_failed",
+                call_id=call_id,
+                provider=provider,
+                error_type="OrchestratorUnavailable",
+            )
+            return None
+        tts_options = cfg.get("tts_options") if isinstance(cfg.get("tts_options"), dict) else None
+        timeout = max(0.1, float(timeout_sec))
+        try:
+            # The orchestrator owns the synthesis deadline and a separate
+            # cleanup budget. An outer deadline would discard valid audio
+            # while close_call/stop are still finishing.
+            audio = await orchestrator.synthesize_once(
+                provider,
+                call_id=f"attended-transfer:{call_id}",
+                text=text,
+                options=tts_options,
+                timeout_sec=timeout,
+            )
+        except Exception as exc:
+            logger.warning(
+                "attended_transfer_tts_failed",
+                call_id=call_id,
+                provider=provider,
+                error_type=exc.__class__.__name__,
+            )
+            return None
+        return audio or None
+
+    def _attended_transfer_tts_cfg(
+        self,
+        session: Optional[CallSession],
+        attended_cfg: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Return attended_cfg with ``tts_provider``/``tts_options`` from the call.
+
+        The tool prepares audio with the call's own tool config (including the
+        agent's ``tool_configs``), so the answer-time sites must use the same
+        two keys or the prepared audio is discarded. Without a session the
+        passed config is used as is.
+        """
+        cfg = dict(attended_cfg) if isinstance(attended_cfg, dict) else {}
+        if session is None:
+            return cfg
+        per_call = (self._tool_config_for_session(session).get("tools") or {}).get("attended_transfer")
+        per_call = per_call if isinstance(per_call, dict) else {}
+        for key in ("tts_provider", "tts_options"):
+            if key in per_call:
+                cfg[key] = per_call[key]
+            else:
+                cfg.pop(key, None)
+        return cfg
+
     async def _authenticate_local_ai_server_ws(
         self,
         *,
@@ -9895,6 +10062,183 @@ class Engine:
             logger.debug("Failed to play ulaw bytes on channel", channel_id=channel_id, exc_info=True)
             return None
 
+    def _render_attended_transfer_texts(
+        self,
+        session: CallSession,
+        attended_cfg: Dict[str, Any],
+        *,
+        effective_screening_mode: str,
+        screening_payload: Optional[Dict[str, Any]],
+        template_vars: Dict[str, Any],
+    ) -> Tuple[str, str]:
+        """Return the agent announcement and accept prompt for one attempt."""
+        default_announcement_template = "Hi, this is Ava. I'm transferring {caller_display} regarding {context_name}."
+        if effective_screening_mode == "caller_recording" and screening_payload and screening_payload.get("kind") == "caller_recording":
+            default_announcement_template = "Hi, this is Ava. Here is the caller's screening."
+
+        if effective_screening_mode == "ai_briefing":
+            announcement_template = str(
+                attended_cfg.get("ai_briefing_intro_template")
+                or "Hi, this is Ava. Here is a short summary of the caller."
+            )
+        else:
+            announcement_template = str(attended_cfg.get("announcement_template", default_announcement_template) or "")
+        prompt_template = str(
+            (
+                attended_cfg.get("agent_accept_prompt_template")
+                if "agent_accept_prompt_template" in attended_cfg
+                else attended_cfg.get("agent_accept_prompt")
+            )
+            or "Press 1 to accept this transfer, or 2 to decline."
+        )
+
+        # Treat blank templates as "use defaults" (UI may persist empty strings).
+        if not announcement_template.strip():
+            if effective_screening_mode == "caller_recording" and screening_payload and screening_payload.get("kind") == "caller_recording":
+                announcement_template = "Hi, this is Ava. Here is the caller's screening."
+            elif effective_screening_mode == "ai_briefing":
+                announcement_template = "Hi, this is Ava. Here is a short summary of the caller."
+            else:
+                announcement_template = "Hi, this is Ava. I'm transferring {caller_display} regarding {context_name}."
+        if not prompt_template.strip():
+            prompt_template = "Press 1 to accept, or 2 to decline."
+
+        announcement_text = self._apply_prompt_template_substitution(
+            announcement_template,
+            session,
+            extra_substitutions=template_vars,
+        )
+        prompt_text = self._apply_prompt_template_substitution(
+            prompt_template,
+            session,
+            extra_substitutions=template_vars,
+        )
+        return announcement_text, prompt_text
+
+    def _pre_synthesized_attended_audio(
+        self,
+        session: CallSession,
+        kind: str,
+        text: str,
+        attended_cfg: Optional[Dict[str, Any]],
+    ) -> Optional[bytes]:
+        """Return audio prepared before dialling when provider and text still match."""
+        cfg = self._attended_transfer_tts_cfg(session, attended_cfg)
+        provider = str(cfg.get("tts_provider") or "").strip()
+        if not provider:
+            return None
+        action = getattr(session, "current_action", None)
+        prepared = action.get("_pre_audio") if isinstance(action, dict) else None
+        entry = prepared.get(kind) if isinstance(prepared, dict) else None
+        if not isinstance(entry, dict) or entry.get("provider") != provider or entry.get("text") != text:
+            return None
+        audio = entry.get("audio")
+        return bytes(audio) if audio else None
+
+    async def prepare_attended_transfer_audio(
+        self,
+        *,
+        call_id: str,
+        destination_description: str,
+        attended_cfg: Optional[Dict[str, Any]],
+        attempt: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Synthesize attended-transfer audio before the agent leg is dialled.
+
+        Runs only when ``tts_provider`` is set; otherwise it returns True and
+        does nothing. The accept prompt is always prepared, and the
+        announcement in ``basic_tts`` and ``caller_recording``. In
+        ``ai_briefing`` the intro and briefing depend on text generated after
+        answer, so they are synthesized then. Audio is parked on the attempt
+        under ``_pre_audio`` with its provider and exact text; the answer
+        handler plays it only while both still match, and every leg may reuse
+        it. The texts are synthesized concurrently, each bounded by
+        ``tts_timeout_seconds``, while the caller is already on hold music.
+        Returns False when any synthesis fails or the attempt is no longer
+        current, so the caller is not dialled.
+        """
+        cfg = attended_cfg if isinstance(attended_cfg, dict) else {}
+        provider = str(cfg.get("tts_provider") or "").strip()
+        if not provider:
+            return True
+        session = await self.session_store.get_by_call_id(call_id)
+        action = getattr(session, "current_action", None) if session else None
+        if (
+            not session
+            or getattr(session, "cleanup_in_progress", False)
+            or not isinstance(action, dict)
+            or action.get("type") != "attended_transfer"
+            or (attempt is not None and action is not attempt)
+        ):
+            return False
+        cfg = self._attended_transfer_tts_cfg(session, cfg)
+        provider = str(cfg.get("tts_provider") or "").strip()
+        if not provider:
+            return True
+
+        screening_mode = self._resolve_attended_transfer_screening_mode(cfg)
+        template_vars = self._build_attended_transfer_template_vars(
+            session,
+            destination_description=destination_description,
+        )
+        announcement_text, prompt_text = self._render_attended_transfer_texts(
+            session,
+            cfg,
+            effective_screening_mode=screening_mode,
+            screening_payload=dict(action.get("screening_payload") or {}),
+            template_vars=template_vars,
+        )
+        texts: Dict[str, str] = {}
+        if screening_mode in {"basic_tts", "caller_recording"}:
+            texts["announcement"] = announcement_text
+        texts["prompt"] = prompt_text
+        tts_timeout = float(cfg.get("tts_timeout_seconds", 8) or 8)
+
+        # Synthesize concurrently so the caller's wait on hold is bounded by
+        # one tts_timeout_seconds, not one per text.
+        kinds = list(texts.keys())
+        results = await asyncio.gather(
+            *(
+                self._attended_transfer_tts(
+                    call_id=call_id,
+                    text=texts[kind],
+                    timeout_sec=tts_timeout,
+                    attended_cfg=cfg,
+                    session=session,
+                )
+                for kind in kinds
+            ),
+            return_exceptions=True,
+        )
+        prepared: Dict[str, Dict[str, Any]] = {}
+        for kind, audio in zip(kinds, results):
+            text = texts[kind]
+            if isinstance(audio, BaseException) or not audio:
+                logger.warning(
+                    "Attended transfer audio could not be prepared before dialling",
+                    call_id=call_id,
+                    provider=provider,
+                    kind=kind,
+                )
+                return False
+            prepared[kind] = {"provider": provider, "text": text, "audio": audio}
+
+        # The call may have ended during synthesis; never reinsert its session.
+        current = await self.session_store.get_by_call_id(call_id)
+        if (
+            current is not session
+            or session.current_action is not action
+            or getattr(session, "cleanup_in_progress", False)
+        ):
+            return False
+        action["_pre_audio"] = prepared
+        if not await self.session_store.upsert_call(session, require_current=True):
+            action.pop("_pre_audio", None)
+            return False
+        if self.conversation_coordinator:
+            await self.conversation_coordinator.sync_from_session(session)
+        return True
+
     async def _handle_attended_transfer_answered(self, channel_id: str, args: list):
         """
         Handle attended (warm) transfer agent leg entering Stasis on answer.
@@ -9919,9 +10263,16 @@ class Engine:
             await self.ari_client.hangup_channel(channel_id)
             return
 
-        tools_cfg = getattr(self.config, "tools", {}) or {}
-        attended_cfg = tools_cfg.get("attended_transfer") if isinstance(tools_cfg, dict) else None
-        if not isinstance(attended_cfg, dict) or not bool(attended_cfg.get("enabled", False)):
+        # Use the settings this call started with. The attended_transfer tool
+        # originated this leg from the same snapshot, so a config reload during
+        # the call cannot change the transfer's rules halfway through.
+        session_tools = self._tool_config_for_session(session).get("tools") or {}
+        if not isinstance(session_tools, dict):
+            session_tools = {}
+        attended_cfg = session_tools.get("attended_transfer")
+        if not isinstance(attended_cfg, dict):
+            attended_cfg = {}
+        if not bool(attended_cfg.get("enabled", False)):
             logger.info("Attended transfer disabled - hanging up agent channel", call_id=caller_id, channel_id=channel_id)
             self._unregister_attended_transfer_agent_channel(channel_id)
             await self.ari_client.hangup_channel(channel_id)
@@ -9946,7 +10297,7 @@ class Engine:
         except Exception:
             logger.debug("Failed to mark attended transfer answered", call_id=caller_id, exc_info=True)
 
-        transfer_cfg = tools_cfg.get("transfer") if isinstance(tools_cfg, dict) else None
+        transfer_cfg = session_tools.get("transfer")
         destinations = (transfer_cfg.get("destinations") or {}) if isinstance(transfer_cfg, dict) else {}
         dest_cfg = destinations.get(destination_key) if isinstance(destinations, dict) else None
         dest_desc = None
@@ -9969,24 +10320,47 @@ class Engine:
                 replacement="tools.attended_transfer.screening_mode=ai_briefing",
             )
         if screening_mode == "ai_briefing":
+            attempt = session.current_action
+
+            async def briefing_is_current() -> bool:
+                current_session = await self.session_store.get_by_call_id(caller_id)
+                return (
+                    current_session is session
+                    and not session.cleanup_in_progress
+                    and session.current_action is attempt
+                    and isinstance(attempt, dict)
+                    and not attempt.get("recovery_started")
+                    and not self._attended_transfer_leg_retired(caller_id, channel_id)
+                )
+
             briefing_text = await self._generate_attended_transfer_briefing_text(
                 session=session,
                 destination_description=dest_desc,
                 timeout_sec=ai_briefing_timeout,
                 briefing_language=ai_briefing_language or None,
             )
+            # Generation yields to hangup recovery, caller cleanup, or a newer
+            # attempt. Check ownership before persisting or playing its result;
+            # recovery relies on the original action object's identity.
+            if not await briefing_is_current():
+                await self._leave_retired_attended_transfer_leg(caller_id, channel_id, stage="briefing-generation")
+                return
             if briefing_text:
                 try:
-                    session.current_action = dict(session.current_action or {})
-                    session.current_action["screening_payload"] = {
+                    attempt["screening_payload"] = {
                         "kind": "ai_briefing",
                         "text": briefing_text,
                         "source": "local_ai_server",
                         "generated_at": time.time(),
                     }
-                    await self._save_session(session)
+                    await self._save_session(session, require_current=True)
                 except Exception:
                     logger.debug("Failed to persist attended transfer AI briefing", call_id=caller_id, exc_info=True)
+                # Saving can wait on the store lock or coordinator. Do not
+                # start announcement playback after ownership changed there.
+                if not await briefing_is_current():
+                    await self._leave_retired_attended_transfer_leg(caller_id, channel_id, stage="briefing-save")
+                    return
             else:
                 logger.warning(
                     "Attended transfer AI briefing unavailable; falling back to basic_tts",
@@ -10010,24 +10384,12 @@ class Engine:
             if not (isinstance(screening_payload, dict) and screening_payload.get("kind") == "ai_briefing" and str(screening_payload.get("text") or "").strip()):
                 effective_screening_mode = "basic_tts"
 
-        default_announcement_template = "Hi, this is Ava. I'm transferring {caller_display} regarding {context_name}."
-        if effective_screening_mode == "caller_recording" and screening_payload and screening_payload.get("kind") == "caller_recording":
-            default_announcement_template = "Hi, this is Ava. Here is the caller's screening."
-
-        if effective_screening_mode == "ai_briefing":
-            announcement_template = str(
-                attended_cfg.get("ai_briefing_intro_template")
-                or "Hi, this is Ava. Here is a short summary of the caller."
-            )
-        else:
-            announcement_template = str(attended_cfg.get("announcement_template", default_announcement_template) or "")
-        prompt_template = str(
-            (
-                attended_cfg.get("agent_accept_prompt_template")
-                if "agent_accept_prompt_template" in attended_cfg
-                else attended_cfg.get("agent_accept_prompt")
-            )
-            or "Press 1 to accept this transfer, or 2 to decline."
+        announcement_text, prompt_text = self._render_attended_transfer_texts(
+            session,
+            attended_cfg,
+            effective_screening_mode=effective_screening_mode,
+            screening_payload=screening_payload,
+            template_vars=template_vars,
         )
         caller_connected_prompt = str(attended_cfg.get("caller_connected_prompt", "") or "")
         accept_digit = str(attended_cfg.get("accept_digit", "1") or "1")
@@ -10043,28 +10405,6 @@ class Engine:
         tts_timeout = float(attended_cfg.get("tts_timeout_seconds", 8) or 8)
         stream_fallback_to_file = bool(attended_cfg.get("stream_fallback_to_file", True))
         use_streaming = self._attended_transfer_streaming_enabled(attended_cfg)
-
-        # Treat blank templates as "use defaults" (UI may persist empty strings).
-        if not announcement_template.strip():
-            if effective_screening_mode == "caller_recording" and screening_payload and screening_payload.get("kind") == "caller_recording":
-                announcement_template = "Hi, this is Ava. Here is the caller's screening."
-            elif effective_screening_mode == "ai_briefing":
-                announcement_template = "Hi, this is Ava. Here is a short summary of the caller."
-            else:
-                announcement_template = "Hi, this is Ava. I'm transferring {caller_display} regarding {context_name}."
-        if not prompt_template.strip():
-            prompt_template = "Press 1 to accept, or 2 to decline."
-
-        announcement_text = self._apply_prompt_template_substitution(
-            announcement_template,
-            session,
-            extra_substitutions=template_vars,
-        )
-        prompt_text = self._apply_prompt_template_substitution(
-            prompt_template,
-            session,
-            extra_substitutions=template_vars,
-        )
 
         logger.info(
             "🔀 ATTENDED TRANSFER - Agent answered, starting announcement",
@@ -10090,10 +10430,19 @@ class Engine:
                 await self._attended_transfer_abort_and_resume(session, channel_id, reason="stream-unavailable")
                 return
 
-        # Step A: Play one-way announcement to agent (hard requirement: Local AI Server TTS).
-        announcement_audio = await self._local_ai_server_tts(call_id=caller_id, text=announcement_text, timeout_sec=tts_timeout)
+        # Step A: Play one-way announcement to agent (Local AI Server TTS unless
+        # tools.attended_transfer.tts_provider names a pipeline TTS component).
+        announcement_audio = self._pre_synthesized_attended_audio(
+            session, "announcement", announcement_text, attended_cfg
+        ) or await self._attended_transfer_tts(
+            call_id=caller_id,
+            text=announcement_text,
+            timeout_sec=tts_timeout,
+            attended_cfg=attended_cfg,
+            session=session,
+        )
         if not announcement_audio:
-            logger.warning("Attended transfer requires Local AI Server TTS; aborting", call_id=caller_id)
+            logger.warning("Attended transfer announcement TTS unavailable; aborting", call_id=caller_id)
             await self._attended_transfer_abort_and_resume(session, channel_id, reason="tts-unavailable")
             return
 
@@ -10150,7 +10499,13 @@ class Engine:
                 await self._attended_transfer_abort_and_resume(session, channel_id, reason="stream-unavailable")
                 return
         elif ai_briefing_text:
-            briefing_audio = await self._local_ai_server_tts(call_id=caller_id, text=ai_briefing_text, timeout_sec=tts_timeout)
+            briefing_audio = await self._attended_transfer_tts(
+                call_id=caller_id,
+                text=ai_briefing_text,
+                timeout_sec=tts_timeout,
+                attended_cfg=attended_cfg,
+                session=session,
+            )
             if briefing_audio:
                 briefing_ok = True
                 if use_streaming:
@@ -10171,10 +10526,24 @@ class Engine:
             else:
                 logger.warning("Attended transfer AI briefing TTS failed; continuing with prompt", call_id=caller_id)
 
+        # The destination may have hung up during the announcement; whoever
+        # retired the leg already owns the caller's recovery.
+        if self._attended_transfer_leg_retired(caller_id, channel_id):
+            await self._leave_retired_attended_transfer_leg(caller_id, channel_id, stage="announcement")
+            return
+
         # Step B: Collect DTMF acceptance/decline (early digits during announcement are honored).
         digit = self._attended_transfer_dtmf_digits.get(channel_id)
         if digit not in {accept_digit, decline_digit}:
-            prompt_audio = await self._local_ai_server_tts(call_id=caller_id, text=prompt_text, timeout_sec=tts_timeout)
+            prompt_audio = self._pre_synthesized_attended_audio(
+                session, "prompt", prompt_text, attended_cfg
+            ) or await self._attended_transfer_tts(
+                call_id=caller_id,
+                text=prompt_text,
+                timeout_sec=tts_timeout,
+                attended_cfg=attended_cfg,
+                session=session,
+            )
             if not prompt_audio:
                 logger.warning("Attended transfer prompt TTS failed; aborting", call_id=caller_id)
                 await self._attended_transfer_abort_and_resume(session, channel_id, reason="tts-unavailable")
@@ -10198,6 +10567,9 @@ class Engine:
                 await self._attended_transfer_abort_and_resume(session, channel_id, reason="stream-unavailable")
                 return
             digit = await self._wait_for_attended_transfer_dtmf(channel_id, timeout_sec=accept_timeout)
+            if self._attended_transfer_leg_retired(caller_id, channel_id):
+                await self._leave_retired_attended_transfer_leg(caller_id, channel_id, stage="accept-prompt")
+                return
 
         accepted = digit == accept_digit
         declined = digit == decline_digit or digit is None
@@ -10205,6 +10577,13 @@ class Engine:
         # Persist decision (best effort).
         try:
             session = await self.session_store.get_by_call_id(caller_id)
+            # A contended store lock yields; a hangup in that gap has already
+            # retired the leg and started recovery, so never record accepted.
+            if self._attended_transfer_leg_retired(caller_id, channel_id) or (
+                session and isinstance(session.current_action, dict) and session.current_action.get("recovery_started")
+            ):
+                await self._leave_retired_attended_transfer_leg(caller_id, channel_id, stage="decision")
+                return
             if session and session.current_action and session.current_action.get("type") == "attended_transfer":
                 session.current_action["decision_digit"] = digit
                 session.current_action["decision"] = "accepted" if accepted else "declined"
@@ -10225,6 +10604,7 @@ class Engine:
             caller_connected_prompt=caller_connected_prompt,
             tts_timeout=tts_timeout,
             template_vars=template_vars,
+            attended_cfg=attended_cfg,
         )
 
     async def recover_attended_transfer_failure(
@@ -10290,9 +10670,8 @@ class Engine:
 
         # Optional: play a short caller-facing prompt on decline/timeout so the call doesn't feel "dead".
         try:
-            tools_cfg = getattr(self.config, "tools", {}) or {}
-            attended_cfg = tools_cfg.get("attended_transfer") if isinstance(tools_cfg, dict) else None
-            if not provider_recovery and isinstance(attended_cfg, dict) and reason in {"declined", "timeout", "no-answer", "dial-timeout"}:
+            attended_cfg = self._attended_transfer_config_for_session(session)
+            if not provider_recovery and isinstance(attended_cfg, dict) and reason in {"declined", "timeout", "no-answer", "dial-timeout", "target-hangup"}:
                 caller_prompt = str(
                     attended_cfg.get(
                         "caller_declined_prompt",
@@ -10315,7 +10694,13 @@ class Engine:
                         session,
                         extra_substitutions=template_vars,
                     )
-                    prompt_audio = await self._local_ai_server_tts(call_id=call_id, text=prompt_text, timeout_sec=tts_timeout)
+                    prompt_audio = await self._attended_transfer_tts(
+                        call_id=call_id,
+                        text=prompt_text,
+                        timeout_sec=tts_timeout,
+                        attended_cfg=attended_cfg,
+                        session=session,
+                    )
                     if prompt_audio:
                         await self._play_ulaw_bytes_on_channel_and_wait(
                             channel_id=session.caller_channel_id,
@@ -10352,7 +10737,7 @@ class Engine:
             # end event cannot notify twice or race a timeout into the same recovery.
             if provider_recovery:
                 try:
-                    configured = (self._tool_config_for_session(session).get("tools") or {}).get("attended_transfer") or {}
+                    configured = self._attended_transfer_config_for_session(session)
                     caller_prompt = str(configured.get("caller_declined_prompt") or "")
                     if caller_prompt:
                         caller_prompt = self._apply_prompt_template_substitution(
@@ -10413,6 +10798,7 @@ class Engine:
         caller_connected_prompt: str,
         tts_timeout: float,
         template_vars: Optional[Dict[str, Any]] = None,
+        attended_cfg: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Finish an accepted transfer and append the successful handoff outcome.
 
@@ -10421,6 +10807,20 @@ class Engine:
         recording completion does not restart a provider already stopped here.
         """
         call_id = session.call_id
+        action = session.current_action
+
+        def superseded() -> bool:
+            # Recovery (decline, hangup, cancel) owns the caller once started;
+            # bridging now would stop the AI and leave the caller in silence.
+            return (
+                not isinstance(action, dict)
+                or bool(action.get("recovery_started"))
+                or self._attended_transfer_leg_retired(call_id, agent_channel_id)
+            )
+
+        if superseded():
+            await self._leave_retired_attended_transfer_leg(call_id, agent_channel_id, stage="finalize")
+            return
 
         # Stop MOH and optionally play "connecting you now" prompt to caller.
         try:
@@ -10434,10 +10834,12 @@ class Engine:
                 session,
                 extra_substitutions=template_vars or self._build_attended_transfer_template_vars(session),
             )
-            prompt_audio = await self._local_ai_server_tts(
+            prompt_audio = await self._attended_transfer_tts(
                 call_id=call_id,
                 text=prompt_text,
                 timeout_sec=float(tts_timeout),
+                attended_cfg=attended_cfg,
+                session=session,
             )
             if prompt_audio:
                 await self._play_ulaw_bytes_on_channel_and_wait(
@@ -10446,6 +10848,10 @@ class Engine:
                     playback_id_prefix="attx-caller",
                     timeout_sec=max(3.0, float(tts_timeout) * 4),
                 )
+
+        if superseded():
+            await self._leave_retired_attended_transfer_leg(call_id, agent_channel_id, stage="finalize")
+            return
 
         try:
             await self._cleanup_attended_transfer_helper_media(agent_channel_id)
@@ -11196,8 +11602,9 @@ class Engine:
                 session = await self.session_store.get_by_channel_id(channel_or_call_id)
             if not session:
                 # Attended transfer agent leg is a separate SIP channel that is not tracked in SessionStore.
-                # The agent leg's pre-answer failure must resume the caller;
-                # only an answered agent leg may own whole-call cleanup.
+                # A leg that ends before accepting (unanswered, or answered and
+                # hung up during screening) resumes the caller; only an
+                # accepted agent leg may own whole-call cleanup.
                 mapped_call_id = self._attended_transfer_agent_channel_to_call_id.get(channel_or_call_id)
                 if mapped_call_id:
                     mapped_session = await self.session_store.get_by_call_id(mapped_call_id)
@@ -11224,6 +11631,35 @@ class Engine:
                         )
                         await self._attended_transfer_abort_and_resume(
                             mapped_session, channel_or_call_id, reason="no-answer"
+                        )
+                        return
+                    decision = str(action.get("decision") or "").strip().lower()
+                    if decision != "accepted":
+                        # A decline digit already received (or recorded) means
+                        # the destination declined and then hung up; report it
+                        # as a decline. Read the digit before unregistering
+                        # clears it.
+                        attended_cfg = self._attended_transfer_config_for_session(mapped_session)
+                        decline_digit = str(attended_cfg.get("decline_digit", "2") or "2")
+                        declined_first = decision == "declined" or (
+                            self._attended_transfer_dtmf_digits.get(channel_or_call_id) == decline_digit
+                        )
+                        # The destination answered but hung up during the
+                        # announcement or the accept prompt. Treat it as a
+                        # decline. Unregister before the first await so the
+                        # paired end event and the screening handler both see
+                        # the leg as retired (this also ends its DTMF wait).
+                        self._unregister_attended_transfer_agent_channel(channel_or_call_id)
+                        logger.info(
+                            "Answered attended transfer leg ended before acceptance; resuming caller",
+                            call_id=mapped_call_id,
+                            agent_channel_id=channel_or_call_id,
+                            decision=decision or None,
+                        )
+                        await self._attended_transfer_abort_and_resume(
+                            mapped_session,
+                            channel_or_call_id,
+                            reason="declined" if declined_first else "target-hangup",
                         )
                         return
                     session = mapped_session
@@ -11501,6 +11937,8 @@ class Engine:
                 if deferred_recovery and not deferred_recovery.done():
                     deferred_recovery.cancel()
                 self._deferred_transfer_commit_locks.pop(call_id, None)
+                self._stand_down_deferred_transfer_watchdog(call_id, reason="call_cleanup")
+                (getattr(self, "_deferred_transfer_commit_actions", None) or {}).pop(call_id, None)
                 state = getattr(self, "_transfer_handoffs", {}).pop(call_id, None)
                 if state:
                     state.cancel()
@@ -12316,19 +12754,21 @@ class Engine:
                             rms_native=rms_native,
                             rms_swapped=rms_swapped,
                         )
-                        # Determine if inbound PCM16 appears byte-swapped (big-endian on wire)
+                        # AudioSocket slin frames are little-endian and the TLV type
+                        # states the format, so never swap them. Quiet line noise
+                        # on the first frame looks loud when swapped, and a sticky
+                        # swap decision would garble the rest of the call.
+                        vad_state['pcm16_inbound_swap'] = False
                         try:
                             frame_bytes = len(audio_bytes)
-                            # Conservative rule: only flag swap when swapped energy is clearly higher
-                            swap_flag = (
+                            swap_suspected = (
                                 frame_bytes >= 640 and  # 20ms @ 16k PCM
                                 rms_swapped >= 2048 and
                                 rms_swapped >= 16 * max(1, rms_native)
                             )
-                            vad_state['pcm16_inbound_swap'] = bool(swap_flag)
-                            if swap_flag:
-                                logger.warning(
-                                    "Inbound slin16 appears byte-swapped; will normalize to PCM16-LE for processing",
+                            if swap_suspected:
+                                logger.info(
+                                    "Inbound slin first frame is louder byte-swapped; not swapping (AudioSocket is little-endian)",
                                     call_id=caller_channel_id,
                                     rms_native=rms_native,
                                     rms_swapped=rms_swapped,
@@ -12377,8 +12817,9 @@ class Engine:
                     profile_rate = 8000
             pcm_bytes, pcm_rate = self._wire_to_pcm16(audio_bytes, profile_fmt, swap_needed_flag, profile_rate)
             # Remove DC bias ONLY (disable IIR DC-block filter - causes audio degradation)
+            # Off by default; see INBOUND_DC_REMOVAL_ENABLED.
             try:
-                if pcm_bytes:
+                if pcm_bytes and INBOUND_DC_REMOVAL_ENABLED:
                     try:
                         mean = int(audioop.avg(pcm_bytes, 2))
                     except Exception:
@@ -15532,6 +15973,13 @@ class Engine:
             self._observe_transfer_handoff(call_id, session, event)
             if etype in {"HandoffPrepared", "HandoffToolResultSent", "HandoffTranscript", "HandoffAudioComplete"}:
                 return
+            if etype == "DeferredTransferArmed":
+                self._arm_deferred_transfer_watchdog(call_id, session, event.get("action_id"))
+                return
+            if call_id in (getattr(self, "_deferred_transfer_watchdogs", None) or {}):
+                self._note_deferred_transfer_caller_speech(call_id, etype, event)
+            if etype == "CallerSpeechStopped":
+                return
 
             # Normalize provider-native caller activity before any barge-in guards.
             # A speech-start event is useful to the inactivity watchdog even when
@@ -15751,6 +16199,10 @@ class Engine:
                 chunk: bytes = event.get("data") or b""
                 if not chunk:
                     return
+                if call_id in (getattr(self, "_deferred_transfer_watchdogs", None) or {}):
+                    # Reply audio started after the tool result was sent; its
+                    # AgentAudioDone owns the commit unless a barge-in cuts it.
+                    self._pause_deferred_transfer_watchdog(call_id, "agent_speaking")
                 if self._provider_audio_blocked_by_transfer_commit(call_id, session):
                     # The handoff line has finished and the transfer is
                     # draining. New provider speech here is a follow-up turn
@@ -17196,12 +17648,13 @@ class Engine:
         )
         return False
 
-    def _google_disconnect_transfer_wait_sec(self) -> float:
-        """Bound transfer observation using configured phase budgets plus grace."""
-        tools = getattr(self.config, "tools", {}) or {}
-        cfg = tools.get("attended_transfer", {}) if isinstance(tools, dict) else {}
-        if not isinstance(cfg, dict):
-            cfg = {}
+    def _google_disconnect_transfer_wait_sec(self, session: Optional[CallSession] = None) -> float:
+        """Bound transfer observation using configured phase budgets plus grace.
+
+        A live call is budgeted from its own transfer settings; without a
+        session the global config applies.
+        """
+        cfg = self._attended_transfer_config_for_session(session)
 
         def seconds(key: str, default: float) -> float:
             try:
@@ -17222,9 +17675,13 @@ class Engine:
 
     async def _finish_google_provider_disconnect(self, call_id: str) -> None:
         """Drain failed Google playback without taking routing from a transfer."""
-        deadline = time.monotonic() + self._google_disconnect_transfer_wait_sec()
+        session = await self.session_store.get_by_call_id(call_id)
+        deadline = time.monotonic() + self._google_disconnect_transfer_wait_sec(session)
+        first_pass = True
         while True:
-            session = await self.session_store.get_by_call_id(call_id)
+            if not first_pass:
+                session = await self.session_store.get_by_call_id(call_id)
+            first_pass = False
             if not session or session.cleanup_in_progress or self._session_was_transferred(session):
                 return
             if self._session_has_pending_attended_transfer(session):
@@ -23871,6 +24328,222 @@ class Engine:
                         action_id=action_id, reason=state.reason)
         return ready
 
+    def _deferred_transfer_silent_commit_timeout(self, session: Optional["CallSession"]) -> float:
+        """Seconds to wait for reply audio after a deferred transfer is armed; 0 disables."""
+        tools_cfg = (self._tool_config_for_session(session).get("tools") or {})
+        transfer_cfg = tools_cfg.get("transfer", {}) if isinstance(tools_cfg, dict) else {}
+        if not isinstance(transfer_cfg, dict):
+            transfer_cfg = {}
+        try:
+            timeout_sec = float(transfer_cfg.get("deferred_silent_commit_timeout_sec", 4.0))
+        except (TypeError, ValueError):
+            timeout_sec = 4.0
+        if not math.isfinite(timeout_sec):
+            timeout_sec = 4.0
+        return max(0.0, min(timeout_sec, 30.0))
+
+    # A caller-speech start from a provider that reports the matching end
+    # pauses the timer; this backstop bounds a pause whose end never arrives.
+    _DEFERRED_TRANSFER_CALLER_SPEECH_BACKSTOP_SEC = 30.0
+
+    def _arm_deferred_transfer_watchdog(self, call_id: str, session: "CallSession", action_id: Any) -> None:
+        """Bound the wait for the reply turn that commits a deferred transfer.
+
+        Armed when the provider has delivered the tool result to the model.
+        AgentAudioDone commits the action, but a provider that sends no audio
+        after the tool result never emits one, so the caller would wait in the
+        AI bridge with the transfer armed. Announcement actions keep their own
+        start timeout and pipelines commit inline, so neither is watched.
+        """
+        watchdogs = getattr(self, "_deferred_transfer_watchdogs", None)
+        if watchdogs is None:
+            watchdogs = self._deferred_transfer_watchdogs = {}
+        current = watchdogs.get(call_id)
+        if current and current["action_id"] == action_id:
+            return  # A suppressed duplicate request reports the same action again.
+        if action_id and self._deferred_transfer_commit_in_flight(call_id, action_id):
+            return  # Already committing; a second timer would retry that commit.
+        pending = getattr(session, "pending_deferred_transfer", None)
+        if (
+            not action_id
+            or not isinstance(pending, dict)
+            or pending.get("id") != action_id
+            or pending.get("handoff")
+            or getattr(session, "pipeline_name", None)
+        ):
+            return
+        self._stand_down_deferred_transfer_watchdog(call_id, reason="replaced")
+        timeout_sec = self._deferred_transfer_silent_commit_timeout(session)
+        if timeout_sec <= 0:
+            return
+        entry: Dict[str, Any] = {
+            "action_id": action_id,
+            "task": None,
+            "timeout_sec": timeout_sec,
+            "state": "waiting",
+            "caller_vad_speaking": False,
+        }
+        watchdogs[call_id] = entry
+        self._restart_deferred_transfer_watchdog_timer(call_id, entry, timeout_sec)
+
+    def _restart_deferred_transfer_watchdog_timer(
+        self, call_id: str, entry: Dict[str, Any], delay_sec: float,
+    ) -> None:
+        task = entry.get("task")
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+        entry["task"] = self._fire_and_forget_for_call(
+            call_id,
+            self._run_deferred_transfer_watchdog(call_id, entry["action_id"], delay_sec),
+            name=f"deferred-transfer-watchdog-{call_id}",
+        )
+
+    def _pause_deferred_transfer_watchdog(self, call_id: str, state: str) -> None:
+        """Hold the timer while the agent or the caller is speaking."""
+        entry = (getattr(self, "_deferred_transfer_watchdogs", None) or {}).get(call_id)
+        if not entry or entry["state"] == state:
+            return
+        entry["state"] = state
+        if state == "caller_speaking":
+            # The full timeout restarts when the caller's speech ends.
+            self._restart_deferred_transfer_watchdog_timer(
+                call_id, entry,
+                max(entry["timeout_sec"], self._DEFERRED_TRANSFER_CALLER_SPEECH_BACKSTOP_SEC),
+            )
+            return
+        task = entry.get("task")
+        entry["task"] = None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
+    def _note_deferred_transfer_caller_speech(self, call_id: str, etype: Any, event: Dict[str, Any]) -> None:
+        """Keep the silent-reply timer from committing over the caller.
+
+        Provider VAD holds the model's reply while the caller talks, so caller
+        speech must not count as model silence. OpenAI Realtime, Grok and
+        Deepgram report a start and an end (``CallerSpeechStarted`` with
+        ``vad`` set, then ``CallerSpeechStopped``): the timer pauses on the
+        start and restarts at the full timeout on the end. Other providers
+        report only activity (Google Live input transcription fragments,
+        ElevenLabs interruptions, ElevenLabs and local user transcripts), so
+        each signal restarts
+        the full timeout. An explicit barge-in while the agent is speaking means
+        the reply was cut, so the timer resumes instead of waiting for an
+        AgentAudioDone that may never come.
+        """
+        entry = (getattr(self, "_deferred_transfer_watchdogs", None) or {}).get(call_id)
+        if not entry:
+            return
+        state = entry["state"]
+        vad = bool(event.get("vad"))
+        if etype == "CallerSpeechStarted" and vad:
+            entry["caller_vad_speaking"] = True
+            if state == "waiting":
+                self._pause_deferred_transfer_watchdog(call_id, "caller_speaking")
+            return
+        if etype == "CallerSpeechStopped":
+            entry["caller_vad_speaking"] = False
+            if state in ("caller_speaking", "waiting"):
+                entry["state"] = "waiting"
+                self._restart_deferred_transfer_watchdog_timer(call_id, entry, entry["timeout_sec"])
+            return
+        if etype in ("ProviderBargeIn", "interruption"):
+            if state == "agent_speaking":
+                if entry["caller_vad_speaking"]:
+                    self._pause_deferred_transfer_watchdog(call_id, "caller_speaking")
+                else:
+                    entry["state"] = "waiting"
+                    self._restart_deferred_transfer_watchdog_timer(call_id, entry, entry["timeout_sec"])
+            elif state == "waiting":
+                self._restart_deferred_transfer_watchdog_timer(call_id, entry, entry["timeout_sec"])
+            return
+        activity = etype in ("CallerSpeechStarted", "UserStartedSpeaking")
+        if etype == "ConversationText" and str(event.get("role") or "").lower() == "user":
+            activity = bool(str(event.get("text") or event.get("content") or "").strip())
+        elif etype == "transcript" and str(event.get("role") or "user").lower() == "user":
+            text = str(event.get("text") or "").strip()
+            activity = bool(text) and text != "..."
+        if activity and state == "waiting":
+            self._restart_deferred_transfer_watchdog_timer(call_id, entry, entry["timeout_sec"])
+
+    def _deferred_transfer_commit_in_flight(self, call_id: str, action_id: Any) -> bool:
+        claims = (getattr(self, "_deferred_transfer_commit_actions", None) or {}).get(call_id) or ()
+        return action_id in claims
+
+    def _claim_deferred_transfer_commit(self, call_id: str, action_id: Any) -> None:
+        claims = getattr(self, "_deferred_transfer_commit_actions", None)
+        if claims is None:
+            claims = self._deferred_transfer_commit_actions = {}
+        claims.setdefault(call_id, []).append(action_id)
+
+    def _release_deferred_transfer_commit(self, call_id: str, action_id: Any) -> None:
+        claims = getattr(self, "_deferred_transfer_commit_actions", None) or {}
+        held = claims.get(call_id)
+        if held and action_id in held:
+            held.remove(action_id)
+        if not held:
+            claims.pop(call_id, None)
+
+    def _stand_down_deferred_transfer_watchdog(
+        self, call_id: str, *, reason: str, action_id: Any = None,
+    ) -> None:
+        watchdogs = getattr(self, "_deferred_transfer_watchdogs", None) or {}
+        entry = watchdogs.get(call_id)
+        if not entry or (action_id is not None and entry["action_id"] != action_id):
+            return
+        watchdogs.pop(call_id, None)
+        task = entry.get("task")
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+        logger.debug(
+            "Deferred transfer watchdog stood down",
+            call_id=call_id, action_id=entry["action_id"], reason=reason,
+        )
+
+    async def _run_deferred_transfer_watchdog(self, call_id: str, action_id: Any, timeout_sec: float) -> None:
+        await asyncio.sleep(timeout_sec)
+        watchdogs = getattr(self, "_deferred_transfer_watchdogs", None) or {}
+        entry = watchdogs.get(call_id)
+        if not entry or entry["action_id"] != action_id or entry.get("task") is not asyncio.current_task():
+            return
+        # Claim before any await: reply audio or a re-arm arriving from here on
+        # finds no watchdog to cancel and an in-flight commit to respect, so
+        # this task cannot die mid-commit or be duplicated.
+        watchdogs.pop(call_id, None)
+        self._claim_deferred_transfer_commit(call_id, action_id)
+        try:
+            session = await self.session_store.get_by_call_id(call_id)
+            pending = getattr(session, "pending_deferred_transfer", None) if session else None
+            if (
+                not session
+                or getattr(session, "cleanup_in_progress", False)
+                or getattr(session, "cleanup_completed", False)
+                or not isinstance(pending, dict)
+                or pending.get("id") != action_id
+            ):
+                logger.debug(
+                    "Deferred transfer watchdog stood down",
+                    call_id=call_id, action_id=action_id, reason="action_changed",
+                )
+                return
+            if self._provider_audio_blocked_by_transfer_commit(call_id, session):
+                return  # Another trigger is already committing this exact action.
+            logger.warning(
+                "deferred_transfer_watchdog_commit",
+                call_id=call_id,
+                action_id=action_id,
+                source_tool=pending.get("source_tool"),
+                timeout_sec=timeout_sec,
+                state=entry["state"],
+            )
+            # Same path and exact-action guard as AgentAudioDone: the per-call lock
+            # and expected_action_id make a racing trigger a no-op.
+            await self._commit_pending_deferred_transfer_for_call(
+                call_id, session, expected_action_id=action_id,
+            )
+        finally:
+            self._release_deferred_transfer_commit(call_id, action_id)
+
     def _provider_audio_blocked_by_transfer_commit(
         self,
         call_id: str,
@@ -23915,6 +24588,11 @@ class Engine:
             expected_action_id = action.get("id") if isinstance(action, dict) else None
         if expected_action_id is None:
             return None
+        # Another trigger owns this action now; its silent-reply timer is moot,
+        # and a late re-arm for it must not start another one.
+        self._stand_down_deferred_transfer_watchdog(
+            call_id, reason="commit_started", action_id=expected_action_id,
+        )
         # Register this attempt for the whole commit, including the audio
         # drain wait, so on_provider_event drops provider speech that starts
         # after the handoff line. The inner routine stamps the action id once
@@ -23926,11 +24604,13 @@ class Engine:
             self._deferred_transfer_committing = committing
         marker: Dict[str, Any] = {"action_id": None}
         committing.setdefault(call_id, []).append(marker)
+        self._claim_deferred_transfer_commit(call_id, expected_action_id)
         try:
             return await self._commit_pending_deferred_transfer_for_call_inner(
                 call_id, session, commit_marker=marker, expected_action_id=expected_action_id,
             )
         finally:
+            self._release_deferred_transfer_commit(call_id, expected_action_id)
             markers = committing.get(call_id) or []
             if marker in markers:
                 markers.remove(marker)
