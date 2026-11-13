@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: Existing release tag to add to immutable SHA images (for example, v7.7.4.9)
+        description: Existing release tag to add to immutable SHA images (for example, v7.7.4.10)
         required: false
         type: string
       source_sha:

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.7.4.10] - 2026-11-13
+
 ### Changed
 
 - **Provider forms and Tools apply status:** scope modular subtype selection to
