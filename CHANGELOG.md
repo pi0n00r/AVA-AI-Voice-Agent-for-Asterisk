@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.7.4.9] - 2026-11-12
+
+### Added
+
+- **Upstream feature catch-up:** add the verified first-call onboarding path,
+  attended-transfer caller briefing and lifecycle handling, safe call-recording
+  downloads, and the latest Admin UI lifecycle controls.
+
+### Changed
+
+- **Maintained source alignment:** merge upstream through `fe622daa` while
+  retaining the fork's A2A, release, installer, security, and fleet packaging
+  boundaries.
+- **Voice continuity:** retain interrupted caller and generated-response audit
+  history, and route direct memo and note requests through the existing
+  recipient, readback, and confirmation guard.
+
+### Security
+
+- Refresh Engine, Local AI, WebSocket, and Admin dependency baselines from the
+  merged upstream security and compatibility updates.
+
 ## [7.7.4.8] - 2026-11-07
 
 ### Changed

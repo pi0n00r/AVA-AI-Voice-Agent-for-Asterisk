@@ -5,6 +5,7 @@ import axios from 'axios';
 import { toast } from 'sonner';
 import { SystemTopology } from '../components/SystemTopology';
 import { ApiErrorInfo, buildDockerAccessHints, describeApiError } from '../utils/apiErrors';
+import OnboardingBanner from '../components/OnboardingBanner';
 import { useLiveStatus } from '../hooks/useLiveStatus';
 import {
     INITIAL_CONNECTION_STATE,
@@ -307,6 +308,8 @@ const Dashboard = () => {
                     <RefreshCw className={`w-5 h-5 ${refreshing ? 'animate-spin' : ''}`} />
                 </button>
             </div>
+
+            <OnboardingBanner />
 
             {dataErrors.length > 0 && (
                 <div className="rounded-lg border border-destructive/20 bg-destructive/10 p-4">

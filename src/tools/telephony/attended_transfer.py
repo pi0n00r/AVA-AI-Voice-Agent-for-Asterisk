@@ -9,8 +9,9 @@ The engine then:
 """
 
 import asyncio
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 import time
+import unicodedata
 import structlog
 
 from src.tools.base import Tool, ToolCategory, ToolDefinition, ToolParameter
@@ -24,6 +25,56 @@ from src.tools.telephony.deferred_transfer import (
 
 logger = structlog.get_logger(__name__)
 
+_CALLER_NAME_MAX_CHARS = 80
+_CALL_REASON_MAX_CHARS = 200
+_BRIEFING_KEYS = ("screened_caller_name", "screened_call_reason")
+# Joiners that correct spelling needs in Persian, Urdu, Indic scripts and some emoji sequences.
+_KEPT_FORMAT_CHARS = frozenset({"\u200c", "\u200d"})
+# Placeholder values models put in optional arguments instead of omitting them.
+_FILLER_VALUES = frozenset({"unknown", "n/a", "none", "not provided", "not given", "-"})
+
+
+def _normalize_caller_statement(value: Any, max_len: int) -> Optional[str]:
+    """Return a single-line, length-capped copy of caller-stated text, or None.
+
+    Drops Unicode control and format characters (keeping ZWNJ and ZWJ),
+    collapses whitespace, and cuts at a word boundary when one falls inside the
+    cap.
+    """
+    if not isinstance(value, str):
+        return None
+    kept = "".join(
+        ch
+        for ch in value
+        if ch.isspace() or ch in _KEPT_FORMAT_CHARS or not unicodedata.category(ch).startswith("C")
+    )
+    text = " ".join(kept.split())
+    if not text.strip("\u200c\u200d "):
+        return None
+    if len(text) > max_len:
+        cut = text[:max_len]
+        if text[max_len] != " ":
+            cut = cut.rsplit(" ", 1)[0] or cut
+        text = cut.rstrip()
+    return text or None
+
+
+def _caller_briefing_from_parameters(parameters: Dict[str, Any]) -> Dict[str, str]:
+    """Map the optional caller_name/call_reason arguments onto briefing keys."""
+    briefing: Dict[str, str] = {}
+    name = _normalize_caller_statement(parameters.get("caller_name"), _CALLER_NAME_MAX_CHARS)
+    reason = _normalize_caller_statement(parameters.get("call_reason"), _CALL_REASON_MAX_CHARS)
+    # Treat filler such as "unknown" or "N/A" as missing so the fallbacks still run.
+    if name and name.casefold().rstrip(".") in _FILLER_VALUES:
+        name = None
+    if reason and reason.casefold().rstrip(".") in _FILLER_VALUES:
+        reason = None
+    if name:
+        briefing["screened_caller_name"] = name
+    if reason:
+        briefing["screened_call_reason"] = reason
+    return briefing
+
 
 class AttendedTransferTool(Tool):
     @property
@@ -35,7 +86,10 @@ class AttendedTransferTool(Tool):
                 "then DTMF acceptance (1=accept, 2=decline). Caller is placed on MOH while the agent is contacted. "
                 "The screening payload can be a basic TTS briefing, an experimental AI-generated summary, or a caller-recorded screening clip, depending on config. "
                 "Use when you must brief a human before connecting the caller. "
-                "Use exact configured destination keys exposed in the runtime prompt/context."
+                "Use exact configured destination keys exposed in the runtime prompt/context. "
+                "If the caller has told you their name or why they are calling, pass it as caller_name or call_reason; "
+                "the announcement uses them only if its template includes {screened_caller_display} or {screened_reason_display}. "
+                "Pass only what the caller actually said; never guess."
             ),
             category=ToolCategory.TELEPHONY,
             requires_channel=True,
@@ -49,7 +103,25 @@ class AttendedTransferTool(Tool):
                         "Use a destination key configured in Tools -> Transfer Destinations."
                     ),
                     required=True,
-                )
+                ),
+                ToolParameter(
+                    name="caller_name",
+                    type="string",
+                    description=(
+                        "The caller's name as the caller stated it in this conversation. "
+                        "Omit it if the caller has not said their name. Never guess, and never use caller ID."
+                    ),
+                    required=False,
+                ),
+                ToolParameter(
+                    name="call_reason",
+                    type="string",
+                    description=(
+                        "A short phrase giving the reason for the call in the caller's own words. "
+                        "Omit it if the caller has not said why they are calling. Never guess or add detail."
+                    ),
+                    required=False,
+                ),
             ],
         )
 
@@ -153,6 +225,11 @@ class AttendedTransferTool(Tool):
                 "caller_screening_silence_ms": caller_screening_silence_ms,
             },
         )
+        briefing = _caller_briefing_from_parameters(parameters)
+        if briefing:
+            # Underscore keys stay on the armed action but are never copied into
+            # the provider-visible deferred_transfer result or its logs.
+            action["_briefing"] = briefing
 
         if transfer_deferral_enabled(context):
             await store_pending_deferred_transfer(context, action)
@@ -207,7 +284,9 @@ class AttendedTransferTool(Tool):
             deferred_action_id=action.get("id"),
         )
 
-        session.current_action = {
+        # Keep this exact attempt across awaits: a newer transfer may replace it
+        # while synthesis or origination is in flight.
+        attempt = {
             "id": action.get("id"),
             "_tool_history_origin": action.get("_tool_history_origin"),
             "type": "attended_transfer",
@@ -224,19 +303,36 @@ class AttendedTransferTool(Tool):
             "decision_digit": None,
             "screening_mode": screening_mode,
         }
+        briefing = action.get("_briefing")
+        # In caller_recording mode the caller's own clip is the briefing.
+        if screening_mode != "caller_recording" and isinstance(briefing, dict):
+            screened = {
+                key: briefing[key]
+                for key in _BRIEFING_KEYS
+                if isinstance(briefing.get(key), str) and briefing[key]
+            }
+            if screened:
+                attempt["briefing"] = screened
+        previous = session.current_action
+        if isinstance(previous, dict) and previous.get("type") == "attended_transfer":
+            # A replacement inherits the original capture state, not the pause
+            # applied by the transfer it supersedes.
+            if "pre_transfer_audio_capture_enabled" in previous:
+                attempt["pre_transfer_audio_capture_enabled"] = previous["pre_transfer_audio_capture_enabled"]
+        session.current_action = attempt
         await context.session_store.upsert_call(session)
 
         if screening_mode == "caller_recording":
-            session.current_action["screening_status"] = "pending"
-            session.current_action["caller_screening_prompt"] = caller_screening_prompt
-            session.current_action["caller_screening_max_seconds"] = caller_screening_max_seconds
-            session.current_action["caller_screening_silence_ms"] = caller_screening_silence_ms
+            attempt["screening_status"] = "pending"
+            attempt["caller_screening_prompt"] = caller_screening_prompt
+            attempt["caller_screening_max_seconds"] = caller_screening_max_seconds
+            attempt["caller_screening_silence_ms"] = caller_screening_silence_ms
             await context.session_store.upsert_call(session)
 
             engine = getattr(context.ari_client, "engine", None)
             workflow = self._complete_caller_recording_transfer(
                 context=context,
-                attempt=session.current_action,
+                attempt=attempt,
                 destination=destination,
                 extension=extension,
                 description=description,
@@ -258,6 +354,20 @@ class AttendedTransferTool(Tool):
                 "type": "attended_transfer",
             }
 
+        try:
+            prepared, moh_started = await self._prepare_announcement_audio(
+                context, description=description, moh_class=moh_class, attempt=attempt
+            )
+        except asyncio.CancelledError:
+            await self._cleanup_failed_originate(context, call_id, attempt=attempt, reason="tts-cancelled")
+            raise
+        if not prepared:
+            await self._cleanup_failed_originate(context, call_id, attempt=attempt, reason="tts-unavailable")
+            return {
+                "status": "failed",
+                "message": f"{description} could not be reached right now. Offer to take a message instead.",
+            }
+
         result = await self._originate_attended_transfer_leg(
             context=context,
             destination=destination,
@@ -265,6 +375,8 @@ class AttendedTransferTool(Tool):
             dial_endpoint=dial_endpoint,
             dial_timeout_sec=dial_timeout_sec,
             moh_class=moh_class,
+            attempt=attempt,
+            moh_started=moh_started,
         )
         if not result:
             return {
@@ -444,6 +556,82 @@ class AttendedTransferTool(Tool):
         except Exception:
             logger.debug("Failed to persist cleared attended transfer state", call_id=context.call_id, reason=reason, exc_info=True)
 
+    async def _prepare_announcement_audio(
+        self,
+        context: ToolExecutionContext,
+        *,
+        description: str,
+        moh_class: str,
+        attempt: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, bool]:
+        """Synthesize the agent-facing audio before dialling when a TTS provider is set.
+
+        Without ``tools.attended_transfer.tts_provider`` nothing happens here
+        and the engine synthesizes after answer, as before. Hosts without the
+        engine hook also keep answer-time synthesis. Otherwise caller audio
+        capture is turned off and hold music started first, so the caller
+        does not sit in silence and the model neither hears nor answers the
+        caller while the audio is synthesized. Failure cleanup restores
+        capture.
+
+        Returns ``(ok, moh_started)``. ``ok`` False means no leg may be
+        originated; the caller is responsible for stopping the hold music.
+        """
+        cfg = context.get_config_value("tools.attended_transfer") or {}
+        if not isinstance(cfg, dict) or not str(cfg.get("tts_provider") or "").strip():
+            return True, False
+        engine = getattr(context.ari_client, "engine", None)
+        prepare = getattr(engine, "prepare_attended_transfer_audio", None)
+        if not callable(prepare):
+            logger.debug(
+                "Attended transfer TTS provider set but engine cannot prepare audio; synthesizing at answer",
+                call_id=context.call_id,
+            )
+            return True, False
+        try:
+            session = await context.get_session()
+            if attempt is not None and (session.cleanup_in_progress or session.current_action is not attempt):
+                return False, False
+            action = session.current_action
+            if isinstance(action, dict) and action.get("type") == "attended_transfer":
+                action.setdefault(
+                    "pre_transfer_audio_capture_enabled",
+                    bool(getattr(session, "audio_capture_enabled", True)),
+                )
+            session.audio_capture_enabled = False
+            await context.session_store.upsert_call(session)
+        except Exception:
+            if attempt is not None:
+                return False, False
+            logger.debug(
+                "Failed to disable audio capture before attended transfer synthesis",
+                call_id=context.call_id,
+                exc_info=True,
+            )
+        moh_started = False
+        try:
+            await self._start_moh(context, moh_class)
+            moh_started = True
+        except Exception:
+            logger.warning("Failed to start MOH for attended transfer", call_id=context.call_id, exc_info=True)
+        try:
+            ok = bool(
+                await prepare(
+                    call_id=context.call_id,
+                    destination_description=description,
+                    attended_cfg=cfg,
+                    attempt=attempt,
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "Attended transfer audio preparation failed",
+                call_id=context.call_id,
+                error_type=exc.__class__.__name__,
+            )
+            ok = False
+        return ok, moh_started
+
     async def _start_moh(self, context: ToolExecutionContext, moh_class: str) -> None:
         await context.ari_client.send_command(
             method="POST",
@@ -461,24 +649,31 @@ class AttendedTransferTool(Tool):
         dial_timeout_sec: int,
         moh_class: str,
         attempt: Optional[Dict[str, Any]] = None,
+        moh_started: bool = False,
     ) -> Optional[Dict[str, Any]]:
         call_id = context.call_id
         if attempt is not None:
-            session = await context.get_session()
+            try:
+                session = await context.get_session()
+            except RuntimeError:
+                return None
             if session.cleanup_in_progress or session.current_action is not attempt:
                 return None
-        try:
-            await self._start_moh(context, moh_class)
-        except Exception:
-            logger.warning("Failed to start MOH for attended transfer", call_id=call_id, exc_info=True)
+        if not moh_started:
+            try:
+                await self._start_moh(context, moh_class)
+            except Exception:
+                logger.warning("Failed to start MOH for attended transfer", call_id=call_id, exc_info=True)
 
         try:
             session = await context.get_session()
             if attempt is not None and (session.cleanup_in_progress or session.current_action is not attempt):
                 return None
             if session.current_action and session.current_action.get("type") == "attended_transfer":
-                session.current_action["pre_transfer_audio_capture_enabled"] = bool(
-                    getattr(session, "audio_capture_enabled", True)
+                # Pre-dial synthesis may already have recorded (and disabled) capture.
+                session.current_action.setdefault(
+                    "pre_transfer_audio_capture_enabled",
+                    bool(getattr(session, "audio_capture_enabled", True)),
                 )
                 session.current_action["screening_status"] = session.current_action.get("screening_status") or "skipped"
             session.audio_capture_enabled = False
@@ -499,6 +694,14 @@ class AttendedTransferTool(Tool):
                 call_id=call_id,
                 exc_info=True,
             )
+
+        if attempt is not None:
+            try:
+                session = await context.get_session()
+            except RuntimeError:
+                return None
+            if session.cleanup_in_progress or session.current_action is not attempt:
+                return None
 
         caller_id = self._build_ai_caller_id(context)
         app = str(context.get_config_value("asterisk.app_name", "asterisk-ai-voice-agent") or "asterisk-ai-voice-agent")
@@ -539,16 +742,28 @@ class AttendedTransferTool(Tool):
                 session = None
             if not session or session.cleanup_in_progress or session.current_action is not attempt:
                 # Only the leg originated by this now-stale workflow is ours.
-                await context.ari_client.send_command(method="DELETE", resource=f"channels/{agent_channel_id}")
+                await self._hangup_stale_attended_leg(context, agent_channel_id)
                 return None
         try:
-            session = await context.get_session()
+            # With an attempt, use the session validated above without opening
+            # another await between the ownership check and the mutation.
+            if attempt is None:
+                session = await context.get_session()
             if session.current_action and session.current_action.get("type") == "attended_transfer":
                 session.current_action["agent_channel_id"] = agent_channel_id
                 session.current_action["screening_status"] = session.current_action.get("screening_status") or "skipped"
                 await context.session_store.upsert_call(session)
         except Exception:
             logger.debug("Failed to persist attended transfer originate state", call_id=call_id, exc_info=True)
+
+        if attempt is not None:
+            try:
+                session = await context.get_session()
+            except RuntimeError:
+                session = None
+            if not session or session.cleanup_in_progress or session.current_action is not attempt:
+                await self._hangup_stale_attended_leg(context, agent_channel_id)
+                return None
 
         try:
             engine = getattr(context.ari_client, "engine", None)
@@ -566,6 +781,20 @@ class AttendedTransferTool(Tool):
             destination_key=destination,
         )
         return result
+
+    async def _hangup_stale_attended_leg(
+        self, context: ToolExecutionContext, agent_channel_id: str
+    ) -> None:
+        """Retire only this workflow's leg without failing its replacement."""
+        try:
+            await context.ari_client.send_command(method="DELETE", resource=f"channels/{agent_channel_id}")
+        except Exception as exc:
+            logger.warning(
+                "Failed to hang up stale attended transfer leg",
+                call_id=context.call_id,
+                agent_channel_id=agent_channel_id,
+                error_type=exc.__class__.__name__,
+            )
 
     async def _complete_caller_recording_transfer(
         self,
@@ -617,6 +846,17 @@ class AttendedTransferTool(Tool):
             await self._recover_background_failure(context, attempt, reason="screening-failed")
             return
 
+        try:
+            prepared, moh_started = await self._prepare_announcement_audio(
+                context, description=description, moh_class=moh_class, attempt=attempt
+            )
+        except asyncio.CancelledError:
+            await self._cleanup_failed_originate(context, call_id, attempt=attempt, reason="tts-cancelled")
+            raise
+        if not prepared:
+            await self._recover_background_failure(context, attempt, reason="tts-unavailable")
+            return
+
         result = await self._originate_attended_transfer_leg(
             context=context,
             destination=destination,
@@ -625,6 +865,7 @@ class AttendedTransferTool(Tool):
             dial_timeout_sec=dial_timeout_sec,
             moh_class=moh_class,
             attempt=attempt,
+            moh_started=moh_started,
         )
         if result:
             return
@@ -641,11 +882,24 @@ class AttendedTransferTool(Tool):
         # Standalone/custom tool hosts retain best-effort cleanup.
         session = await context.get_session()
         if session.current_action is attempt and not session.cleanup_in_progress:
-            await self._cleanup_failed_originate(context, context.call_id, attempt=attempt)
+            await self._cleanup_failed_originate(context, context.call_id, attempt=attempt, reason=reason)
 
     async def _cleanup_failed_originate(
-        self, context: ToolExecutionContext, call_id: str, *, attempt: Optional[Dict[str, Any]] = None
+        self,
+        context: ToolExecutionContext,
+        call_id: str,
+        *,
+        attempt: Optional[Dict[str, Any]] = None,
+        reason: str = "originate-failed",
     ) -> None:
+        if attempt is not None:
+            try:
+                session = await context.get_session()
+            except RuntimeError:
+                return
+            # MOH belongs to the current attempt too, not just its stored state.
+            if session.cleanup_in_progress or session.current_action is not attempt:
+                return
         try:
             await context.ari_client.send_command(
                 method="DELETE",
@@ -658,6 +912,6 @@ class AttendedTransferTool(Tool):
             context,
             clear_current_action=True,
             restore_audio_capture=True,
-            reason="originate-failed",
+            reason=reason,
             expected_action=attempt,
         )
