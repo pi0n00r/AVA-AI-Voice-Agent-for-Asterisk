@@ -2350,6 +2350,7 @@ async def test_completion_persists_state_when_history_write_fails(monkeypatch):
     action = {"type": "attended_transfer", "agent_channel_id": "agent"}
     session.current_action = action
     await engine.session_store.upsert_call(session)
+    engine.register_attended_transfer_agent_channel(session.call_id, "agent")
 
     record = AsyncMock(side_effect=RuntimeError("history unavailable"))
     save = AsyncMock(wraps=engine._save_session)
