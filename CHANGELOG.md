@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Environment and email-template lifecycle:** serialize Environment saves,
+  refreshes, tests, and Apply confirmations; ignore obsolete reads and recheck
+  drift before clearing pending changes. Scope email drafts and previews to the
+  current opening and inputs, lock pending saves, and preserve failed drafts for
+  retry. Lower the frontend lint warning ceiling to 820.
+
 ## [7.7.4.9] - 2026-11-12
 
 ### Added
