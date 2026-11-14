@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.7.4.11] - 2026-11-13
+
+### Changed
+
+- **Upstream release-credit catch-up:** merge upstream through `e9f2b0d3`
+  while retaining the maintained fork's current runtime, documentation, release,
+  security, A2A, and fleet boundaries. Import the applicable contributor credit;
+  do not inherit upstream's older v7.7.3-only release labels or security waiver.
+
 ## [7.7.4.10] - 2026-11-13
 
 ### Changed
