@@ -47,6 +47,7 @@ class PlaybackRef:
     audio_file: str
     timestamp: float = field(default_factory=time.time)
     cancel_cleanup_pending: bool = False
+    cancel_notify_no_input: bool = True
 
 
 @dataclass
@@ -151,6 +152,11 @@ class CallSession:
     # TTS timing for barge-in/protection windows
     tts_started_ts: float = 0.0
     tts_ended_ts: float = 0.0
+    # Process-local clocks; never restore monotonic values across engine restarts.
+    tts_ended_monotonic: float = 0.0
+    google_playback_drained_monotonic: float = 0.0
+    google_output_emission_end_monotonic: float = 0.0
+    google_output_interrupted: bool = False
     # Barge-in detection accumulators
     barge_in_candidate_ms: int = 0
     last_barge_in_ts: float = 0.0
@@ -182,6 +188,10 @@ class CallSession:
     connection_audio_playback_id: Optional[str] = None
     connection_audio_media_uri: Optional[str] = None
     connection_audio_started_ts: float = 0.0
+    # Runtime-only resource owners. Each pre-call tool owns only its hold playback.
+    pre_call_hold_audio: Set[Any] = field(default_factory=set, repr=False)
+    voicemail_handoff_id: Optional[str] = None
+    voicemail_handoff_outcome: Optional[str] = None  # pending | confirmed | indeterminate
     created_at: float = field(default_factory=time.time)
     agent_audio_buffer: bytearray = field(default_factory=bytearray)
     last_agent_audio_ts: float = 0.0

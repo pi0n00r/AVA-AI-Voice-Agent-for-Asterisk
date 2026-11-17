@@ -40,6 +40,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest, Histogram, C
 
 from .ari_client import ARIClient
 from .core.audio_backlog import AudioBacklogQueue
+from .core.input_gain import InputGainState
 from aiohttp import web
 from pydantic import ValidationError
 
@@ -114,6 +115,7 @@ from .core.pipeline_message_deposit import PipelineMessageDepositGuard
 from .core.rita_outbound_context import (
     project_rita_context, rita_context_url, rita_outbound_greeting, unknown_rita_context,
 )
+from .core.outbound_config import voicemail_drop_enabled
 from .core.outbound_schedule import normalize_outbound_daily_window
 from .core.outbound_store import get_outbound_store, outbound_flag_enabled
 from .utils.audio_capture import AudioCaptureManager
@@ -433,6 +435,8 @@ def _sanitize_for_llm(history: list) -> list:
 class Engine:
     """The main application engine."""
 
+    _OUTBOUND_ENDPOINT_CACHE_MAX_ENTRIES = 1024
+
     def __init__(self, config: AppConfig):
         self.config = config
         self._legacy_context_warning_emitted = False
@@ -669,7 +673,6 @@ class Engine:
         # Per-call downstream audio preferences (format/sample-rate)
         self.call_audio_preferences: Dict[str, Dict[str, Any]] = {}
         self.conn_to_channel: Dict[str, str] = {}
-        self.channel_to_conn: Dict[str, str] = {}
         self.conn_to_caller: Dict[str, str] = {}  # conn_id -> caller_channel_id
         self.audio_socket_server: Optional[AudioSocketServer] = None
         self.websocket_server: Optional[WebSocketMediaServer] = None
@@ -678,8 +681,8 @@ class Engine:
         self.audiosocket_conn_to_ssrc: Dict[str, int] = {}
         self.audiosocket_resample_state: Dict[str, Optional[tuple]] = {}
         # Stateful resampling: maintain per-call/per-provider ratecv states to avoid drift
-        # Provider input (caller -> provider) resample state
-        self._resample_state_provider_in: Dict[str, Dict[str, Optional[tuple]]] = {}
+        # Provider input resampler and gain state share the existing call lifecycle.
+        self._resample_state_provider_in: Dict[str, Dict[str, Any]] = {}
         # Provider output (provider -> wire) resample state
         self._resample_state_provider_out: Dict[str, Optional[tuple]] = {}
         # Forced pipeline PCM16@16k path (per-call)
@@ -689,6 +692,7 @@ class Engine:
         self.pending_channel_for_bind: Optional[str] = None
         # Support duplicate Local ;1/;2 AudioSocket connections per call
         self.channel_to_conns: Dict[str, set] = {}
+        self._audiosocket_frame_count: Dict[str, int] = {}
         self.audiosocket_primary_conn: Dict[str, str] = {}
         # Audio buffering for better playback quality
         self.audio_buffers: Dict[str, bytes] = {}
@@ -1193,7 +1197,7 @@ class Engine:
                     result = await self.outbound_store.cleanup_stale_attempts_and_leads(
                         stale_seconds=int(_outbound_attempt_stale_seconds())
                     )
-                    if result.get("attempts_closed") or result.get("leads_failed"):
+                    if result.get("attempts_closed") or result.get("leads_failed") or result.get("leads_repaired"):
                         logger.info("Outbound cleanup applied", **result)
                 except Exception:
                     logger.debug("Outbound cleanup failed", exc_info=True)
@@ -1690,7 +1694,61 @@ class Engine:
                 drain_timeout_sec=150.0,
             )
 
-    async def _note_provider_output_start(self, call_id: str) -> None:
+    def _google_owns_input_gating(self, session: CallSession) -> bool:
+        provider_name = getattr(session, "provider_name", None)
+        provider = getattr(self, "_call_providers", {}).get(session.call_id)
+        return self._get_provider_kind(provider_name) == "google_live" and not self._google_live_full_duplex_barge_in(provider_name, provider)
+
+    def _google_post_tts_protection_active(self, session: CallSession) -> bool:
+        """One decision for provider input and local activity observers.
+
+        Native full-duplex providers retain caller audio. For engine-gated Google,
+        a confirmed playback completion supersedes the earlier token timestamp.
+        New output and accepted interruption must never mute the caller's turn.
+        """
+        if (not self._google_owns_input_gating(session)
+                or session.cleanup_in_progress or session.google_output_interrupted
+                or not session.audio_capture_enabled or session.tts_playing):
+            return False
+        cfg = getattr(getattr(self, "config", None), "barge_in", None)
+        guard_ms = max(0, int(getattr(cfg, "post_tts_end_protection_ms", 0) or 0))
+        ended = session.google_playback_drained_monotonic or session.tts_ended_monotonic
+        if session.call_id in getattr(self, "_agent_output_active_calls", set()):
+            # Generation-end tokens can clear while seconds of audio remain.
+            # Protect only the post-emission tail, including the quiet wait itself.
+            if session.call_id not in getattr(self, "_provider_output_drain_tasks", {}):
+                return False
+            ended = self._google_output_emission_end(session)
+        return bool(guard_ms and ended > 0 and time.monotonic() < ended + guard_ms / 1000.0)
+
+    def _google_output_emission_end(self, session: CallSession) -> float:
+        """Observe an empty output path without waiting for the drain poller.
+
+        Local transports record successful paced writes. Remote-clock WebSocket
+        output must first acknowledge completion; its local send time is not a
+        playback clock. Keep the first empty observation stable across frames.
+        """
+        snapshot = self._call_audio_buffer_snapshot(session.call_id)
+        snapshot.pop("last_real_emit_ts", None)
+        last_emit = snapshot.pop("last_real_emit_monotonic", None)
+        if any(int(value or 0) > 0 for value in snapshot.values()):
+            session.google_output_emission_end_monotonic = 0.0
+            return 0.0
+        if getattr(self.config, "audio_transport", None) != "websocket" and last_emit:
+            # An older persistent stream timestamp cannot override a later local
+            # playback completion or a response that has only just ended.
+            session.google_output_emission_end_monotonic = max(last_emit, session.tts_ended_monotonic)
+        elif not session.google_output_emission_end_monotonic:
+            session.google_output_emission_end_monotonic = time.monotonic()
+        return session.google_output_emission_end_monotonic
+
+    def _note_google_protected_frame(self, session: CallSession, pcm: bytes, rate: int) -> None:
+        # Bounded per-call diagnostics, with no audio/text or per-frame log output.
+        diag = session.audio_diagnostics.setdefault("google_post_tts_protection", {})
+        diag["frames"] = int(diag.get("frames", 0)) + 1
+        diag["duration_ms"] = float(diag.get("duration_ms", 0)) + len(pcm) * 1000.0 / (2 * max(1, rate))
+
+    async def _note_provider_output_start(self, call_id: str, session: Optional[CallSession] = None) -> None:
         """Observe real caller-facing provider audio without changing AEC gating."""
         operations = getattr(self, "_provider_output_operations", {})
         operation = operations.get(call_id)
@@ -1704,6 +1762,11 @@ class Engine:
         pending_drain = drain_tasks.pop(call_id, None)
         if pending_drain and not pending_drain.done():
             pending_drain.cancel()
+
+        if session is not None and self._get_provider_kind(session.provider_name) == "google_live":
+            session.google_playback_drained_monotonic = 0.0
+            session.google_output_emission_end_monotonic = 0.0
+            session.google_output_interrupted = False
 
         active = getattr(self, "_agent_output_active_calls", None)
         if active is None:
@@ -1823,26 +1886,31 @@ class Engine:
         drain_tasks = getattr(self, "_provider_output_drain_tasks", {})
         if drain_tasks.get(call_id) is not current_task:
             return
-        if not google_provider:
+        session = await self.session_store.get_by_call_id(call_id)
+        if drain_tasks.get(call_id) is not current_task:
+            return
+        if not session or session.cleanup_in_progress:
             drain_tasks.pop(call_id, None)
-        if google_provider:
-            session = await self.session_store.get_by_call_id(call_id)
-            if drain_tasks.get(call_id) is not current_task:
-                return
-            if not session or bool(getattr(session, "cleanup_in_progress", False)):
-                drain_tasks.pop(call_id, None)
-                return  # Teardown is cancellation, not a playback timeout.
-        if google_provider and not drained:
+            return  # Teardown is cancellation, not a playback timeout.
+        protected_google = self._google_owns_input_gating(session)
+        if not drained and (google_provider or (protected_google and clear_tts_gating_after_drain)):
             drain_tasks.pop(call_id, None)
-            google_provider._long_audio_failed = True
+            if google_provider:
+                google_provider._long_audio_failed = True
             logger.error("Google audio playback failed to drain", call_id=call_id)
             await self._fail_google_audio_playback(call_id, "google_audio_drain_timeout")
             return
         getattr(self, "_agent_output_active_calls", set()).discard(call_id)
 
-        session = await self.session_store.get_by_call_id(call_id)
-        if not session or bool(getattr(session, "cleanup_in_progress", False)):
-            return
+        if drained and protected_google and not session.google_output_interrupted:
+            # The drain observer already waited this quiet tail. Credit it rather
+            # than adding another full guard after the existing transport safety tail.
+            session.google_playback_drained_monotonic = (
+                session.google_output_emission_end_monotonic
+                or time.monotonic() - self._terminal_transport_quiet_sec()
+            )
+            logger.info("Google playback input protection armed", call_id=call_id,
+                        quiet_credit_ms=int(self._terminal_transport_quiet_sec() * 1000))
         # Google Live keeps a persistent playback stream across response segments.
         # End the first-greeting state at the first drained segment, otherwise the
         # long greeting barge-in guard is incorrectly applied to every later turn.
@@ -1852,11 +1920,15 @@ class Engine:
                 coordinator = getattr(self, "conversation_coordinator", None)
                 if coordinator is not None:
                     await coordinator.update_conversation_state(call_id, "listening")
+        if drain_tasks.get(call_id) is not current_task:
+            return
         if clear_tts_gating_after_drain:
             await self._clear_tts_gating_after_provider_drain(
                 call_id,
                 deferred_tts_tokens,
             )
+        if drain_tasks.get(call_id) is not current_task:
+            return
         watchdog = getattr(self, "no_input_watchdog", None)
         if watchdog is not None:
             await watchdog.note_agent_output_end(
@@ -1871,7 +1943,7 @@ class Engine:
             reset_timer=reset_timer,
             preserve_policy_state=preserve_policy_state,
         )
-        if google_provider and drain_tasks.get(call_id) is current_task:
+        if drain_tasks.get(call_id) is current_task:
             drain_tasks.pop(call_id, None)
 
     async def _clear_tts_gating_after_provider_drain(
@@ -1947,6 +2019,8 @@ class Engine:
         """Conservatively detect sustained caller speech without treating noise as activity."""
         watchdog = getattr(self, "no_input_watchdog", None)
         if not pcm16 or watchdog is None or not watchdog.has_call(session.call_id):
+            return
+        if self._google_post_tts_protection_active(session):
             return
         # Raw detection is disabled during agent output to avoid echo resets. Barge-in,
         # provider VAD, and TALK_DETECT remain authoritative during that window.
@@ -2232,132 +2306,133 @@ class Engine:
             )
             return False
 
-    async def _reject_outbound_answered_attempt(
-        self,
-        channel_id: str,
-        attempt_id: str,
-        meta: Optional[Dict[str, Any]],
-        error_message: str,
-    ) -> None:
-        """Retain fail-closed ownership when answered metadata is unsafe."""
-        campaign_id = str((meta or {}).get("campaign_id") or "")
-        lead_id = str((meta or {}).get("lead_id") or "")
-        logger.error(
-            "Outbound call rejected before AMD/provider startup",
-            channel_id=channel_id,
-            attempt_id=attempt_id,
-            campaign_id=campaign_id,
-            lead_id=lead_id,
-            error=error_message,
-        )
+    def _remember_outbound_completion(
+        self, channel_id: str, attempt_id: str, meta: Optional[Dict[str, Any]],
+        *, result: Dict[str, Any], lead_state: str,
+    ) -> Dict[str, Any]:
+        """Keep terminal persistence intent in the existing attempt owner."""
+        existing = self._outbound_attempt_meta_by_attempt_id.get(attempt_id) if attempt_id else None
+        if existing is not None and "completion_result" in existing:
+            return existing
+        owner = dict(meta or {})
+        owner.update({
+            "attempt_id": attempt_id, "channel_id": channel_id,
+            "completion_result": dict(result), "completion_lead_state": lead_state,
+            "completion_attempt_saved": not bool(attempt_id),
+            "completion_lead_saved": not bool(owner.get("lead_id")),
+            "completion_busy": False, "completion_hangup_pending": True,
+        })
         if attempt_id:
-            try:
+            self._outbound_attempt_meta_by_attempt_id[attempt_id] = owner
+        previous = str((meta or {}).get("channel_id") or "")
+        if previous and previous != channel_id and self._outbound_attempt_meta_by_channel_id.get(previous) is meta:
+            self._outbound_attempt_meta_by_channel_id.pop(previous, None)
+        self._outbound_attempt_meta_by_channel_id[channel_id] = owner
+        return owner
+
+    def _release_outbound_completion(self, owner: Dict[str, Any]) -> None:
+        if not (owner.get("completion_attempt_saved") and owner.get("completion_lead_saved")) or owner.get("completion_hangup_pending"):
+            return
+        attempt_id = str(owner.get("attempt_id") or "")
+        channel_id = str(owner.get("channel_id") or "")
+        if self._outbound_attempt_meta_by_attempt_id.get(attempt_id) is owner:
+            self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None)
+            self._outbound_attempt_amd.pop(attempt_id, None)
+        if self._outbound_attempt_meta_by_channel_id.get(channel_id) is owner:
+            self._outbound_attempt_meta_by_channel_id.pop(channel_id, None)
+
+    async def _persist_outbound_completion(self, owner: Dict[str, Any]) -> None:
+        """Retry only terminal writes, never AMD, origination, or playback."""
+        attempt_id = str(owner.get("attempt_id") or "")
+        channel_id = str(owner.get("channel_id") or "")
+        def still_owned():
+            return (self._outbound_attempt_meta_by_attempt_id.get(attempt_id) is owner if attempt_id else self._outbound_attempt_meta_by_channel_id.get(channel_id) is owner)
+        if owner.get("completion_busy") or not still_owned():
+            return
+        if time.monotonic() < float(owner.get("completion_retry_at") or 0):
+            return
+        owner["completion_busy"] = True
+        try:
+            if not owner["completion_attempt_saved"]:
                 await self.outbound_store.finish_attempt(
-                    attempt_id,
-                    outcome="error",
-                    error_message=error_message,
+                    attempt_id, **owner["completion_result"], only_if_unfinished=True,
                 )
-            except Exception:
-                logger.error(
-                    "Failed to persist outbound answered-call rejection",
-                    channel_id=channel_id,
-                    attempt_id=attempt_id,
-                    exc_info=True,
-                )
-        if lead_id:
-            try:
+                owner["completion_attempt_saved"] = True
+            if not still_owned():
+                return
+            if not owner["completion_lead_saved"]:
                 await self.outbound_store.set_lead_state(
-                    lead_id,
-                    state="failed",
-                    last_outcome="error",
+                    str(owner["lead_id"]), state=owner["completion_lead_state"],
+                    last_outcome=owner["completion_result"]["outcome"], only_if_active=True,
+                    expected_attempt_id=attempt_id,
                 )
-            except Exception:
-                logger.error(
-                    "Failed to persist lead state for rejected outbound call",
-                    channel_id=channel_id,
-                    attempt_id=attempt_id,
-                    lead_id=lead_id,
-                    exc_info=True,
-                )
+                owner["completion_lead_saved"] = True
+        except Exception:
+            delay = min(float(owner.get("completion_retry_delay") or 0) * 2.0 or 1.0, 30.0)
+            owner["completion_retry_delay"] = delay
+            owner["completion_retry_at"] = time.monotonic() + delay
+            logger.warning("Outbound terminal persistence pending recovery", attempt_id=attempt_id, retry_seconds=delay, exc_info=True)
+        finally:
+            owner["completion_busy"] = False
+            self._release_outbound_completion(owner)
+
+    async def _complete_outbound_attempt(
+        self, channel_id: str, attempt_id: str, meta: Optional[Dict[str, Any]],
+        *, result: Dict[str, Any], lead_state: str,
+    ) -> None:
+        owner = self._remember_outbound_completion(channel_id, attempt_id, meta, result=result, lead_state=lead_state)
         seen_outbound = getattr(self, "_seen_outbound_channels", None)
         if seen_outbound is not None:
             seen_outbound.add(channel_id)
-
-        # Keep a minimal owner until Asterisk accepts the hangup or confirms
-        # that the channel is already gone. ChannelDestroyed recognizes this
-        # terminal marker and must not overwrite the persisted error outcome.
-        owner_meta = dict(meta or {})
-        previous_channel_id = str(owner_meta.get("channel_id") or "")
-        owner_meta.update(
-            {
-                "attempt_id": attempt_id,
-                "campaign_id": campaign_id,
-                "lead_id": lead_id,
-                "channel_id": channel_id,
-                "fail_closed_rejected": True,
-            }
-        )
-        if attempt_id:
-            self._outbound_attempt_meta_by_attempt_id[attempt_id] = owner_meta
-        if previous_channel_id and previous_channel_id != channel_id:
-            self._outbound_attempt_meta_by_channel_id.pop(
-                previous_channel_id, None
-            )
-        self._outbound_attempt_meta_by_channel_id[channel_id] = owner_meta
         try:
-            hangup_ok = await self.ari_client.hangup_channel(channel_id)
-        except Exception:
-            hangup_ok = False
-            logger.error(
-                "Failed to hang up rejected outbound call",
-                channel_id=channel_id,
-                attempt_id=attempt_id,
-                exc_info=True,
-            )
-        if not hangup_ok:
-            logger.error(
-                "Rejected outbound hangup was not accepted; retaining retry owner",
-                channel_id=channel_id,
-                attempt_id=attempt_id,
-            )
-            self._schedule_outbound_forced_hangup_retry(
-                attempt_id=attempt_id,
-                channel_id=channel_id,
-            )
-        else:
-            self._release_outbound_rejection_ownership(
-                attempt_id=attempt_id,
-                channel_id=channel_id,
-            )
+            await self._persist_outbound_completion(owner)
+        finally:
+            try:
+                accepted = bool(await self.ari_client.hangup_channel(channel_id))
+            except asyncio.CancelledError:
+                if self._outbound_attempt_meta_by_channel_id.get(channel_id) is owner:
+                    self._schedule_outbound_forced_hangup_retry(attempt_id=attempt_id, channel_id=channel_id)
+                raise
+            except Exception:
+                accepted = False
+            if accepted:
+                self._release_outbound_rejection_ownership(attempt_id=attempt_id, channel_id=channel_id, expected_meta=owner)
+            elif self._outbound_attempt_meta_by_channel_id.get(channel_id) is owner:
+                self._schedule_outbound_forced_hangup_retry(attempt_id=attempt_id, channel_id=channel_id)
+
+    async def _reject_outbound_answered_attempt(
+        self, channel_id: str, attempt_id: str, meta: Optional[Dict[str, Any]],
+        error_message: str, *, gate_result: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Reject safely, retaining independent hangup and completion ownership."""
+        logger.error("Outbound call rejected", channel_id=channel_id, attempt_id=attempt_id, error=error_message)
+        await self._complete_outbound_attempt(
+            channel_id, attempt_id, meta,
+            result={"outcome": "error", "error_message": error_message, **(gate_result or {})},
+            lead_state="failed",
+        )
 
     def _release_outbound_rejection_ownership(
-        self,
-        *,
-        attempt_id: str,
-        channel_id: str,
+        self, *, attempt_id: str, channel_id: str,
+        expected_meta: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Release only tracking created for a terminal fail-closed rejection."""
-        channel_meta = self._outbound_attempt_meta_by_channel_id.get(channel_id)
-        if not channel_meta or channel_meta.get("fail_closed_rejected"):
-            self._outbound_attempt_meta_by_channel_id.pop(channel_id, None)
-
-        if attempt_id:
+        """Release accepted hangup independently of pending terminal writes."""
+        owner = self._outbound_attempt_meta_by_channel_id.get(channel_id)
+        if expected_meta is not None and owner is not expected_meta:
+            return
+        if owner is not None and "completion_result" in owner:
+            owner["completion_hangup_pending"] = False
+            self._release_outbound_completion(owner)
+        else:
+            if not owner or owner.get("fail_closed_rejected"):
+                self._outbound_attempt_meta_by_channel_id.pop(channel_id, None)
             attempt_meta = self._outbound_attempt_meta_by_attempt_id.get(attempt_id)
-            if not attempt_meta or (
-                attempt_meta.get("fail_closed_rejected")
-                and str(attempt_meta.get("channel_id") or "") == channel_id
-            ):
+            if not attempt_meta or (attempt_meta.get("fail_closed_rejected") and str(attempt_meta.get("channel_id") or "") == channel_id):
                 self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None)
                 self._outbound_attempt_amd.pop(attempt_id, None)
-
         tasks = getattr(self, "_outbound_forced_hangup_tasks", None) or {}
         retry_task = tasks.pop(channel_id, None)
-        current_task = asyncio.current_task()
-        if (
-            retry_task
-            and retry_task is not current_task
-            and not retry_task.done()
-        ):
+        if retry_task and retry_task is not asyncio.current_task() and not retry_task.done():
             retry_task.cancel()
 
     def _schedule_forced_hangup_retry_owner(
@@ -2438,6 +2513,7 @@ class Engine:
         channel_id: str,
     ) -> None:
         """Retry a rejected outbound hangup while retaining attempt ownership."""
+        owner = self._outbound_attempt_meta_by_channel_id.get(channel_id)
         self._schedule_forced_hangup_retry_owner(
             task_store_attribute="_outbound_forced_hangup_tasks",
             task_name_prefix="outbound-forced-hangup",
@@ -2448,6 +2524,7 @@ class Engine:
             on_accepted=lambda: self._release_outbound_rejection_ownership(
                 attempt_id=attempt_id,
                 channel_id=channel_id,
+                expected_meta=owner,
             ),
         )
 
@@ -3258,7 +3335,7 @@ class Engine:
                                 "created_at_ts": time.time(),
                             }
 
-                            marked = await self.outbound_store.mark_lead_dialing(lead_id)
+                            marked = await self.outbound_store.mark_lead_dialing(lead_id, attempt_id=attempt_id)
                             if not marked:
                                 await self.outbound_store.finish_attempt(
                                     attempt_id,
@@ -3353,9 +3430,7 @@ class Engine:
                 return u.split("sound:", 1)[1]
             return u
 
-        voicemail_enabled = outbound_flag_enabled(
-            campaign.get("voicemail_drop_enabled"), default=True
-        )
+        voicemail_enabled = voicemail_drop_enabled(campaign.get("voicemail_drop_enabled"))
         consent_enabled = outbound_flag_enabled(
             campaign.get("consent_enabled"), default=False
         )
@@ -3512,6 +3587,27 @@ class Engine:
         self._outbound_attempt_meta_by_attempt_id[attempt_id] = meta
         self._outbound_attempt_meta_by_channel_id[str(channel_id)] = meta
 
+    def _prune_outbound_endpoint_cache(self, now: float) -> None:
+        """Expire positive and negative probe results, including unqueried numbers."""
+        cache = self._outbound_pjsip_endpoint_cache
+        ttl = self._outbound_pjsip_endpoint_cache_ttl_seconds
+        for phone, entry in list(cache.items()):
+            if not (now - float(entry["ts"])) < ttl:
+                cache.pop(phone, None)
+
+    def _cache_outbound_endpoint(self, phone: str, tech: Optional[str]) -> None:
+        # Probe requests yield; prune/cap again at insertion so concurrent misses
+        # cannot overflow the bound. Zero/negative TTL continues to disable reuse.
+        now = time.monotonic()
+        self._prune_outbound_endpoint_cache(now)
+        if not self._outbound_pjsip_endpoint_cache_ttl_seconds > 0:
+            return
+        cache = self._outbound_pjsip_endpoint_cache
+        cache.pop(phone, None)
+        while len(cache) >= self._OUTBOUND_ENDPOINT_CACHE_MAX_ENTRIES:
+            cache.pop(next(iter(cache)))  # Oldest inserted result, not an active call.
+        cache[phone] = {"exists": tech is not None, "tech": tech, "ts": now}
+
     async def _outbound_choose_endpoint(self, dial_phone: str) -> str:
         """
         Choose best endpoint for outbound dialing.
@@ -3545,10 +3641,9 @@ class Engine:
         else:  # "auto" — try PJSIP first, then SIP
             techs_to_probe = ["PJSIP", "SIP"]
 
-        ttl = self._outbound_pjsip_endpoint_cache_ttl_seconds
-        now = time.monotonic()
+        self._prune_outbound_endpoint_cache(time.monotonic())
         cached = self._outbound_pjsip_endpoint_cache.get(phone)
-        if cached and (now - float(cached.get("ts") or 0.0)) < ttl:
+        if cached:
             cached_tech = cached.get("tech")
             if bool(cached.get("exists")) and cached_tech:
                 return f"{cached_tech}/{phone}"
@@ -3565,7 +3660,7 @@ class Engine:
                 if isinstance(resp, dict) and int(resp.get("status") or 0) == 404:
                     continue
                 if isinstance(resp, dict) and ("resource" in resp or "technology" in resp or "state" in resp):
-                    self._outbound_pjsip_endpoint_cache[phone] = {"exists": True, "tech": tech, "ts": now}
+                    self._cache_outbound_endpoint(phone, tech)
                     return f"{tech}/{phone}"
             except Exception as exc:
                 logger.debug(
@@ -3577,7 +3672,7 @@ class Engine:
                 )
                 continue
 
-        self._outbound_pjsip_endpoint_cache[phone] = {"exists": False, "tech": None, "ts": now}
+        self._cache_outbound_endpoint(phone, None)
         return f"Local/{dial_prefix}{phone}@{dial_context}"
 
     async def _outbound_cleanup_stale_attempts(self) -> None:
@@ -3595,11 +3690,16 @@ class Engine:
             # Copy values to avoid mutation during iteration.
             metas = list(self._outbound_attempt_meta_by_attempt_id.values())
             for meta in metas:
+                if "completion_result" in meta:
+                    await self._persist_outbound_completion(meta)
+                    continue
                 if meta.get("fail_closed_rejected"):
                     # The forced-hangup retry owns this terminal answered call.
                     # Do not let the no-answer watchdog overwrite its outcome.
                     continue
                 attempt_id = str(meta.get("attempt_id") or "").strip()
+                if self._outbound_attempt_meta_by_attempt_id.get(attempt_id) is not meta:
+                    continue
                 channel_id = str(meta.get("channel_id") or "").strip()
                 lead_id = str(meta.get("lead_id") or "").strip()
                 created_at_ts = float(meta.get("originated_at_ts") or meta.get("created_at_ts") or 0.0)
@@ -3614,6 +3714,8 @@ class Engine:
                 if channel_id:
                     try:
                         session = await self.session_store.get_by_channel_id(channel_id)
+                        if self._outbound_attempt_meta_by_attempt_id.get(attempt_id) is not meta:
+                            continue
                         if session and getattr(session, "is_outbound", False):
                             continue
                     except Exception:
@@ -3636,29 +3738,28 @@ class Engine:
                         # Avoid aggressive cleanup if ARI is flaky.
                         continue
 
+                if self._outbound_attempt_meta_by_attempt_id.get(attempt_id) is not meta:
+                    continue
+                result = {"outcome": "no_answer", "error_message": "stale originate (no StasisStart)"}
                 if exists and channel_id:
-                    try:
-                        await self.ari_client.hangup_channel(channel_id)
-                    except Exception:
-                        pass
-
-                try:
-                    await self.outbound_store.finish_attempt(
-                        attempt_id,
-                        outcome="no_answer",
-                        error_message="stale originate (no StasisStart)",
+                    await self._complete_outbound_attempt(
+                        channel_id, attempt_id, meta, result=result, lead_state="failed",
                     )
-                except Exception:
-                    pass
-                try:
-                    await self.outbound_store.set_lead_state(lead_id, state="failed", last_outcome="no_answer")
-                except Exception:
-                    pass
-
-                self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None)
-                self._outbound_attempt_amd.pop(attempt_id, None)
-                if channel_id:
-                    self._outbound_attempt_meta_by_channel_id.pop(channel_id, None)
+                else:
+                    owner = self._remember_outbound_completion(
+                        channel_id, attempt_id, meta, result=result, lead_state="failed",
+                    )
+                    owner["completion_hangup_pending"] = False
+                    await self._persist_outbound_completion(owner)
+            # Restart can lose a recent unfinished attempt before it becomes
+            # stale. Revisit durable recovery periodically, excluding live owners.
+            durable_cleanup = getattr(self.outbound_store, "cleanup_stale_attempts_and_leads", None)
+            if callable(durable_cleanup) and now >= float(getattr(self, "_outbound_next_durable_cleanup_ts", 0)):
+                self._outbound_next_durable_cleanup_ts = now + 30.0
+                await durable_cleanup(
+                    stale_seconds=int(stale_after),
+                    exclude_attempt_ids=list(self._outbound_attempt_meta_by_attempt_id),
+                )
         except Exception:
             logger.debug("Outbound stale-attempt cleanup failed", exc_info=True)
 
@@ -3702,6 +3803,12 @@ class Engine:
                     campaign_id=str(meta.get("campaign_id") or ""),
                     lead_id=str(meta.get("lead_id") or ""),
                 )
+            # Recovery awaited storage; a terminal owner may have won meanwhile.
+            current = self._outbound_attempt_meta_by_attempt_id.get(attempt_id)
+            if current is not None:
+                meta = current
+            elif channel_id in getattr(self, "_seen_outbound_channels", set()):
+                return
         if not meta:
             await self._reject_outbound_answered_attempt(
                 channel_id,
@@ -3709,6 +3816,21 @@ class Engine:
                 None,
                 "outbound attempt metadata unavailable after answer",
             )
+            return
+        if "completion_result" in meta:
+            # A late answer must not copy terminal ownership or its busy flag.
+            if not str(meta.get("channel_id") or "").strip():
+                if self._outbound_attempt_meta_by_channel_id.get("") is meta:
+                    self._outbound_attempt_meta_by_channel_id.pop("", None)
+                meta["channel_id"] = channel_id
+                meta["completion_hangup_pending"] = True
+                self._outbound_attempt_meta_by_channel_id[channel_id] = meta
+                await self._complete_outbound_attempt(
+                    channel_id, attempt_id, meta, result=meta["completion_result"],
+                    lead_state=meta["completion_lead_state"],
+                )
+            else:
+                await self._persist_outbound_completion(meta)
             return
         if meta.get("custom_vars_valid") is False:
             await self._reject_outbound_answered_attempt(
@@ -3729,6 +3851,15 @@ class Engine:
                 previous_channel_id, None
             )
         self._outbound_attempt_meta_by_channel_id[channel_id] = meta
+
+        async def answer_owner_retired() -> bool:
+            current = self._outbound_attempt_meta_by_attempt_id.get(attempt_id)
+            if current is meta:
+                return False
+            if current is not None and "completion_result" in current:
+                await self._persist_outbound_completion(current)
+            return True
+
         try:
             await self.outbound_store.set_attempt_channel(attempt_id, channel_id)
         except Exception:
@@ -3738,10 +3869,13 @@ class Engine:
                 attempt_id=attempt_id,
                 exc_info=True,
             )
+        if await answer_owner_retired():
+            return
         try:
             await self.outbound_store.set_lead_state(
                 str(meta.get("lead_id") or ""),
                 state="amd_pending",
+                only_if_active=True,
             )
         except Exception:
             logger.warning(
@@ -3751,6 +3885,8 @@ class Engine:
                 lead_id=str(meta.get("lead_id") or ""),
                 exc_info=True,
             )
+        if await answer_owner_retired():
+            return
 
         # Lead context is mandatory when supplied. Keep this confirmation
         # independent from the other best-effort safety-net writes below: a
@@ -3771,6 +3907,8 @@ class Engine:
                     expected_custom_vars_json,
                 )
             )
+            if await answer_owner_retired():
+                return
             if not confirmed:
                 error_message = (
                     "outbound custom_vars could not be confirmed after answer"
@@ -3812,9 +3950,7 @@ class Engine:
 
                     # Ensure voicemail/consent controls are present for the dialplan hop.
                     try:
-                        voicemail_enabled = outbound_flag_enabled(
-                            campaign.get("voicemail_drop_enabled"), default=True
-                        )
+                        voicemail_enabled = voicemail_drop_enabled(campaign.get("voicemail_drop_enabled"))
                     except Exception:
                         voicemail_enabled = True
                     try:
@@ -3846,6 +3982,8 @@ class Engine:
         except Exception:
             logger.debug("Failed to refresh outbound correlation vars before AMD hop", channel_id=channel_id, exc_info=True)
 
+        if await answer_owner_retired():
+            return
         # Exiting Stasis triggers StasisEnd; guard cleanup until AMD returns.
         self._outbound_awaiting_amd_channel_ids.add(channel_id)
         try:
@@ -3864,6 +4002,8 @@ class Engine:
                 exc_info=True,
             )
 
+        if await answer_owner_retired():
+            return
         if ok is True:
             return
         if ok is None:
@@ -3903,6 +4043,11 @@ class Engine:
         meta = self._outbound_attempt_meta_by_attempt_id.get(attempt_id) if attempt_id else None
         if not meta:
             meta = self._outbound_attempt_meta_by_channel_id.get(channel_id)
+        if meta is None and channel_id in getattr(self, "_seen_outbound_channels", set()):
+            return
+        if meta is not None and "completion_result" in meta:
+            await self._persist_outbound_completion(meta)
+            return
         if (not attempt_id) and meta and meta.get("attempt_id"):
             attempt_id = str(meta.get("attempt_id") or "").strip()
         if not attempt_id:
@@ -3959,49 +4104,65 @@ class Engine:
                 campaign = await self.outbound_store.get_campaign(campaign_id) if campaign_id else None
             except Exception:
                 campaign = None
-            vm_enabled = outbound_flag_enabled(
-                (campaign or {}).get("voicemail_drop_enabled"), default=True
-            )
-            media_uri = str((campaign or {}).get("voicemail_drop_media_uri") or "").strip()
-            if not media_uri:
-                media_uri = "sound:beep"
+            # A missing flag on a loaded legacy campaign retains its default;
+            # a missing/unreadable campaign is not permission to play voicemail.
+            gate_result = self._outbound_attempt_amd.get(attempt_id) or {}
+            if not isinstance(campaign, dict) or not campaign:
+                await self._reject_outbound_answered_attempt(
+                    channel_id, attempt_id, meta,
+                    "outbound campaign unavailable for AMD voicemail decision",
+                    gate_result=gate_result,
+                )
+                return
+            try:
+                vm_enabled = voicemail_drop_enabled(campaign.get("voicemail_drop_enabled"))
+            except (TypeError, ValueError):
+                await self._reject_outbound_answered_attempt(
+                    channel_id, attempt_id, meta,
+                    "outbound voicemail setting is invalid",
+                    gate_result=gate_result,
+                )
+                return
+            media_uri = campaign.get("voicemail_drop_media_uri")
+            media_uri = media_uri.strip() if isinstance(media_uri, str) else ""
+            if vm_enabled and not media_uri:
+                await self._reject_outbound_answered_attempt(
+                    channel_id, attempt_id, meta,
+                    "outbound voicemail recording is not configured",
+                    gate_result=gate_result,
+                )
+                return
 
             if vm_enabled:
                 try:
-                    pb = await self.ari_client.play_media(channel_id, media_uri)
-                    pb_id = pb.get("id") if isinstance(pb, dict) else None
-                    if pb_id:
-                        await self._wait_for_ari_playback(str(pb_id), timeout_sec=30.0)
-                except Exception:
-                    logger.debug("Outbound voicemail playback failed", channel_id=channel_id, exc_info=True)
-
-            if attempt_id:
-                await self.outbound_store.finish_attempt(
-                    attempt_id,
-                    outcome="voicemail_dropped" if vm_enabled else "machine_detected",
-                    amd_status=amd_status or None,
-                    amd_cause=amd_cause or None,
-                    consent_dtmf=consent_dtmf or None,
-                    consent_result=consent_result or None,
-                    context=str((meta or {}).get("context") or "") or None,
-                    provider=str((meta or {}).get("provider") or "") or None,
-                )
-            if lead_id:
-                try:
-                    await self.outbound_store.set_lead_state(
-                        lead_id,
-                        state="completed",
-                        last_outcome="voicemail_dropped" if vm_enabled else "machine_detected",
+                    confirmed = await self._play_outbound_voicemail(channel_id, media_uri)
+                except asyncio.CancelledError:
+                    await self._reject_outbound_answered_attempt(
+                        channel_id, attempt_id, meta,
+                        "outbound voicemail playback was cancelled",
+                        gate_result=gate_result,
                     )
-                except Exception:
-                    pass
+                    raise
+                if not confirmed:
+                    # Do not replay an uncertain drop or claim it was delivered.
+                    await self._reject_outbound_answered_attempt(
+                        channel_id, attempt_id, meta,
+                        "outbound voicemail playback was not confirmed",
+                        gate_result=gate_result,
+                    )
+                    return
 
-            # Cleanup mappings and hang up.
-            if attempt_id:
-                self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None)
-                self._outbound_attempt_amd.pop(attempt_id, None)
-            self._outbound_attempt_meta_by_channel_id.pop(channel_id, None)
-            await self.ari_client.hangup_channel(channel_id)
+            await self._complete_outbound_attempt(
+                channel_id, attempt_id, meta,
+                result={
+                    "outcome": "voicemail_dropped" if vm_enabled else "machine_detected",
+                    "amd_status": amd_status or None, "amd_cause": amd_cause or None,
+                    "consent_dtmf": consent_dtmf or None, "consent_result": consent_result or None,
+                    "context": str((meta or {}).get("context") or "") or None,
+                    "provider": str((meta or {}).get("provider") or "") or None,
+                },
+                lead_state="completed",
+            )
             return
 
         # HUMAN but consent denied/timeout (no AI attach).
@@ -4081,6 +4242,13 @@ class Engine:
 
             attempt_id = str(meta.get("attempt_id") or "")
             lead_id = str(meta.get("lead_id") or "")
+            if "completion_result" in meta:
+                self._seen_outbound_channels.add(channel_id)
+                self._release_outbound_rejection_ownership(
+                    attempt_id=attempt_id, channel_id=channel_id, expected_meta=meta,
+                )
+                await self._persist_outbound_completion(meta)
+                return
             if meta.get("fail_closed_rejected"):
                 self._seen_outbound_channels.add(channel_id)
                 self._release_outbound_rejection_ownership(
@@ -4092,6 +4260,9 @@ class Engine:
 
             # If a session exists, let _persist_call_history finish the attempt.
             session = await self.session_store.get_by_channel_id(channel_id)
+            # The await can overlap AMD completion or a replacement owner.
+            if self._outbound_attempt_meta_by_channel_id.get(channel_id) is not meta:
+                return
             if session and getattr(session, "is_outbound", False):
                 return
 
@@ -4120,28 +4291,22 @@ class Engine:
                 # If we never reached AMD (so we never got an answer/StasisStart), treat as no_answer.
                 outcome = "no_answer"
 
-            if attempt_id:
-                await self.outbound_store.finish_attempt(
-                    attempt_id,
-                    outcome=outcome,
-                    amd_status=(amd or {}).get("amd_status"),
-                    amd_cause=(amd or {}).get("amd_cause"),
-                    consent_dtmf=(amd or {}).get("consent_dtmf"),
-                    consent_result=(amd or {}).get("consent_result"),
-                    context=str((meta or {}).get("context") or "") or None,
-                    provider=str((meta or {}).get("provider") or "") or None,
-                    error_message=str(event.get("cause_txt") or cause_txt or cause or "") or None,
-                )
-            if lead_id:
-                try:
-                    await self.outbound_store.set_lead_state(lead_id, state="failed", last_outcome=outcome)
-                except Exception:
-                    pass
-
-            if attempt_id:
-                self._outbound_attempt_meta_by_attempt_id.pop(attempt_id, None)
-                self._outbound_attempt_amd.pop(attempt_id, None)
-            self._outbound_attempt_meta_by_channel_id.pop(channel_id, None)
+            owner = self._remember_outbound_completion(
+                channel_id, attempt_id, meta,
+                result={
+                    "outcome": outcome,
+                    "amd_status": (amd or {}).get("amd_status"),
+                    "amd_cause": (amd or {}).get("amd_cause"),
+                    "consent_dtmf": (amd or {}).get("consent_dtmf"),
+                    "consent_result": (amd or {}).get("consent_result"),
+                    "context": str((meta or {}).get("context") or "") or None,
+                    "provider": str((meta or {}).get("provider") or "") or None,
+                    "error_message": str(event.get("cause_txt") or cause_txt or cause or "") or None,
+                },
+                lead_state="failed",
+            )
+            owner["completion_hangup_pending"] = False
+            await self._persist_outbound_completion(owner)
         except Exception:
             logger.debug("Outbound ChannelDestroyed handler failed", exc_info=True)
 
@@ -4312,12 +4477,15 @@ class Engine:
         provider_name: Optional[str] = None,
     ) -> None:
         """Stop a per-call provider and release call-owned persistent resources."""
-        if provider is None:
-            return
-        if isinstance(provider, LocalProvider):
-            await provider.close()
-        elif hasattr(provider, "stop_session"):
-            await provider.stop_session()
+        try:
+            if provider is None:
+                return
+            if isinstance(provider, LocalProvider):
+                await provider.close()
+            elif hasattr(provider, "stop_session"):
+                await provider.stop_session()
+        finally:
+            self._finish_provider_input_gain(call_id, provider_name)
         evidence = getattr(provider, "_handoff_evidence", None)
         if evidence:
             evidence.reset(call_id)
@@ -8437,6 +8605,38 @@ class Engine:
         except Exception:
             logger.debug("Failed to clean up attended transfer helper media for retired leg", call_id=call_id, agent_channel_id=agent_channel_id, exc_info=True)
 
+    async def _play_outbound_voicemail(
+        self, channel_id: str, media_uri: str, *, timeout_sec: float = 30.0,
+        start_timeout_sec: float = 3.0,
+    ) -> bool:
+        """Confirm this owned playback's done state; never replay uncertainty."""
+        playback_id = f"outbound-vm-{uuid.uuid4().hex}"
+        waiter = asyncio.get_running_loop().create_future()
+        # As with Local farewell, short sounds can finish before REST returns.
+        self._ari_playback_waiters[playback_id] = waiter
+        try:
+            started = await asyncio.wait_for(
+                self.ari_client.play_media_on_channel_with_id(
+                    channel_id, media_uri, playback_id,
+                ),
+                timeout=start_timeout_sec,
+            )
+            if started is not True:
+                return False
+            playback = await asyncio.wait_for(waiter, timeout=timeout_sec)
+            # "done" is Asterisk's terminal boundary (also used for stopped
+            # playback), not proof of uninterrupted delivery at the handset.
+            if not isinstance(playback, dict):
+                return False
+            state = str(playback.get("state") or "").strip().lower()
+            return state == "done"
+        except Exception:
+            return False
+        finally:
+            self._ari_playback_waiters.pop(playback_id, None)
+            if not waiter.done():
+                waiter.cancel()
+
     async def _wait_for_ari_playback(self, playback_id: str, *, timeout_sec: float) -> bool:
         try:
             loop = asyncio.get_running_loop()
@@ -11411,6 +11611,10 @@ class Engine:
                 post_guard_ms = int(getattr(cfg, "post_tts_end_protection_ms", 0)) if cfg else 0
             except (TypeError, ValueError):
                 post_guard_ms = 0
+            if self._google_owns_input_gating(session):
+                if self._google_post_tts_protection_active(session):
+                    return
+                post_guard_ms = 0
             tts_ended_ts = float(getattr(session, "tts_ended_ts", 0.0) or 0.0)
             if (
                 post_guard_ms > 0
@@ -11489,6 +11693,8 @@ class Engine:
             latest_session = await self.session_store.get_by_call_id(call_id)
             if latest_session is not None:
                 session = latest_session
+            if self._google_post_tts_protection_active(session):
+                return
             if bool(getattr(session, "audio_capture_enabled", True)) and not bool(
                 getattr(session, "tts_playing", False)
             ):
@@ -11771,6 +11977,8 @@ class Engine:
                 import time as _time
                 _cleanup_completed_at[call_id] = _time.time()
             
+            from src.core.pre_call_hold import stop_pre_call_holds
+            await stop_pre_call_holds(session)
             logger.info("Cleaning up call", call_id=call_id)
             observed = (
                 session.vad_state.get("pipeline_observability", {})
@@ -11809,7 +12017,9 @@ class Engine:
             # Determine call outcome based on session state
             call_outcome = str(getattr(session, "call_outcome", "") or "").strip() or "caller_hangup"
             try:
-                if call_outcome == "caller_hangup" and self._session_was_transferred(session):
+                if getattr(session, "voicemail_handoff_outcome", None) in {"pending", "indeterminate"}:
+                    call_outcome = "error"
+                elif call_outcome == "caller_hangup" and self._session_was_transferred(session):
                     call_outcome = "transferred"
                 elif call_outcome == "caller_hangup" and getattr(session, 'cleanup_after_tts', False):
                     call_outcome = "agent_hangup"  # AI agent initiated hangup via hangup_call tool
@@ -12131,6 +12341,7 @@ class Engine:
                 self.websocket_media_channels.pop(session.media_channel_id, None)
 
             # Clear per-call resample states to prevent unbounded memory growth
+            self._finish_provider_input_gain(call_id)
             self._resample_state_provider_in.pop(call_id, None)
             self._resample_state_provider_out.pop(call_id, None)
             self._resample_state_pipeline16k.pop(call_id, None)
@@ -12366,11 +12577,14 @@ class Engine:
                     provider_name=getattr(session, "provider_name", None) or "",
                     pipeline_name=getattr(session, "pipeline_name", None) or "",
                     audio_transport=getattr(self.config, "audio_transport", "") or "",
-                    transferred=self._session_was_transferred(session),
+                    transferred=(self._session_was_transferred(session) and getattr(
+                        session, "voicemail_handoff_outcome", None) not in {"pending", "indeterminate"}),
+                    voicemail_handoff_outcome=getattr(session, "voicemail_handoff_outcome", None),
                     transfer_destination=getattr(session, "transfer_destination", None) or getattr(session, "transfer_target", None) or "",
                     media_rx_confirmed=bool(getattr(session, "media_rx_confirmed", False)),
                     upstream_squelch_frames=int(((getattr(session, "vad_state", {}) or {}).get("upstream_squelch", {}) or {}).get("frames", 0)),
                     upstream_squelch_suppressed_frames=int(((getattr(session, "vad_state", {}) or {}).get("upstream_squelch", {}) or {}).get("suppressed_frames", 0)),
+                    google_post_tts_protection=dict(session.audio_diagnostics.get("google_post_tts_protection", {})),
                     websocket_input_rejections=dict(getattr(session, "websocket_input_rejections", {})),
                 )
             except Exception:
@@ -12384,6 +12598,15 @@ class Engine:
             # step fails. Only the invocation that acquired cleanup ownership
             # may close handles or release the in-memory guard.
             if resolved_call_id and cleanup_owned:
+                self._last_transcript_ts.pop(resolved_call_id, None)
+                caller_id = session.caller_channel_id
+                getattr(self, "_audiosocket_frame_count", {}).pop(caller_id, None)
+                self.channel_to_conns.pop(caller_id, None)
+                self.audiosocket_primary_conn.pop(caller_id, None)
+                for conn_id, channel_id in list(self.conn_to_channel.items()):
+                    if channel_id == caller_id:
+                        self.conn_to_channel.pop(conn_id, None)
+                self.streaming_playback_manager.cleanup_call(resolved_call_id)
                 try:
                     self.audio_capture.close_call(resolved_call_id)
                 except Exception:
@@ -12448,7 +12671,12 @@ class Engine:
             # Determine outcome
             outcome = "completed"
             explicit_outcome = str(getattr(session, "call_outcome", "") or "").strip()
-            if explicit_outcome == "no_input_timeout":
+            voicemail_unconfirmed = getattr(session, "voicemail_handoff_outcome", None) in {"pending", "indeterminate"}
+            # Cleanup's frozen error also feeds post-call tools. A late ARI
+            # result may update routing ownership, not rewrite that report.
+            if voicemail_unconfirmed or explicit_outcome == "error":
+                outcome = "error"
+            elif explicit_outcome == "no_input_timeout":
                 outcome = "no_input_timeout"
             elif session.error_message:
                 outcome = "error"
@@ -12484,7 +12712,10 @@ class Engine:
                 conversation_history=session.conversation_history or [],
                 outcome=outcome,
                 transfer_destination=session.transfer_destination,
-                error_message=session.error_message,
+                error_message=(session.error_message or (
+                    "Voicemail handoff could not be confirmed; the caller may have left the AI agent."
+                    if voicemail_unconfirmed else None
+                )),
                 tool_calls=getattr(session, 'tool_calls', []) or [],
                 pre_call_tool_calls=getattr(session, 'pre_call_tool_calls', []) or [],
                 call_metadata=dict(getattr(session, 'call_metadata', {}) or {}),
@@ -12538,7 +12769,8 @@ class Engine:
                             amd = self._outbound_attempt_amd.get(attempt_id) if hasattr(self, "_outbound_attempt_amd") else None
                             # Normalize final outcome (MVP: answered vs error)
                             final_outcome = "answered_human"
-                            if session.error_message:
+                            if (session.error_message or getattr(session, "voicemail_handoff_outcome", None)
+                                    in {"pending", "indeterminate"}):
                                 final_outcome = "error"
                             elif self._session_was_transferred(session):
                                 final_outcome = "transferred"
@@ -12610,7 +12842,6 @@ class Engine:
 
             # Track mappings
             self.conn_to_channel[conn_id] = caller_channel_id
-            self.channel_to_conn[caller_channel_id] = conn_id
             self.channel_to_conns.setdefault(caller_channel_id, set()).add(conn_id)
             if caller_channel_id not in self.audiosocket_primary_conn:
                 self.audiosocket_primary_conn[caller_channel_id] = conn_id
@@ -12663,11 +12894,20 @@ class Engine:
                         caller_channel_id = self.uuidext_to_channel.get(uuid_str)
                         if caller_channel_id:
                             self.conn_to_channel[conn_id] = caller_channel_id
+                            self.channel_to_conns.setdefault(caller_channel_id, set()).add(conn_id)
                 except Exception:
                     pass
 
             if not caller_channel_id:
                 logger.debug("AudioSocket audio received for unknown connection", conn_id=conn_id, bytes=len(audio_bytes))
+                return
+
+            session = await self.session_store.get_by_call_id(caller_channel_id)
+            if (
+                not session or session.cleanup_in_progress or session.cleanup_completed
+                or self.conn_to_channel.get(conn_id) != caller_channel_id
+            ):
+                logger.debug("No active session for caller; dropping AudioSocket audio", conn_id=conn_id, caller_channel_id=caller_channel_id)
                 return
 
             # Track frame count per call
@@ -12686,11 +12926,6 @@ class Engine:
                     sample_rate=frame_rate,
                     conn_id=conn_id,
                 )
-
-            session = await self.session_store.get_by_call_id(caller_channel_id)
-            if not session:
-                logger.debug("No session for caller; dropping AudioSocket audio", conn_id=conn_id, caller_channel_id=caller_channel_id)
-                return
 
             # Media-path confirmation: first inbound audio frame observed.
             # Used to gate barge-in actions so we don't trigger during setup races.
@@ -13182,13 +13417,19 @@ class Engine:
                     except (caller_audioop.error, ValueError):
                         logger.debug("Google fallback PCM conditioning failed", call_id=caller_channel_id)
 
-                if needs_gating and not session.audio_capture_enabled:
+                post_tts_protected = self._google_post_tts_protection_active(session)
+                if post_tts_protected:
+                    session.barge_in_candidate_ms = 0
+                    session.barge_start_ts = 0.0
+                    self._note_google_protected_frame(session, pcm_bytes, pcm_rate)
+                if needs_gating and (not session.audio_capture_enabled or post_tts_protected):
                     # Send silence instead of blocking so Google Live's continuous
                     # input timing and VAD state remain stable.
                     logger.debug(
                         "🔇 GATING ACTIVE - Sending silence frame for Google Live (TTS playing)",
                         call_id=caller_channel_id,
                         audio_capture_enabled=session.audio_capture_enabled,
+                        protection_reason="post_tts" if post_tts_protected else "tts_playback",
                     )
                     pcm_bytes = b'\x00' * len(pcm_bytes)
 
@@ -13343,8 +13584,8 @@ class Engine:
                         frame_num=frame_num,
                         frame_bytes=len(audio_bytes),
                         pcm_bytes=len(pcm_bytes),
-                        gating_active=needs_gating and not session.audio_capture_enabled,
-                        is_silence=needs_gating and not session.audio_capture_enabled,
+                        gating_active=needs_gating and (not session.audio_capture_enabled or post_tts_protected),
+                        is_silence=needs_gating and (not session.audio_capture_enabled or post_tts_protected),
                         squelch_applicable=squelch_applicable,
                         squelch_suppressed=squelch_suppressed,
                         squelch_speech_evidence=squelch_speech_evidence,
@@ -13416,7 +13657,9 @@ class Engine:
                         exc_info=True,
                     )
                 # Provider-owned mode: local VAD fallback may flush local output (never cancels provider).
-                if not full_duplex_barge_in:
+                # Keep the frame's classification across send_audio's await;
+                # expiry must not admit protected echo to the local detector.
+                if not post_tts_protected and not full_duplex_barge_in:
                     try:
                         await self._maybe_provider_barge_in_fallback(
                             session,
@@ -14219,6 +14462,11 @@ class Engine:
                     )
                 return
 
+            if self._google_post_tts_protection_active(session):
+                session.barge_in_candidate_ms = 0
+                session.barge_start_ts = 0.0
+                return
+
             # Only relevant while streaming playback is active (agent is speaking).
             try:
                 if not self.streaming_playback_manager.is_stream_active(call_id):
@@ -14621,6 +14869,13 @@ class Engine:
                         exc_info=True,
                     )
 
+            # Accepted caller speech must survive the token release caused by a
+            # flush, and a pending natural-completion observer must not re-arm it.
+            if self._google_owns_input_gating(session):
+                session.google_output_interrupted = True
+                session.google_playback_drained_monotonic = 0.0
+                session.google_output_emission_end_monotonic = 0.0
+
             # Stop/flush streaming playback first (prevents tail audio).
             self._close_google_audio_backlog(call_id)
             # Mark end_reason so cleanup skips remainder flush (avoids oversized RTP packets).
@@ -14935,6 +15190,7 @@ class Engine:
                 conns.discard(conn_id)
                 if not conns:
                     self.channel_to_conns.pop(caller_channel_id, None)
+                    getattr(self, "_audiosocket_frame_count", {}).pop(caller_channel_id, None)
                 # Reset primary if needed
                 if self.audiosocket_primary_conn.get(caller_channel_id) == conn_id:
                     self.audiosocket_primary_conn.pop(caller_channel_id, None)
@@ -15270,12 +15526,20 @@ class Engine:
                     provider=provider,
                 )
 
+                post_tts_protected = self._google_post_tts_protection_active(session)
+                if post_tts_protected:
+                    session.barge_in_candidate_ms = 0
+                    session.barge_start_ts = 0.0
+                    gating_mode = "silence"
+                    self._note_google_protected_frame(session, pcm_16k, pcm_sample_rate)
+
                 if gating_mode == "silence":
                     # Send SILENCE instead of dropping to maintain Google Live's stream
                     logger.debug(
                         "🔇 GATING ACTIVE - Sending silence frame for Google Live (TTS playing)",
                         call_id=caller_channel_id,
                         provider=provider_name,
+                        protection_reason="post_tts" if post_tts_protected else "tts_playback",
                     )
                     # Replace audio with silence (zero-filled PCM16)
                     pcm_16k = b'\x00' * len(pcm_16k)
@@ -15339,7 +15603,7 @@ class Engine:
                     logger.debug("Continuous-input transport forward error", call_id=caller_channel_id, source=source, error=str(exc))
 
                 # Provider-owned mode: local VAD fallback may flush local output (never cancels provider).
-                if not self._google_live_full_duplex_barge_in(provider_name, provider):
+                if not post_tts_protected and not self._google_live_full_duplex_barge_in(provider_name, provider):
                     try:
                         await self._maybe_provider_barge_in_fallback(
                             session,
@@ -16304,7 +16568,7 @@ class Engine:
                     if response_id < google_audio_provider._playback_response_id:
                         return
                     google_audio_provider._playback_response_id = response_id
-                await self._note_provider_output_start(call_id)
+                await self._note_provider_output_start(call_id, session)
                 encoding = event.get("encoding")
                 if isinstance(encoding, bytes):
                     try:
@@ -16760,6 +17024,9 @@ class Engine:
                 defer_gating_until_drain = bool(
                     generation_only or event.get("defer_tts_gating_until_drain", False)
                     or getattr(self.config, "audio_transport", None) == "websocket"
+                    or (self._google_owns_input_gating(session)
+                        and session.conversation_state == "greeting"
+                        and not session.google_output_interrupted)
                 )
                 # If we were suppressing output due to barge-in, end suppression at a segment boundary.
                 # This prevents cutting into the next (new) response once the provider finishes the interrupted one.
@@ -17480,8 +17747,8 @@ class Engine:
                         exc_info=True,
                     )
 
-    async def _call_audio_drain_snapshot(self, call_id: str) -> Dict[str, Any]:
-        """Return pending caller-facing audio across provider, stream, and file paths."""
+    def _call_audio_buffer_snapshot(self, call_id: str) -> Dict[str, Any]:
+        """Read paced/remote output buffers synchronously for drain and ingress."""
         pending_provider_chunks = 0
         pending_coalesce_bytes = 0
         pending_stream_bytes = 0
@@ -17490,8 +17757,8 @@ class Engine:
         pending_transport_setup = 0
         pending_transport_output = 0
         pending_transport_frames = 0
-        active_playbacks = 0
         last_real_emit_ts: Optional[float] = None
+        last_real_emit_monotonic: Optional[float] = None
 
         try:
             provider_queue = self._provider_stream_queues.get(call_id)
@@ -17516,17 +17783,15 @@ class Engine:
                 emit_ts = stream_info.get("last_real_emit_ts")
                 if emit_ts is not None:
                     last_real_emit_ts = float(emit_ts)
+                emit_mono = stream_info.get("last_real_emit_monotonic")
+                if emit_mono is not None:
+                    last_real_emit_monotonic = float(emit_mono)
             jitter_buffers = getattr(spm, "jitter_buffers", {}) if spm else {}
             jitter_buffer = jitter_buffers.get(call_id)
             if jitter_buffer is not None:
                 pending_jitter_frames = int(jitter_buffer.qsize())
             remainders = getattr(spm, "frame_remainders", {}) if spm else {}
             pending_remainder_bytes = len(remainders.get(call_id, b"") or b"")
-        except Exception:
-            pass
-
-        try:
-            active_playbacks = len(await self.session_store.list_playbacks_for_call(call_id))
         except Exception:
             pass
 
@@ -17554,9 +17819,20 @@ class Engine:
             "pending_transport_setup": pending_transport_setup,
             "pending_transport_output": pending_transport_output,
             "pending_transport_frames": pending_transport_frames,
-            "active_playbacks": active_playbacks,
             "last_real_emit_ts": last_real_emit_ts,
+            "last_real_emit_monotonic": last_real_emit_monotonic,
         }
+
+    async def _call_audio_drain_snapshot(self, call_id: str) -> Dict[str, Any]:
+        """Return pending caller-facing audio across provider, stream, and file paths."""
+        snapshot = self._call_audio_buffer_snapshot(call_id)
+        snapshot.pop("last_real_emit_monotonic", None)
+        snapshot["active_playbacks"] = 0
+        try:
+            snapshot["active_playbacks"] = len(await self.session_store.list_playbacks_for_call(call_id))
+        except Exception:
+            pass
+        return snapshot
 
     def _terminal_transport_quiet_sec(self) -> float:
         """Return the post-emit safety tail for the active call transport."""
@@ -17609,6 +17885,8 @@ class Engine:
             has_pending_audio = any(int(value or 0) > 0 for value in snapshot.values())
 
             if has_pending_audio:
+                if session:
+                    session.google_output_emission_end_monotonic = 0.0
                 quiet_started_at = None
                 if not logged_wait:
                     logger.info(
@@ -17620,6 +17898,8 @@ class Engine:
                     logged_wait = True
             else:
                 now_mono = time.monotonic()
+                if session and self._google_owns_input_gating(session) and not session.google_output_interrupted:
+                    self._google_output_emission_end(session)
                 if quiet_started_at is None:
                     quiet_started_at = now_mono
                 quiet_elapsed = now_mono - quiet_started_at
@@ -17737,7 +18017,7 @@ class Engine:
                 return False
 
             session = await self.session_store.get_by_call_id(call_id)
-            if not session or bool(getattr(session, "cleanup_in_progress", False)):
+            if not session or session.cleanup_in_progress or session.cleanup_completed:
                 return False
             if (self._session_was_transferred(session)
                     or self._session_has_pending_attended_transfer(session)
@@ -17746,96 +18026,142 @@ class Engine:
                 return False
 
             started.add(call_id)
-            fallback_tasks = getattr(self, "_terminal_fallback_tasks", {})
-            fallback = fallback_tasks.pop(call_id, None)
-            current_task = asyncio.current_task()
-            if fallback and fallback is not current_task and not fallback.done():
-                fallback.cancel()
-
-            drained = True
-            if not audio_already_drained:
-                google_provider = self._google_long_audio_provider(session)
-                if google_provider:
-                    drain_timeout_sec = max(drain_timeout_sec, google_provider.config.long_audio_backlog_sec + 30.0)
-                if drain_timeout_cap_sec is not None:
-                    drain_timeout_sec = min(drain_timeout_sec, max(0.0, drain_timeout_cap_sec))
-                drained = await self._wait_for_call_audio_drain(
-                    call_id,
-                    timeout_sec=drain_timeout_sec,
-                    quiet_sec=self._terminal_transport_quiet_sec(),
-                    reason=reason,
-                )
-
-            # A transfer may have taken ownership and recovered while this
-            # older hangup was draining. Its pending action can already be gone.
-            if call_id not in started:
-                return False
-            session = await self.session_store.get_by_call_id(call_id)
-            if not session or self._session_was_transferred(session):
-                return False
-            if isinstance(getattr(session, "pending_deferred_transfer", None), dict):
-                started.discard(call_id)
-                return False
-            if drain_timeout_cap_sec is not None and (
-                bool(getattr(session, "cleanup_in_progress", False))
-                or self._session_has_pending_attended_transfer(session)
-            ):
-                started.discard(call_id)
-                return False
-            if call_outcome:
-                session.call_outcome = call_outcome
-            session.cleanup_after_tts = False
-            await self._save_session(session)
-            logger.info(
-                "Executing terminal hangup",
-                call_id=call_id,
-                channel_id=session.caller_channel_id,
-                reason=reason,
-                audio_drained=drained,
-                transport=getattr(getattr(self, "config", None), "audio_transport", None),
-            )
-            if getattr(session, "external_platform", None) == "vicidial":
-                finalized = False
-                try:
-                    finalized = await self._finalize_vicidial_call(
-                        session,
-                        semantic="ai_hangup",
-                        operation_reason=reason,
-                    )
-                finally:
-                    if not finalized:
-                        # VICIdial still owns an active call. Release both the
-                        # engine and provider terminal guards so caller audio
-                        # resumes and a later tool or cleanup request can retry.
-                        provider = (getattr(self, "_call_providers", {}) or {}).get(
-                            call_id
-                        )
-                        release_provider = getattr(
-                            provider, "release_terminal_output_protection", None
-                        )
-                        if callable(release_provider):
-                            try:
-                                release_provider()
-                            except Exception:
-                                logger.warning(
-                                    "Failed to release provider terminal protection",
-                                    call_id=call_id,
-                                    provider=type(provider).__name__,
-                                    exc_info=True,
-                                )
-                        started.discard(call_id)
-                return finalized
+            owner_session = session
+            owner_channel = session.caller_channel_id
+            owner_provider = (getattr(self, "_call_providers", {}) or {}).get(call_id)
+            completed = False
             try:
-                await self.ari_client.hangup_channel(session.caller_channel_id)
-                return True
-            except Exception:
-                logger.debug(
-                    "Terminal ARI hangup failed (channel may already be gone)",
+                fallback_tasks = getattr(self, "_terminal_fallback_tasks", {})
+                fallback = fallback_tasks.pop(call_id, None)
+                current_task = asyncio.current_task()
+                if fallback and fallback is not current_task and not fallback.done():
+                    fallback.cancel()
+
+                drained = True
+                if not audio_already_drained:
+                    google_provider = self._google_long_audio_provider(session)
+                    if google_provider:
+                        drain_timeout_sec = max(drain_timeout_sec, google_provider.config.long_audio_backlog_sec + 30.0)
+                    if drain_timeout_cap_sec is not None:
+                        drain_timeout_sec = min(drain_timeout_sec, max(0.0, drain_timeout_cap_sec))
+                    drained = await self._wait_for_call_audio_drain(
+                        call_id,
+                        timeout_sec=drain_timeout_sec,
+                        quiet_sec=self._terminal_transport_quiet_sec(),
+                        reason=reason,
+                    )
+
+                # A transfer may have taken ownership and recovered while this
+                # older hangup was draining. Its pending action can already be gone.
+                if call_id not in started:
+                    return False
+                session = await self.session_store.get_by_call_id(call_id)
+                if (session is not owner_session or session.cleanup_in_progress
+                        or session.cleanup_completed or self._session_was_transferred(session)
+                        or self._session_has_pending_attended_transfer(session)):
+                    return False
+                if isinstance(getattr(session, "pending_deferred_transfer", None), dict):
+                    started.discard(call_id)
+                    return False
+                if call_outcome:
+                    session.call_outcome = call_outcome
+                session.cleanup_after_tts = False
+                await self._save_session(session, require_current=True)
+                # Let already-queued routing ownership changes run before the
+                # irreversible ARI DELETE admission check below.
+                await asyncio.sleep(0)
+                logger.info(
+                    "Executing terminal hangup",
                     call_id=call_id,
+                    channel_id=session.caller_channel_id,
                     reason=reason,
-                    exc_info=True,
+                    audio_drained=drained,
+                    transport=getattr(getattr(self, "config", None), "audio_transport", None),
                 )
+                if getattr(session, "external_platform", None) == "vicidial":
+                    finalized = False
+                    try:
+                        finalized = await self._finalize_vicidial_call(
+                            session,
+                            semantic="ai_hangup",
+                            operation_reason=reason,
+                        )
+                    finally:
+                        if not finalized:
+                            # VICIdial still owns an active call. Release both the
+                            # engine and provider terminal guards so caller audio
+                            # resumes and a later tool or cleanup request can retry.
+                            provider = (getattr(self, "_call_providers", {}) or {}).get(
+                                call_id
+                            )
+                            release_provider = getattr(
+                                provider, "release_terminal_output_protection", None
+                            )
+                            if callable(release_provider):
+                                try:
+                                    release_provider()
+                                except Exception:
+                                    logger.warning(
+                                        "Failed to release provider terminal protection",
+                                        call_id=call_id,
+                                        provider=type(provider).__name__,
+                                        exc_info=True,
+                                    )
+                            started.discard(call_id)
+                    completed = finalized
+                    return finalized
+                # DELETE is idempotent; ARIClient treats already-gone (404) as
+                # success. Bound attempts and revalidate ownership before each one.
+                for attempt in range(3):
+                    if attempt:
+                        await asyncio.sleep((0.25, 0.75)[attempt - 1])
+                    latest = await self.session_store.get_by_call_id(call_id)
+                    if (latest is not owner_session or locks.get(call_id) is not lock
+                            or call_id not in started or latest.cleanup_in_progress
+                            or latest.cleanup_completed or latest.caller_channel_id != owner_channel
+                            or self._session_was_transferred(latest)
+                            or self._session_has_pending_attended_transfer(latest)
+                            or isinstance(getattr(latest, "pending_deferred_transfer", None), dict)):
+                        return False
+                    async def delete_if_still_owned():
+                        latest = await self.session_store.get_by_call_id(call_id)
+                        if (latest is not owner_session or locks.get(call_id) is not lock
+                                or call_id not in started or latest.cleanup_in_progress
+                                or latest.cleanup_completed or latest.caller_channel_id != owner_channel
+                                or self._session_was_transferred(latest)
+                                or self._session_has_pending_attended_transfer(latest)
+                                or isinstance(getattr(latest, "pending_deferred_transfer", None), dict)):
+                            return False
+                        return await self.ari_client.hangup_channel(owner_channel)
+
+                    try:
+                        accepted = await asyncio.wait_for(
+                            delete_if_still_owned(), timeout=3.0,
+                        )
+                    except Exception:
+                        accepted = False
+                    if accepted is True:
+                        completed = True
+                        return True
+                    logger.warning("Terminal ARI hangup not accepted", call_id=call_id,
+                                   reason=reason, attempt=attempt + 1)
                 return False
+            finally:
+                if not completed and locks.get(call_id) is lock:
+                    started.discard(call_id)
+                    if (getattr(owner_session, "external_platform", None) != "vicidial"
+                            and not owner_session.cleanup_in_progress
+                            and not owner_session.cleanup_completed
+                            and not self._session_was_transferred(owner_session)
+                            and not self._session_has_pending_attended_transfer(owner_session)
+                            and not isinstance(getattr(owner_session, "pending_deferred_transfer", None), dict)):
+                        provider = (getattr(self, "_call_providers", {}) or {}).get(call_id)
+                        release = getattr(owner_provider, "release_terminal_output_protection", None)
+                        if provider is owner_provider and callable(release):
+                            try:
+                                release()
+                            except Exception:
+                                logger.warning("Failed to release native terminal protection", call_id=call_id)
 
     def _schedule_terminal_fallback(
         self,
@@ -18729,6 +19055,8 @@ class Engine:
                     except Exception:
                         logger.debug("STT transcribe failed", call_id=call_id, exc_info=True)
                         return
+                    if session.cleanup_in_progress or session.cleanup_completed:
+                        return
                     transcript = (transcript or "").strip()
                     if not transcript:
                         return
@@ -18829,6 +19157,8 @@ class Engine:
                 async def stt_receiver() -> None:
                     try:
                         async for final in pipeline.stt_adapter.iter_results(call_id):
+                            if session.cleanup_in_progress or session.cleanup_completed:
+                                return
                             try:
                                 # Record time when a final transcript arrives
                                 self._last_transcript_ts[call_id] = time.time()
@@ -22072,55 +22402,31 @@ class Engine:
                     expected_rate=expected_rate,
                 )
             
-            # Re-enabled: Gain normalization required for low-volume audio
-            # Root cause identified: Incoming audio had RMS=23 (needs ~1400)
-            # Without normalization, Google Live cannot understand quiet audio
-            # Silence frames during gating prevent echo while maintaining stream continuity
-            #
-            # NOTE: This is now gated by per-provider config:
-            # - input_gain_target_rms <= 0 or input_gain_max_db <= 0.0  => gain disabled (default)
-            # - both > 0 => enable normalization with configured target/max gain.
+            # Gain remains opt-in and PCM-only. Keep its envelope and counters
+            # with the call-owned input state, never on a shared provider config.
             if pcm_bytes and gain_target_rms > 0 and gain_max_db > 0.0:
                 try:
-                    # audioop already imported at module level - don't re-import here!
-                    current_rms = audioop.rms(pcm_bytes, 2)
-                    target_rms = gain_target_rms
-                    max_gain_db = gain_max_db
-                    
-                    if current_rms > 10:  # Only apply if audio has some energy
-                        gain_needed = target_rms / current_rms
-                        max_gain = 10 ** (max_gain_db / 20.0)
-                        gain = min(gain_needed, max_gain)
-                        
-                        if gain > 1.05:  # Apply if gain needed is >5%
-                            pcm_bytes = audioop.mul(pcm_bytes, 2, gain)
-                            actual_rms = audioop.rms(pcm_bytes, 2)
-                            
-                            # CRITICAL: Warn about excessive gain (indicates audio quality issues)
-                            # High gain on low-quality audio causes distortion and speech recognition failures
-                            if gain > 10.0:
-                                logger.warning(
-                                    "⚠️ AUDIO QUALITY ISSUE: Excessive gain required!",
-                                    call_id=call_id,
-                                    provider=provider_name,
-                                    gain_multiplier=f"{gain:.1f}x",
-                                    rms_before=current_rms,
-                                    rms_target=target_rms,
-                                    recommendation="Check SIP trunk rxgain configuration - incoming audio too quiet",
-                                )
-                            
-                            logger.info(
-                                "🔊 Provider input: Gain applied",
-                                call_id=call_id,
-                                provider=provider_name,
-                                rms_before=current_rms,
-                                rms_after=actual_rms,
-                                rms_target=target_rms,
-                                gain=f"{gain:.2f}",
-                            )
+                    floor = int(getattr(provider_cfg, "input_gain_noise_floor_rms", 200))
+                    key = f"gain:{provider_name}"
+                    gain_state = prov_states.get(key)
+                    if not isinstance(gain_state, InputGainState):
+                        gain_state = InputGainState(
+                            provider_name, gain_target_rms, gain_max_db, floor
+                        )
+                        prov_states[key] = gain_state
+                    pcm_bytes = gain_state.process(pcm_bytes, pcm_rate)
+                    if gain_state.excessive_frames and not gain_state.warned:
+                        gain_state.warned = True
+                        logger.warning(
+                            "Provider input gain exceeded 10x",
+                            call_id=call_id,
+                            provider=provider_name,
+                            noise_floor_rms=floor,
+                            message_detail="Review call-level input gain summary; quiet frames alone do not diagnose trunk gain",
+                        )
                 except Exception as e:
-                    logger.error(f"Provider input normalization failed: {e}", call_id=call_id, exc_info=True)
-            
+                    logger.error("Provider input normalization failed", error=str(e), call_id=call_id, exc_info=True)
+
             return pcm_bytes, "slin16", pcm_rate
 
         if expected_enc in ("ulaw", "mulaw", "g711_ulaw", "mu-law"):
@@ -22142,6 +22448,21 @@ class Engine:
 
         # Fallback: return PCM as-is
         return pcm_bytes, "slin16", pcm_rate
+
+    def _finish_provider_input_gain(self, call_id: str, provider_name: Optional[str] = None) -> None:
+        """Summarize and release gain state exactly once on stop or cleanup."""
+        states = getattr(self, "_resample_state_provider_in", {}).get(call_id, {})
+        for key, state in list(states.items()):
+            if isinstance(state, InputGainState) and (
+                provider_name is None or state.provider_name == provider_name
+            ):
+                states.pop(key, None)
+                logger.info(
+                    "Provider input gain summary",
+                    call_id=call_id,
+                    provider=state.provider_name,
+                    **state.summary(),
+                )
 
     async def _update_transport_profile(self, session: CallSession, *, fmt: Optional[str], sample_rate: Optional[int], source: str) -> None:
         """Persist transport profile updates and sync preferences."""
@@ -22247,16 +22568,29 @@ class Engine:
                 )
             rms_threshold = 50 if canonical == "ulaw" else 200
             alert_key = f"{stage}_low_rms_alerted"
-            if rms < rms_threshold and not session.audio_diagnostics.get(alert_key):
-                session.audio_diagnostics[alert_key] = True
-                logger.warning(
-                    "Low audio energy detected; degraded audio quality likely",
-                    call_id=session.call_id,
-                    stage=stage,
-                    format=canonical,
-                    rms=rms,
-                    threshold=rms_threshold,
+            # Ignore empty/digital silence (including intentional TTS gating).
+            # Require one second of nonzero audio before diagnosing low energy.
+            if rms > 0 and sample_rate > 0 and not session.audio_diagnostics.get(alert_key):
+                window = session.audio_diagnostics.setdefault(
+                    f"{stage}_energy_window", {"seconds": 0.0, "energy": 0.0}
                 )
+                duration = len(pcm) / (2.0 * sample_rate)
+                window["seconds"] += duration
+                window["energy"] += rms * rms * duration
+                if window["seconds"] >= 1.0 - 1e-9:
+                    window_rms = math.sqrt(window["energy"] / window["seconds"])
+                    if window_rms < rms_threshold:
+                        session.audio_diagnostics[alert_key] = True
+                        logger.warning(
+                            "Sustained low audio energy detected",
+                            call_id=session.call_id,
+                            stage=stage,
+                            format=canonical,
+                            rms=round(window_rms),
+                            threshold=rms_threshold,
+                            active_audio_seconds=round(window["seconds"], 3),
+                        )
+                    window.update(seconds=0.0, energy=0.0)
             dc_threshold = 600
             dc_alert_key = f"{stage}_dc_alerted"
             if abs(dc_offset) > dc_threshold and not session.audio_diagnostics.get(dc_alert_key):
@@ -24620,6 +24954,21 @@ class Engine:
             return await self._commit_pending_deferred_transfer_for_call_inner(
                 call_id, session, commit_marker=marker, expected_action_id=expected_action_id,
             )
+        except asyncio.CancelledError:
+            latest = await self.session_store.get_by_call_id(call_id)
+            pending = getattr(latest, "pending_deferred_transfer", None)
+            if (marker.get("voicemail_owner") and isinstance(pending, dict)
+                    and pending.get("id") == expected_action_id
+                    and pending.get("source_tool") == "leave_voicemail"
+                    and getattr(latest, "voicemail_handoff_outcome", None) is None):
+                # Cancellation before ARI has no external effect. Retire only
+                # this action, leaving replacement and uncertain owners alone.
+                latest.pending_deferred_transfer = None
+                await self._record_deferred_transfer_timeout_tool_result(
+                    latest, pending, error_code="voicemail_cancelled",
+                    message="Voicemail handoff cancelled before the dialplan request.",
+                )
+            raise
         finally:
             self._release_deferred_transfer_commit(call_id, expected_action_id)
             markers = committing.get(call_id) or []
@@ -24628,7 +24977,9 @@ class Engine:
             if not markers:
                 committing.pop(call_id, None)
             state = getattr(self, "_transfer_handoffs", {}).get(call_id)
-            if state and state.action_id == expected_action_id:
+            another_voicemail_owner = any(m.get("voicemail_owner") for m in markers)
+            if (state and state.action_id == expected_action_id
+                    and (marker.get("voicemail_owner") or not another_voicemail_owner)):
                 state.cancel()
                 self._transfer_handoffs.pop(call_id, None)
 
@@ -24671,6 +25022,8 @@ class Engine:
                     latest_action_id=action_id,
                 )
                 return None
+            if commit_marker is not None and action.get("source_tool") == "leave_voicemail":
+                commit_marker["voicemail_owner"] = True
             # Preserve #702's original pre-await gate for every legacy action.
             # Only opted-in provider announcements keep admission open here.
             if commit_marker is not None and (not action.get("handoff") or action.get("_engine_handoff_attempted")):
@@ -24705,6 +25058,13 @@ class Engine:
                 pending = getattr(session, "pending_deferred_transfer", None)
                 if not isinstance(pending, dict) or pending.get("id") != action_id:
                     return None
+            if action.get("source_tool") == "leave_voicemail":
+                state = getattr(self, "_transfer_handoffs", {}).get(call_id)
+                if (not state or state.action_id != action_id or state.reason not in {
+                        "origin_sentence_matched", "reply_completed", "pipeline_announcement_completed"}):
+                    return await self._recover_failed_deferred_transfer(
+                        call_id, action_id=action_id, preparation_failed=True,
+                    )
             if commit_marker is not None:
                 commit_marker["action_id"] = action_id
 
@@ -24761,6 +25121,10 @@ class Engine:
                     status=result.get("status"),
                     message=result.get("message"),
                 )
+            if isinstance(result, dict) and result.get("handoff_indeterminate") is True:
+                # The channel may already belong to dialplan. Do not cancel,
+                # speak, terminate, or replay an uncertain external handoff.
+                return result
             if not isinstance(result, dict) or result.get("status") != "success":
                 # Do not replay a potentially side-effectful commit on the next
                 # provider completion, or leave hangup blocked indefinitely.
@@ -24787,6 +25151,8 @@ class Engine:
         preparation_failed: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Cancel the exact failed action; resume AI unless its output has failed."""
+        from src.tools.context import ToolExecutionContext
+
         error_code = "deferred_transfer_commit_failed" if commit_failed else "deferred_audio_drain_timeout"
         message = (
             "Deferred transfer cancelled because the transfer commit failed."
@@ -24812,6 +25178,16 @@ class Engine:
                 latest_action_id=action.get("id") if isinstance(action, dict) else None,
             )
             return None
+
+        if (action.get("source_tool") == "leave_voicemail"
+                and (self._session_was_transferred(session)
+                     or ToolExecutionContext.is_pending_attended_transfer(session))):
+            session.pending_deferred_transfer = None
+            await self._record_deferred_transfer_timeout_tool_result(
+                session, action, error_code="voicemail_superseded",
+                message="Voicemail handoff cancelled because another routing action owns the call.",
+            )
+            return {"status": "failed", "transfer_cancelled": True, "apology_spoken": False}
 
         queue_failed = bool(session.audio_diagnostics.get("provider_queue_failed"))
         if queue_failed:
@@ -25025,7 +25401,8 @@ class Engine:
             parameters=dict(origin.get("params") or {}),
             result={
                 "status": "cancelled",
-                "action": "deferred_transfer_commit_failed" if error_code == "deferred_transfer_commit_failed" else "deferred_transfer_timeout",
+                "action": ("voicemail_failed" if action.get("source_tool") == "leave_voicemail" else
+                           "deferred_transfer_commit_failed" if error_code == "deferred_transfer_commit_failed" else "deferred_transfer_timeout"),
                 "message": message,
                 "error_code": error_code,
                 "transfer_cancelled": True,
@@ -25309,7 +25686,7 @@ class Engine:
             return False
 
         action = getattr(session, "pending_deferred_transfer", None)
-        if not isinstance(action, dict):
+        if not isinstance(action, dict) or action.get("source_tool") == "leave_voicemail":
             return False
 
         description = str(action.get("description") or action.get("destination_key") or action.get("target") or "").strip()
@@ -25528,12 +25905,12 @@ class Engine:
                 ari_client=self.ari_client,
             )
             
-            # Track if we need to play hold audio
-            hold_audio_tasks: Dict[str, asyncio.Task] = {}
+            from src.core.pre_call_hold import PreCallHold
 
             # Collect execution metadata (one entry per tool) for the call history UI.
             # Same shape as post_call_tool_calls so the frontend can render uniformly.
             tool_call_records: List[Dict[str, Any]] = []
+            session.pre_call_tool_calls = tool_call_records
 
             async def run_tool_with_timeout(tool) -> Dict[str, str]:
                 """Execute a single pre-call tool with timeout and hold audio."""
@@ -25549,29 +25926,12 @@ class Engine:
                 tool_start = time.time()
                 tool_results: Dict[str, str] = {}
                 
-                # Schedule hold audio if configured
+                duration_ms = 0.0
+                hold = None
                 if hold_file and self.ari_client:
-                    async def play_hold_audio():
-                        await asyncio.sleep(hold_threshold_ms / 1000.0)
-                        try:
-                            # Connection ringback and the tool's hold prompt both
-                            # target the caller channel. Hand off cleanly before
-                            # starting the configured pre-call hold audio.
-                            await self._stop_connection_audio(
-                                session,
-                                reason="pre-call-hold-audio",
-                            )
-                            # Play the configured hold audio file via ARI
-                            await self.ari_client.play_sound(session.caller_channel_id, hold_file)
-                            logger.debug("Playing hold audio for pre-call tool",
-                                       call_id=call_id, tool=tool_name, file=hold_file)
-                        except Exception as e:
-                            logger.debug("Failed to play hold audio", 
-                                       call_id=call_id, tool=tool_name, error=str(e))
-                    
-                    hold_task = asyncio.create_task(play_hold_audio())
-                    hold_audio_tasks[tool_name] = hold_task
-                
+                    hold = PreCallHold(self.ari_client, session, hold_file,
+                                       hold_threshold_ms, self._stop_connection_audio)
+
                 try:
                     # Execute tool with timeout
                     tool_results = await asyncio.wait_for(
@@ -25596,6 +25956,10 @@ class Engine:
                     # Return empty strings for all expected output variables
                     for var in tool.definition.output_variables:
                         tool_results[var] = ""
+                except asyncio.CancelledError:
+                    exec_status = "error"
+                    exec_error = "cancelled"
+                    raise
                 except Exception as e:
                     duration_ms = (time.time() - tool_start) * 1000
                     exec_status = "error"
@@ -25609,9 +25973,9 @@ class Engine:
                     for var in tool.definition.output_variables:
                         tool_results[var] = ""
                 finally:
-                    # Cancel hold audio if still pending
-                    if tool_name in hold_audio_tasks:
-                        hold_audio_tasks[tool_name].cancel()
+                    duration_ms = (time.time() - tool_start) * 1000
+                    # Record before awaiting cleanup: cancellation during a late
+                    # playback start must not discard the known tool outcome.
                     # Record execution metadata for the call history UI.
                     finished_at_iso = datetime.now(timezone.utc).isoformat()
                     metadata: Dict[str, Any] = {
@@ -25660,6 +26024,8 @@ class Engine:
                         logger.debug("pre-call get_last_result failed",
                                      call_id=call_id, tool=tool_name, exc_info=True)
                     tool_call_records.append(metadata)
+                    if hold:
+                        await hold.close()
 
                 return tool_results
             

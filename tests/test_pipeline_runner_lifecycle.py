@@ -299,6 +299,12 @@ class _StreamOwnershipStub:
     def is_stream_active(self, call_id, stream_id=None):
         return self.active and stream_id == self.stream_id
 
+    async def stop_caller_wait_ambience(self, call_id):
+        return False
+
+    def cleanup_call(self, call_id):
+        self.active = False
+
 
 class _DrainingStreamingStub(_StreamOwnershipStub):
     def __init__(self):
@@ -728,6 +734,22 @@ def test_ext7_default_terminal_fallback_keeps_retained_behavior(caller):
     assert Engine._is_pipeline_farewell_without_tool(
         caller, "Thank you for calling. Goodbye.", normalize_hangup_policy({}),
     )
+
+@pytest.mark.parametrize(
+    "user_text, expected_hangup",
+    [
+        ("Can you hand off to a real person?", False),
+        ("I was on hold and the call dropped", False),
+        ("Please leave a message and call me back", False),
+        ("Please end the call now.", True),
+        ("Please and the call now.", True),
+        ("Okay, hand up the call.", True),
+    ],
+)
+def test_pipeline_terminal_fallback_requires_caller_command(user_text, expected_hangup):
+    assert Engine._is_pipeline_farewell_without_tool(
+        user_text, "Thanks for calling!", normalize_hangup_policy({})
+    ) is expected_hangup
 
 
 class _StubResolution:
@@ -1539,6 +1561,12 @@ class _OverlapPlaybackProbe:
             self._consumer.cancel()
             await asyncio.gather(self._consumer, return_exceptions=True)
         return True
+
+    async def stop_caller_wait_ambience(self, call_id):
+        return False
+
+    def cleanup_call(self, call_id):
+        self.active = False
 
 
 async def _start_controlled_overlap(monkeypatch, *, mode="text", chunks=None):

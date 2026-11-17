@@ -373,6 +373,9 @@ class _TimingPlayback:
     async def stop_caller_wait_ambience(self, call_id):
         return True
 
+    def cleanup_call(self, call_id):
+        self.active_streams.pop(call_id, None)
+
 
 def timing_engine(monkeypatch, tmp_path, agent="aimee_main"):
     # Explicit dummy config, absent test agents DB, and injected ARI operations.
