@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.7.5] - 2026-11-16
+
+### Changed
+
+- **Upstream maintenance catch-up:** merge upstream through `5ad4514f` while
+  retaining the maintained fork's runtime, documentation, release, A2A, and
+  fleet boundaries.
+
 ### Fixed
 
 - **Voicemail announcement drain:** voicemail uses the shared deferred handoff owner and waits for correlated provider completion (or pipeline playback) plus caller transport drain before leaving Stasis. Incomplete announcements cancel safely; uncertain ARI requests cannot trigger recovery speech, hangup, or replay. Submitted-request cancellation retains uncertainty evidence even after a newer routing owner takes over, and native hangup rechecks ownership inside its bounded request task. Call History distinguishes announcement, accepted, cancelled, and uncertain handoffs, and preserves the same cleanup reporting outcome as post-call tools when a request settles during teardown (#863).
