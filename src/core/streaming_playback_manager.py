@@ -3546,13 +3546,19 @@ class StreamingPlaybackManager:
                     conns = list(set(getattr(session, 'audiosocket_conns', []) or []))
                     sent = 0
                     for cid in conns or [conn_id]:
-                        if not self._stream_send_owner_current(call_id, stream_id, session, stream_info):
+                        if caller_wait_ambience:
+                            if not caller_wait_owner_is_current():
+                                return False
+                        elif not self._stream_send_owner_current(call_id, stream_id, session, stream_info):
                             return False
                         if await self._selected_output_transport().write(OutputFrame(
                             call_id, chunk, fmt, sample_rate, connection_id=cid,
                         )):
                             sent += 1
-                        if not self._stream_send_owner_current(call_id, stream_id, session, stream_info):
+                        if caller_wait_ambience:
+                            if not caller_wait_owner_is_current():
+                                return False
+                        elif not self._stream_send_owner_current(call_id, stream_id, session, stream_info):
                             return False
                     if sent == 0:
                         logger.warning("AudioSocket broadcast send failed (no recipients)", call_id=call_id, stream_id=stream_id)
@@ -3564,7 +3570,10 @@ class StreamingPlaybackManager:
                 success = await self._selected_output_transport().write(OutputFrame(
                     call_id, chunk, fmt, sample_rate, connection_id=conn_id,
                 ))
-                if not self._stream_send_owner_current(call_id, stream_id, session, stream_info):
+                if caller_wait_ambience:
+                    if not caller_wait_owner_is_current():
+                        return False
+                elif not self._stream_send_owner_current(call_id, stream_id, session, stream_info):
                     return False
                 if not success:
                     logger.warning("AudioSocket streaming send failed", call_id=call_id, stream_id=stream_id)
