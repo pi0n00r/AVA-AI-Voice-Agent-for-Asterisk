@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **SenseVoice STT in Sherpa offline mode** ([#407](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/407)): `stt_backend=sherpa` with `sherpa_model_type=offline` now auto-detects SenseVoice model directories (`model*.onnx` + `tokens.txt`) and loads them through the bundled `sherpa-onnx`, with no new dependencies. New `SHERPA_SENSE_VOICE_LANGUAGE` (`auto|zh|en|ja|ko|yue`) and `SHERPA_SENSE_VOICE_USE_ITN` settings are available in the Models page, Environment page and Health widget (the Local Provider editor links to these global controls), are persisted to `.env`/YAML, are verified after a switch even when the model path is unchanged, and roll back on failure. Runtime status reports the model family and effective settings. Models without SenseVoice metadata are rejected with a diagnostic before native loading instead of terminating the server. Emotion and audio-event tags are kept out of transcripts. Catalog adds the int8 SenseVoiceSmall export (zh/en/ja/ko/yue); applying it from the Models page selects offline mode unless an operator chose a mode.
+
+### Changed
+
+- **Local AI dependency security:** update Torch, TorchAudio, Transformers, and Hugging Face Hub together. Constrain optional backend installs to the shared pins and keep MeloTTS synthesis and T-one builds compatible with the patched dependency set. Faster-Whisper can load a cached model when a proxy connection fails.
+- Run branch-based CI on `main` and validate release candidates at an exact
+  commit on `main` as part of retiring the legacy development branches.
+
+### Fixed
+
+- **SenseVoice final review:** overlapping Admin model switches are rejected for the entire apply/verify/rollback lifecycle, failed switches restore absent environment overrides, dry-run changes retain their pending reload across concurrent requests and degraded model loads, invalid native metadata values (including float32 overflow and unsupported numeric syntax) are rejected, failed UI applies retain pending settings, normalization-vector dimensions are checked before native decoding, displayed settings match model-switch payloads, and SenseVoice selects have accessible labels (#879).
+
+- **SenseVoice Environment apply:** language and ITN changes now request Local AI container recreation, including when removing an override. The Environment page retains the pending action after refresh until the running container matches the saved environment (#879).
+
+- **Voicemail announcement drain:** voicemail uses the shared deferred handoff owner and waits for correlated provider completion (or pipeline playback) plus caller transport drain before leaving Stasis. Incomplete announcements cancel safely; uncertain ARI requests cannot trigger recovery speech, hangup, or replay. Submitted-request cancellation retains uncertainty evidence even after a newer routing owner takes over, and native hangup rechecks ownership inside its bounded request task. Call History distinguishes announcement, accepted, cancelled, and uncertain handoffs, and preserves the same cleanup reporting outcome as post-call tools when a request settles during teardown (#863).
+- **ARI lifecycle recovery:** voicemail reports rejected or uncertain dialplan handoffs accurately without taking ownership back from a potentially transferred caller. Native hangup checks acceptance and retries safely; pre-call hold playback is stopped on completion, failure, cancellation, and caller cleanup, including late starts (#863).
+
+- **Runtime state cleanup (#864):** release call and stream diagnostics during disconnect and teardown, preserving replacement connections and once-per-call logging across responses. Reject late producer sends and diagnostic updates once call teardown starts. Cancelled or replaced streams can no longer retain rejected speech or revive output through file fallback; healthy transport failures retain their fallback path. Deferred cancellation and late playback-finish events preserve inactivity-notification suppression after ownership loss. Bound outbound endpoint probe caching with TTL eviction and a 1,024-entry limit while preserving endpoint probing and route selection.
+- Provider input gain now uses a smoothed level follower, sample ramps, a configurable noise floor, and peak headroom limiting instead of normalizing every frame independently. Excessive-gain logs are bounded per provider session with a cleanup summary; low-energy diagnostics require a nonzero-audio window rather than alerting on startup silence (#853).
+
+- **Outbound voicemail drop** (#862): campaigns saved with voicemail drop disabled can start without a voicemail recording and retain that setting through origination and AMD; MACHINE/NOTSURE hangs up without playback and records `machine_detected`. Enabled campaigns retain recording requirements and legacy enabled defaults. Running edits and Start now validate the merged recording state atomically; missing campaign/recording or unconfirmed playback fails closed as `error` without a beep or replay, with hangup cleanup even on persistence failure. Terminal attempt/lead writes retain independent recovery ownership, use conditional generation guards, and recover conservatively after restart without replaying audio.
+- **Google Calendar title-prefix availability** ([#867](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/867)): new AVA bookings remain busy across calls and restarts without changing their titles. Timed and all-day Busy events respect cancellation, transparency and exclusive calendar-local dates, including DST changes. Older unmarked bookings retain existing filtering and need the documented one-time busy-prefix title repair.
+- **Google Calendar future appointments** ([#866](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/866)): availability excludes elapsed starts before applying result limits in both availability modes and across selected calendars. Booking rejects starts at or before the current time with guidance to confirm a new future slot.
+- **Google Calendar datetime handling** ([#865](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/865)): availability and bookings now preserve `Z`/offset instants while keeping naive inputs calendar-local. Event payloads retain DST offsets. Google and Microsoft suggestions share a DST-aware grid that includes both repeated-hour folds in chronological order, skips nonexistent times, and preserves elapsed slot durations. Range clipping, busy subtraction, aggregation and containment compare instants across repeated hours. Offsetless timed API events use their endpoint or target-calendar timezone and malformed bounds fail closed. Updated provider/runtime/UI guidance and documented compatibility for custom prompts that relied on offset stripping.
+
+- **Hangup intent:** requests to "hand off" to a person, reports that "the call dropped," and "and call me back" no longer become end-call markers during fuzzy normalization (#854). The "and the call" STT correction now requires a whole command and preserves optional "please"/"now" modifiers for custom markers; genuine end-call requests and configured marker policies remain supported.
+- Targeted Codex reviews now reserve more room for reasoning, retry confirmed token exhaustion once with a larger bounded budget, and report safe response metadata while continuing to reject incomplete or refused reviews.
+- **Static defects (#856):** restore Local AI backend registry/schema endpoints using the configured server URL; emit streaming warm-up logs with calculated buffer values; preserve Google Live input resampling history across frames and reset it at connection/rate boundaries. Remove unused broken ARI streaming cleanup and legacy Kroko implementations.
+
+- **Calendar slot rounding** ([#855](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/855)): Google and Microsoft Calendar suggestions round interval starts with nonzero seconds or microseconds up to the next slot boundary, preventing suggestions before the free interval or overlapping the end of a busy event. Both tools now share the same slot builder.
+- Google Live engine-gated greetings now retain input protection until caller-facing transport drain (#849). The configured post-TTS guard also silences continuous Google input on AudioSocket and shared RTP/WebSocket ingress (#850), with transport quiet time credited and accepted interruption preserved. Gemini 3.8 native full-duplex input remains unchanged; Admin help documents applicability.
+- **Local AI status:** the Models page now falls back to a current health check when live status is stale or expired, preventing cached failures from showing a healthy server as disconnected and cached readiness from hiding an outage.
+
 ## [7.7.5] - 2026-11-16
 
 ### Changed
@@ -15,32 +50,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retaining the maintained fork's runtime, documentation, release, A2A, and
   fleet boundaries.
 
-### Fixed
+## [7.7.3] - 2026-11-13
 
-- **Voicemail announcement drain:** voicemail uses the shared deferred handoff owner and waits for correlated provider completion (or pipeline playback) plus caller transport drain before leaving Stasis. Incomplete announcements cancel safely; uncertain ARI requests cannot trigger recovery speech, hangup, or replay. Submitted-request cancellation retains uncertainty evidence even after a newer routing owner takes over, and native hangup rechecks ownership inside its bounded request task. Call History distinguishes announcement, accepted, cancelled, and uncertain handoffs, and preserves the same cleanup reporting outcome as post-call tools when a request settles during teardown (#863).
-- **ARI lifecycle recovery:** voicemail reports rejected or uncertain dialplan handoffs accurately without taking ownership back from a potentially transferred caller. Native hangup checks acceptance and retries safely; pre-call hold playback is stopped on completion, failure, cancellation, and caller cleanup, including late starts (#863).
-- **Runtime state cleanup (#864):** release call and stream diagnostics during disconnect and teardown, preserving replacement connections and once-per-call logging across responses. Reject late producer sends and diagnostic updates once call teardown starts. Cancelled or replaced streams can no longer retain rejected speech or revive output through file fallback; healthy transport failures retain their fallback path. Deferred cancellation and late playback-finish events preserve inactivity-notification suppression after ownership loss. Bound outbound endpoint probe caching with TTL eviction and a 1,024-entry limit while preserving endpoint probing and route selection.
-- Provider input gain now uses a smoothed level follower, sample ramps, a configurable noise floor, and peak headroom limiting instead of normalizing every frame independently. Excessive-gain logs are bounded per provider session with a cleanup summary; low-energy diagnostics require a nonzero-audio window rather than alerting on startup silence (#853).
-- **Outbound voicemail drop** (#862): campaigns saved with voicemail drop disabled can start without a voicemail recording and retain that setting through origination and AMD; MACHINE/NOTSURE hangs up without playback and records `machine_detected`. Enabled campaigns retain recording requirements and legacy enabled defaults. Running edits and Start now validate the merged recording state atomically; missing campaign/recording or unconfirmed playback fails closed as `error` without a beep or replay, with hangup cleanup even on persistence failure. Terminal attempt/lead writes retain independent recovery ownership, use conditional generation guards, and recover conservatively after restart without replaying audio.
-- **Google Calendar title-prefix availability** ([#867](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/867)): new AVA bookings remain busy across calls and restarts without changing their titles. Timed and all-day Busy events respect cancellation, transparency and exclusive calendar-local dates, including DST changes. Older unmarked bookings retain existing filtering and need the documented one-time busy-prefix title repair.
-- **Google Calendar future appointments** ([#866](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/866)): availability excludes elapsed starts before applying result limits in both availability modes and across selected calendars. Booking rejects starts at or before the current time with guidance to confirm a new future slot.
-- **Google Calendar datetime handling** ([#865](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/865)): availability and bookings now preserve `Z`/offset instants while keeping naive inputs calendar-local. Event payloads retain DST offsets. Google and Microsoft suggestions share a DST-aware grid that includes both repeated-hour folds in chronological order, skips nonexistent times, and preserves elapsed slot durations. Range clipping, busy subtraction, aggregation and containment compare instants across repeated hours. Offsetless timed API events use their endpoint or target-calendar timezone and malformed bounds fail closed. Updated provider/runtime/UI guidance and documented compatibility for custom prompts that relied on offset stripping.
-- **Hangup intent:** requests to "hand off" to a person, reports that "the call dropped," and "and call me back" no longer become end-call markers during fuzzy normalization (#854). The "and the call" STT correction now requires a whole command and preserves optional "please"/"now" modifiers for custom markers; genuine end-call requests and configured marker policies remain supported.
-- **Static defects (#856):** restore Local AI backend registry/schema endpoints using the configured server URL; emit streaming warm-up logs with calculated buffer values; preserve Google Live input resampling history across frames and reset it at connection/rate boundaries. Remove unused broken ARI streaming cleanup and legacy Kroko implementations.
-- **Calendar slot rounding** ([#855](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/855)): Google and Microsoft Calendar suggestions round interval starts with nonzero seconds or microseconds up to the next slot boundary, preventing suggestions before the free interval or overlapping the end of a busy event. Both tools now share the same slot builder.
-- Google Live engine-gated greetings now retain input protection until caller-facing transport drain (#849). The configured post-TTS guard also silences continuous Google input on AudioSocket and shared RTP/WebSocket ingress (#850), with transport quiet time credited and accepted interruption preserved. Gemini 3.8 native full-duplex input remains unchanged; Admin help documents applicability.
-- **Local AI status:** the Models page now falls back to a current health check when live status is stale or expired, preventing cached failures from showing a healthy server as disconnected and cached readiness from hiding an outage.
+Release preparation from main `00c32c49` after v7.7.2. Includes 23 merged PRs
+covering transfer/audio recovery, recording downloads, Admin lifecycle safety,
+and compatible dependency and tooling migrations. See the [migration guide](docs/MIGRATION.md#v772-to-v773)
+and [validation matrix](docs/baselines/golden/v7.7.3-validation-matrix.md).
+Thanks to Chris Wilson (`cswilsnetex`), proposal author `lucivan212`, `hkjarral`,
+and Dependabot. See [contributors](CONTRIBUTORS.md) for their verified roles.
 
-## [7.7.4.11] - 2026-11-13
+### Added
 
-### Changed
+- Call History authenticated WAV downloads and recording refresh/error states, with request cancellation and audio/URL cleanup when leaving call details (Refs #767).
 
-- **Upstream release-credit catch-up:** merge upstream through `e9f2b0d3`
-  while retaining the maintained fork's current runtime, documentation, release,
-  security, A2A, and fleet boundaries. Import the applicable contributor credit;
-  do not inherit upstream's older v7.7.3-only release labels or security waiver.
+- **Attended transfer caller briefing:** `attended_transfer` accepts optional
+  `caller_name` and `call_reason` and uses them to fill the existing
+  `{screened_*}` announcement placeholders. The model is told to pass only what
+  the caller actually said. Values are normalised and capped (80 and 200
+  characters; control and format characters are dropped, but the joiners U+200C
+  and U+200D are kept) and kept out of tool results and out of the tool's and
+  engine's own logs. Placeholder values such as `unknown` or
+  `N/A` are treated as missing. The speech backend receives the rendered
+  announcement text and may log it. Call history now redacts
+  a `call_reason` parameter on any tool, as it already did `caller_name`. In
+  `caller_recording` mode, `attended_transfer` ignores `caller_name` and
+  `call_reason`. The default announcement is unchanged. Local-provider parser
+  debug logs omit tool argument values across all supported wrapper formats.
 
-## [7.7.4.10] - 2026-11-13
+- **Attended transfer announcement voice:** new optional
+  `tools.attended_transfer.tts_provider` (a pipeline TTS component key such as
+  `google_tts`) and `tts_options` (`voice`, `language`) let a configured
+  provider speak every attended-transfer prompt. Unset keeps Local AI Server
+  TTS. A set provider fails closed, with no fallback to Local AI Server or
+  another provider, and is synthesized before dialling while the caller hears
+  hold music; if that fails, no call is placed and the agent continues with
+  the caller. `ai_briefing` still needs Local AI Server LLM capability to write
+  the briefing. The Admin UI adds an Announcement voice selector backed by
+  `GET /api/config/providers/tts-options`.
 
 ### Changed
 
@@ -52,101 +98,178 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Lower the frontend lint ceiling from 820 to the verified 817 warnings.
 
 - **Environment and email-template lifecycle:** serialize Environment saves,
-  refreshes, tests, and Apply confirmations; ignore obsolete reads and recheck
-  drift before clearing pending changes. Scope email drafts and previews to the
-  current opening and inputs, lock pending saves, and preserve failed drafts for
-  retry. Lower the frontend lint warning ceiling to 820.
+  refreshes, tests and Apply confirmations; ignore obsolete authentication/read
+  responses and recheck drift before clearing pending changes. Report scheduled
+  Admin restarts and unknown Apply status without claiming readiness. Scope email
+  drafts/previews to each opening and current inputs, lock pending template saves,
+  and preserve failed drafts for retry. Lower the frontend lint ceiling to 820.
 
-## [7.7.4.9] - 2026-11-12
+- **Models and setup lifecycle:** ignore obsolete model/status responses, pin
+  resumed downloads to their job IDs, and stop page-owned reads and timers after
+  navigation. A changed Wizard model selection no longer inherits completion
+  from an older download. Make one automatic Local AI start attempt per completion
+  view, with explicit retry after failure or readiness timeout. Preserve manual
+  model/backend choices when reconciling language changes. Keep accepted downloads
+  tracked across selection changes and serialize further downloads/setup saves
+  until completion, with read-only recovery when job status is unknown.
 
-### Added
+- **Updater UI lifecycle:** bind previews and confirmations to the current target
+  and options, prevent duplicate update/rollback submissions, and ignore obsolete
+  job/log responses. Keep restored jobs locked until their state is known, poll
+  sequentially through recovery, and retain accepted job IDs after navigation.
+  Reconcile uncertain submissions with active server jobs and allow read-only
+  recovery from Recent Runs, including when browser storage is unavailable.
+  Lower the frontend lint warning ceiling from 868 to 843.
 
-- **Upstream feature catch-up:** add the verified first-call onboarding path,
-  attended-transfer caller briefing and lifecycle handling, safe call-recording
-  downloads, and the latest Admin UI lifecycle controls.
+- **Call Scheduling ownership:** discard obsolete campaign/filter/page responses,
+  hide old lead rows during view changes, and recheck lead ownership before
+  applying confirmed actions. Preserve the current view when old operations finish.
+  Refresh pending-lead guidance with statistics, keep readiness unknown without
+  current statistics, and continue detail polling when the campaign list fails.
+  Clear selection, reset pagination and revoke lead actions when the archive view changes.
 
-### Changed
+- **Calendar setup regression coverage:** wait for asynchronous attempt inspection
+  before asserting operator-check resets, with an explicitly delayed mock response.
 
-- **Maintained source alignment:** merge upstream through `fe622daa` while
-  retaining the fork's A2A, release, installer, security, and fleet packaging
-  boundaries.
-- **Voice continuity:** retain interrupted caller and generated-response audit
-  history, and route direct memo and note requests through the existing
-  recipient, readback, and confirmation guard.
+- **Admin frontend TypeScript:** clear application and test compiler debt and require
+  typechecking through the frontend CI gate. Correct Remote Agent error rendering,
+  nullable form values, status-card actions and transport-field descriptions while
+  retaining strict checking and the ES2020 target.
+
+- **Admin frontend React migration (#750, #220):** upgrade React and React DOM
+  together to 19.3.1 with matching React 19 type packages and a compatible Lucide
+  release. Preserve Node 22, existing security overrides, and operator settings.
+- **Admin action feedback (#344):** show pending spinners and prevent repeated
+  Call History deletes and Pipeline/Profile saves/deletes. Preserve confirmations
+  and deletion safeguards; failed Pipeline saves now retain the editable draft
+  for retry. Editors stay locked until a pending write settles.
+- **Streaming greeting controls (#754):** show saved zero/custom/unset values, keep
+  unsupported controls read-only, and explain ExternalMedia provider versus pipeline
+  applicability using configured Agent routes. Preserve YAML and runtime behavior.
+
+- **Admin backend dependencies (#783, #220):** upgrade psutil from 5.9.8 to
+  7.2.2 for system metrics and Local AI hardware recommendations.
+- **Admin frontend tooling (#220, #722):** use Node 22 (minimum 22.12) for
+  frontend CI, Docker builds, and local development; upgrade Jest DOM to 7.0.1.
+  Preserve the existing ESLint versions, configuration, and warning threshold.
+
+- **Admin backend dependencies (#816):** update FastAPI to 0.162.0, Pydantic to
+  2.14.3, python-multipart to 0.0.33, WebSockets to 17.4, and the bundled
+  FFmpeg decoder package to 0.8.1.
+
+### Fixed
+
+- Call recording discovery now rejects ambiguous exact-ID matches and symlinks, hides filesystem paths, and handles empty files by codec. Playback and downloads use private snapshots with byte-range support and identical WAV bytes; SoX explicitly decodes GSM/compressed WAV to PCM16 with accurate WAV lengths; no catalog or database migration is introduced.
+
+- Restore Local AI GPU builds with WebSockets 17.4 by packaging the same Python 3.11.15 interpreter in the CUDA builder and runtime images. Keep engine and Local AI WebSockets pins aligned; CUDA and model dependency versions are unchanged.
+- **Deferred transfers:** a deferred blind, attended or live-agent transfer no
+  longer waits forever when the model sends no audio after the tool result. The
+  new `tools.transfer.deferred_silent_commit_timeout_sec` (default 4 s, 0
+  disables, Admin UI field) commits it through the normal path. The timer starts
+  once the tool result has been sent to the model, pauses while the caller is
+  talking and restarts after a barge-in that cuts the reply. Behaviour changes
+  only when no reply audio follows; handoff announcements and pipelines are
+  unchanged.
+
+- **Attended transfer destination hangup:** behavior change. A destination that
+  answers and hangs up before accepting no longer ends the caller's call. AVA
+  treats it as a decline: MOH stops, the AI resumes, the failure is recorded as
+  `target-hangup` (or `declined` if the decline digit came first), and
+  non-Google providers play `caller_declined_prompt`.
+  Accepted legs, onward-transfer replacement and pickup ownership are unchanged.
+  The screening handler no longer fails on a cancelled DTMF wait when the leg is
+  retired. Late AI briefing generation or persistence cannot recreate a cleared
+  transfer, interrupt caller recovery, or start playback for a retired attempt.
+  Hangup classification uses the call's captured decline digit across config
+  reloads, matching the answer handler and failure recovery.
+  The final frontend gate now waits for A2A validation and the restored Save &
+  Apply control instead of racing the editor's closing state.
+
+- **Attended transfer settings:** the answer handler and failure recovery now
+  retain settings from the call-start tool snapshot when available. Calls without
+  a snapshot keep the existing generation/global configuration fallback. Helper
+  RTP bind settings remain process-wide; unavailable binds or helper startup
+  failures still follow `stream_fallback_to_file`. Inherited helper advertise addresses follow the
+  active server bind across reloads, while explicit NAT addresses are preserved.
+  Failed RTP socket setup releases its reserved port and closes any created socket,
+  so repeated bind failures cannot exhaust the shared range for later calls.
+
+- **Admin frontend dependencies (#823):** retain React Refresh ESLint plugin
+  0.4.x with ESLint 8 so clean frontend installs succeed. Keep the ESLint 9/10
+  migration separate from the compatible dependency updates.
+
+- **AudioSocket inbound audio:** since v5.1.7 a function-local `import audioop`
+  in the AudioSocket audio handler made every earlier `audioop` call fail
+  silently. With it removed, the first-frame "AudioSocket frame probe" logs
+  again and "Inbound PCM guard RMS" reports real levels. The energy barge-in
+  fallback for non-continuous providers, and pipeline barge-in with TALK_DETECT
+  off, react to caller speech again. The first-frame byte-swap check is now
+  log-only, because AudioSocket frame headers define the format and a quiet
+  16 kHz first frame could otherwise swap the whole call. Per-frame DC removal
+  stays disabled, as it has been since v5.1.7, because subtracting each frame's
+  mean adds a frame-edge artifact measured at -15 to -30 dB relative to speech.
 
 ### Security
 
-- Refresh Engine, Local AI, WebSocket, and Admin dependency baselines from the
-  merged upstream security and compatibility updates.
+- Update the Admin frontend lockfile to follow-redirects 1.16.3, preserving
+  custom sensitive-header handling across JavaScript realms when Node clients
+  follow redirects (GHSA-mrwp-f3q8-3g9p).
+- The maintainer accepted the remaining dependency/image findings and Bookworm
+  zlib exposure for v7.7.3 only. The [security exception](docs/baselines/golden/v7.7.3-validation-matrix.md#v773-only-security-exception)
+  records the covered baseline, controls and review deadline.
 
-## [7.7.4.8] - 2026-11-07
+## [7.7.2] - 2026-11-08
+
+Prepared from main `77c03386` through #820 and the security fixes in #822. This
+patch release includes optional A2A delegation, guided first-call setup, media and calendar reliability fixes,
+and installer recovery improvements. See the [migration guide](docs/MIGRATION.md#v771-to-v772)
+and [validation matrix](docs/baselines/golden/v7.7.2-validation-matrix.md) for the
+upgrade path, existing evidence and security disposition. Supported trains
+remain 7.7.x and 7.6.x.
+
+Thanks to Chris Wilson (`cswilsnetex`) for Calendar retries and YAML comment
+preservation, `pi0n00r` for A2A and remote PBX guidance, `jjaroztegi` for media
+reports and reproduction, `ibewackofreak` for the installer report, and
+`hkjarral` for implementation and validation. See [contributors](CONTRIBUTORS.md).
 
 ### Changed
 
-- **Upstream A2A acceptance:** reconnect the maintained A2A implementation to
-  upstream's merged PR #815 while retaining the fork's final lifecycle,
-  cancellation, deadline, origin-pinning, and Admin configuration corrections.
-- **Immutable container aliases:** allow an existing release tag and `latest`
-  alias to be attached to already-built SHA images without rebuilding or
-  changing their source identity.
-
-## [7.7.4.7] - 2026-11-06
+- **AI-assisted UI guidance:** add per-setting design and verification checklists
+  to `AVA.mdc` and the contributor workflow, covering UI controls, validation,
+  persistence, runtime activation, and PR evidence or explicit UI exceptions.
 
 ### Added
+
+- **A2A Admin setup (#817):** configure remote A2A endpoints, managed Bearer
+  credentials and execution limits in Tools; assign access under Agents → Tools
+  with an A2A badge. Preserve YAML-defined settings, protect assigned tools from
+  deletion, and omit disabled tools from model offers while retaining Admin
+  catalog discovery.
 
 - **A2A agent delegation:** add an optional YAML-configured in-call tool that
   delegates one bounded text request to a separately deployed Agent2Agent 1.0
   service through the official SDK. Agent Card discovery is public; authenticated
-  task traffic stays on the configured origin, credentials come only from the
+  task traffic stays on the configured origin, credentials come from managed files or the
   Engine environment, and uncertain requests are never retried automatically.
   Keep other tools available when an A2A entry is invalid at startup or Admin
   cannot reach the Engine. Cancel known remote work on Google Live teardown
-  and preserve uncertain outcomes when a task connection is lost. Keep the
-  transport open through bounded remote cancellation when a caller hangs up
-  during timeout cleanup, then propagate the original hangup signal.
-
-## [7.7.4.6] - 2026-11-04
-
-### Changed
-
-- **Upstream audio catch-up (#811):** merge upstream commit `66b38654` into
-  the maintained line, connecting its Asterisk-owned WebSocket output pacing,
-  OpenAI audio-tail preservation, Grok playback fences, operator controls,
-  regression coverage, and rollback guidance to the fork's existing private
-  audio and caller-wait behavior. The default pacing mode remains `legacy`.
-
-## [7.7.4.5] - 2026-11-03
-
-### Changed
-
-- **Unified build policy (#807):** use the same entitlement-aware Compose build
-  path for fresh installs, preflight, CLI updates, Admin rebuilds, updater
-  bootstrap, and rollback recovery. Preserve explicit builder and Compose
-  selection, validate the selected targets, and start services only after a
-  successful build without silently changing the global Docker builder.
-- **Operator recovery guidance:** restore the upstream installation, CLI, build,
-  and troubleshooting guides required by the unified build policy and its
-  regression tests.
+  and preserve uncertain outcomes when a task connection is lost.
+  Keep the transport open through bounded remote cancellation when a caller
+  hangs up during timeout cleanup, then propagate the original hangup signal.
 
 ### Fixed
 
-- **Remote PBX checklist (#806):** retain live ARI, module, and application
-  evidence while distinguishing remote-host configuration checks, skipped
-  Ava-host audits, missing manifests, and empty audit results. The UI now states
-  when restoring the manifest requires the write-enabled preflight path.
-
-## [7.7.4.4] - 2026-11-02
-
-### Changed
-
-- **Admin update source:** allow deployments to select one validated Git remote
-  and maintained branch for release checks, branch discovery, update planning,
-  and execution. The Updates page now displays that effective source instead of
-  assuming `origin/main`. Updater builds and recovery commands resolve that
-  selected source without writing to a root-owned checkout or falling back to
-  an unrelated upstream release installer.
-
-### Fixed
+- **First-call onboarding:** distinguish preflight environment preparation from
+  saved setup; preserve existing installations and resume unfinished onboarding.
+  Generate Agent-backed dialplans with the effective Stasis name and no forced
+  provider/pipeline override. Guide same-host/remote media configuration, report
+  engine readiness separately from saving, and include FreePBX/plain-Asterisk
+  routing plus explicit test-call acceptance. Reopen merged settings, retain
+  non-secret tab drafts, and keep passwords/keys out of browser draft storage.
+  Keep repair pages reachable for corrupt existing configuration; validate before
+  resetting setup progress or saving CLI changes, and return safe startup errors.
+  Align Agent/CLI dialplans and first-call documentation. No runtime routing or
+  Agent database migration changes.
 
 - **Local config comments (#809):** Admin UI saves keep the comments an
   operator wrote in `config/ai-agent.local.yaml` instead of rewriting the file
@@ -175,129 +298,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Remote PBX checklist:** stop presenting an empty local Asterisk preflight
   manifest as an error when Ava is configured to use Asterisk on a separate
   host; retain live ARI/module status and identify PBX configuration checks as
-  remote-host work. Ava-host audit results, skipped audits, and missing
-  manifests are now reported as distinct states, and an empty audit is never
-  reported as a successful configuration check.
+  remote-host work. Explain that restoring missing Ava-host audit evidence
+  requires write-enabled preflight and also applies system/configuration fixes.
 
-- **Updater diagnostics:** redact credential-bearing remote URLs from clone
-  failure details while preserving bounded operator-facing error context.
+- **Consistent Docker builder/preflight (#802):** share one build policy across
+  installer, CLI updates, GUI builds, updater bootstrap and packaged rollback.
+  Default to the active context's built-in builder; honor explicit overrides
+  without global changes or silent retry switches. Check capabilities and actual
+  builder readiness under the executing identity, validate exact Bake targets,
+  and explain DNS/registry/storage failures without overwriting daemon settings.
+  Repair missing CLI capabilities using platform packages instead of an old
+  amd64-only Buildx download.
+  Load direct updater-image builds into Docker when using custom builders so
+  successful builds can immediately start the updater.
+  Scope private environment creation separately from data/media permissions so
+  the UI runtime can write after a root-run or partially applied preparation.
+  Clarify admission, drain and visibility requirements for manual recreation.
+  Accept older Compose exports containing unused Bake definitions while keeping
+  the selected group/targets scoped; make UI recovery snippets self-contained
+  and warn about placeholder JWT secrets during read-only preflight.
+  Add `install.sh --ui` for management-first onboarding; manual base-image pulls
+  are unnecessary. Existing call guards and pending-action recovery remain intact.
 
-## [7.7.4.2] - 2026-11-02
+- **Fresh-install Docker builds (#802):** route Quick Start, preflight, installer,
+  and Admin UI setup/rebuild paths through the entitlement-aware Compose build
+  helper. Preserve project/Compose overlays, no-cache rebuilds and backend build
+  arguments through the scoped `network.host` fallback. Start only after a
+  successful build with `--no-build --pull never`, so Compose cannot repeat the
+  rejected build during startup. No global Docker entitlement override is needed.
+  Recovery hints also build a missing Admin UI image and retain standalone Compose
+  selection even before the full Compose check has run. Document matching Compose
+  selection for build/start snippets, including older standalone-helper recovery,
+  and clarify CPU/GPU layer settings. Separate wizard completion from engine
+  startup, retain no-cache in legacy recovery, and use the selected Compose mode
+  for first-login instructions. Keep Admin UI recovery scoped to that service,
+  require call drain before engine recreation, and make password lookup independent
+  of prior shell state or Docker when running the backend directly.
 
-### Fixed
+- **AudioSocket caller squelch (#799):** prevent a first speech frame from
+  poisoning the noise floor and muting the whole utterance when quiet onset
+  frames are absent. Classify before updating the noise estimate and exclude
+  detected speech during onset confirmation. Use call-local WebRTC evidence to
+  recover from sustained non-speech noise even if it initially opens the squelch,
+  preserving configured energy thresholds and hysteresis. Bound framing/resampling
+  to the detector copy; expose substitution and per-call totals in diagnostics.
+  Preserve unknown-evidence packets, including incomplete/oversized detector frames,
+  without counting them as suppressed. If the detector is unavailable, preserve
+  caller audio with a once-per-call warning.
+  RTP, Media WebSocket, pipelines and no-input timeout detection are unchanged.
 
-- **Admin release display:** recognize the fork's four-component fix-release
-  versions in CHANGELOG and README fallbacks so packaged deployments report
-  `v7.7.4.2` instead of falling through to the preceding upstream-style
-  three-component release.
+- **Microsoft Calendar lost create:** a `create_event` whose POST timed out
+  before reaching Graph no longer leaves the call unable to book, or unable to
+  cancel its other bookings, once a resend goes through. The identical
+  in-process retry resends the first request on the same `transactionId`, so a create that
+  landed unseen should come back as the same event, and the event is read back before
+  it is reported. A Graph 400 `ErrorDuplicateTransactionId` is reported as
+  uncertain, not as a failure.
 
-## [7.7.4.1] - 2026-11-02
+### Security
 
-### Fixed
+- Update Engine `msgpack` to 1.2.3 and `dnspython` to 2.9.2. Require Debian's
+  DSA-6613-1 `zlib1g` fix in the Trixie-based CPU Local AI runtime image (#822).
+  Use Python 3.11 for source installs and local Core tests, matching the Engine
+  container and CI.
+- The Bookworm Engine, Admin UI and updater images retain an affected `zlib1g`
+  package. The maintainer approved a v7.7.2-only exception pending a vendor fix
+  or image-base remediation. See the [validation matrix](docs/baselines/golden/v7.7.2-validation-matrix.md#security)
+  for advisory IDs, exposure limits and the review deadline.
 
-- **AudioSocket caller squelch (#799):** preserve first utterances that start
-  without quiet onset, recover
-  from sustained startup noise, and fail open when speech evidence is unknown
-  or unavailable without changing RTP, Media WebSocket, or no-input behavior.
+## [7.7.1] - 2026-10-30
 
-- **Microsoft Calendar lost create (#798):** resend an unresolved identical
-  create on the same Graph transaction ID and require event readback before
-  reporting success; unresolved and duplicate-transaction outcomes stay uncertain.
+Release preparation from main `a6cfc5f8`, after v7.7.0. Included PRs:
+#777, #778, #784, #785, #787, #789, #791, #792, #794 and #795.
+The maintainer chose the patch tag while retaining the merged transcription and
+template capabilities. See [migration](docs/MIGRATION.md#v770-to-v771) and the
+[validation matrix](docs/baselines/golden/v7.7.1-validation-matrix.md) for additive
+state, changed modular Google defaults, reused evidence and the fresh scoped
+testing waiver. Merge and tag publication remain held for approval; the date is
+staged metadata, not proof of publication. Supported trains remain 7.7.x/7.6.x.
 
-## [7.7.4] - 2026-10-31
-
-### Added
-
-- Add phase-aware HTTP and Pushover template validation, previews, diagnostics,
-  and bounded in-call transcript substitution from upstream #794.
-- Add operator documentation for HTTP templates and OpenAI-compatible batch
-  transcription while retaining the maintained fork's public documentation.
-
-### Fixed
-
-- Recover Google Live sessions after failed attended transfers and preserve
-  tool-response sanitization from upstream #795.
-- Preserve the fork's one-use native message-deposit reconciliation and exact
-  direct-response failure contract while adopting the upstream validator.
-
-## [7.7.3.3] - 2026-10-30
-
-### Fixed
-
-- Preserve Ollama's resolved system prompt when long-call history is trimmed,
-  so configured instructions remain present beyond the first five turns.
-
-## [7.7.3.2] - 2026-10-29
-
-### Changed
-
-- Update the Google modular provider defaults and capability handling for the
-  current Gemini model family, including complete-candidate selection and
-  guarded handling of truncated responses.
-- Keep non-call tools out of OpenAI streaming requests, matching the existing
-  non-streaming tool-selection contract.
-
-### Fixed
-
-- Harden interrupted updater recovery and rollback across Compose and Bake
-  workflows, including coherent state snapshots and preserved project names.
-- Classify Compose changes before reconciliation, pull updated images before
-  recreation, and clean up failed inference-engine fallbacks safely.
-- Recheck active-call state immediately before every call-affecting runtime
-  mutation, including post-pull reconciliation, rebuild-only recreation,
-  service restart, and rollback recovery.
-- Cover tool-continuation cleanup and runtime-mutation ordering with focused
-  regression tests.
-
-## [7.7.3.1] - 2026-10-28
-
-### Changed
-
-- Restore upstream's maintained Tool Calling Guide and align its farewell
-  lifecycle wording with the merged implementation.
-- Update the Admin backend to FastAPI 0.162.0 and psutil 7.2.2 after reviewing
-  and qualifying the deferred upstream dependency updates together.
-
-### Fixed
-
-- Catch up the final upstream #786/#787 farewell hardening: bound ARI playback
-  startup, retain the `agent_hangup` disposition, preserve call-owned farewell
-  completion across provider-listener replacement, and describe ARI `done` as
-  a terminal boundary rather than proof of audible delivery.
-
-## [7.7.3] - 2026-10-28
-
-### Fixed
-
-- Update `msgpack` from 1.2.1 to 1.2.3 for the Fish Audio transport, including
-  upstream C-extension memory-safety and cleanup fixes (#788).
-- Restrict transcription uploads to approved audio demuxers and local file input
-  so crafted playlists cannot recursively reopen the uploaded file (#784).
-- Prevent an older Local AI `AgentAudioDone` from hanging up an Asterisk-owned
-  farewell before `sound:goodbye` finishes. Reserve the farewell before tool
-  execution, match its exact ARI playback ID and terminal state, and report
-  missing or failed playback as unconfirmed rather than played. Preserve the
-  farewell gate across overlapping callbacks and coalesce duplicate hangup
-  requests so only the selected playback owns terminal hangup (#786, #787).
-
-## [7.7.2] - 2026-10-28
+Thanks to @pi0n00r and @pcbeingused333 for code/tests, @abaichuan1017 (Kai) for
+Local pipeline diagnostics documentation, @Andrew-Engelbrecht for upgrade report
+#790, @lucamancusodev for transfer/notification reports, and @hkjarral for
+implementation/maintenance. Preserve NC/Debian commit co-authorship without
+inventing account identities; see [CONTRIBUTORS.md](CONTRIBUTORS.md).
 
 ### Added
+
+- Extend shared template guidance, highlighting, examples and synthetic previews
+  to Pushover title/message fields in all three phases. Report safe field-specific
+  errors and wait for a current valid review before staging enabled HTTP or
+  Pushover tools, preserving separate recipient/test actions and saved templates.
+
+- Add transcript-so-far payloads to in-call HTTP tools, with phase-specific
+  examples, variable guidance, template validation and synthetic previews across
+  pre-, in-, and post-call HTTP tools. Preserve actionable preparation errors in
+  Call History and support exports, and align explicit HTTP tests with runtime
+  rendering instead of sending malformed JSON as raw content (#766).
 
 - Add an authenticated, OpenAI-compatible local transcription API with
   bounded multipart uploads, killable FFmpeg decoding, and a one-job isolated
   STT worker. Live-call sessions take priority and preempt batch work; backend
   failures remain errors rather than successful empty transcripts (#784).
-
-### Fixed
-
-- Cancel local transcription on HTTP disconnect and reap decoder/worker work
-  before releasing batch admission. Give full LocalProvider setup and greetings
-  live-call priority before the first incoming audio frame (#784).
-- Keep the isolated batch worker's timeout compatible with the CUDA image's
-  Python 3.10 runtime.
-
-## [7.7.1] - 2026-10-25
 
 ### Changed
 
@@ -306,6 +408,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MCP server's responsibility (#778).
 
 ### Fixed
+
+- Order Google Live transfer-failure recovery after the originating tool response,
+  and recover background caller-recording failures with correlated history and
+  caller cleanup. Preserve immediate invocation IDs before dialing and safely
+  render unknown legacy transfer actions in Call History (#795).
+- Notify Google Live when an attended transfer fails after initiation, so it
+  stops claiming the connection is still in progress. Deduplicate recovery,
+  preserve caller/new-attempt ownership, render transfer prompt variables, and
+  show initiation and terminal outcomes separately. This does not enforce a
+  two-attempt limit or resolve every PBX failure in #793.
+
+- Keep HTTP template previews accurate for repeated environment references and
+  explicit test values; reject unsupported pre-call JSON variables. Mask escaped
+  credential echoes and use fixed API error messages. On initial startup, omit
+  malformed HTTP tools while keeping valid tools available; preserve atomic
+  rejection of invalid reloads and strict routing/Pushover policies (#766).
+- Handle invalid Agent-inline HTTP templates through the existing fail-closed
+  policy path. Normalize webhook methods before summary/preparation, clear
+  conflicting pending Content-Type rows when applying JSON examples, and mask
+  percent-encoded credential echoes with either hexadecimal letter case (#766).
 
 - Keep tools that are not in-call out of the OpenAI streaming LLM request, as the
   non-streaming path already does, so a streaming turn cannot be offered pre-call or
@@ -606,8 +728,7 @@ are preserved; see [CONTRIBUTORS.md](CONTRIBUTORS.md).
 ### Added
 
 - **Streamable HTTP MCP backend:** explicit YAML endpoint and environment-referenced authentication headers use the official Python MCP SDK for protocol negotiation, session headers, JSON/SSE responses and paginated tool discovery. Existing stdio and Agent filtering remain intact. A timed-out tool call is not automatically replayed; its effect may require server-side reconciliation. Live in-call allowed/denied acceptance is complete; Admin UI creation/editing remains follow-up #703.
-
-- **Opt-in cloud provider startup connection recovery** ([#676](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/676)): Google Live/Vertex, OpenAI Realtime, Grok, Deepgram Agent, and ElevenLabs Agent can retry transient initial connection failures with configurable opening and total connection deadlines. Provider forms expose the controls under Expert settings. Upgrades retain a 10-second opening timeout, zero retries, and no added aggregate deadline; setup, mid-call recovery, keepalive, terminal failure routing, and Local behavior are unchanged. Reported and supported with production evidence by [@MVECoder](https://github.com/MVECoder).
+- **Opt-in cloud provider startup connection recovery** ([#676](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/676)): Google Live/Vertex, OpenAI Realtime, Grok, Deepgram Agent, and ElevenLabs Agent can retry transient initial connection failures with configurable opening and total connection deadlines. Provider forms expose the controls under Expert settings. Upgrades retain a 10-second opening timeout, zero retries, and no added aggregate deadline; setup, mid-call recovery, keepalive, terminal failure routing, and Local behavior are unchanged. See [connection recovery and real-call verification](docs/Provider-Connection-Recovery.md). Reported and supported with production evidence by [@MVECoder](https://github.com/MVECoder).
 
 - **Google Developer long-response option:** **Providers → Google Live → API Mode → Enable long-response playback** enables a bounded audio backlog for that provider instance. It defaults off on new and existing installations, requires saving and restarting the AI Engine, and is hidden in Vertex mode. The saved preference is ignored on actual Vertex connections; other providers and modular pipelines do not use it. See the [Google setup guide](docs/Provider-Google-Setup.md#long-response-playback-developer-api-opt-in) for configuration and upgrade instructions.
 
@@ -621,26 +742,14 @@ are preserved; see [CONTRIBUTORS.md](CONTRIBUTORS.md).
 - **Replacement transfer handoff:** bind deferred completion callbacks to their original transfer before scheduling or waiting on the per-call lock. A queued completion from a cancelled/replaced transfer no longer starts committing the replacement or suppresses its unfinished handoff audio. Original repeat suppression contributed by [@cswilsnetex](https://github.com/cswilsnetex) in [#702](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/pull/702).
 
 - Preserve expanded YAML compatibility when raw flow-style environment references cannot be parsed for MCP header restoration; credentialed HTTP servers fail closed without exposing expanded header values.
-- **Streamable HTTP MCP diagnostics:** suppress SDK/HTTP wire traces that can include session headers or endpoint URLs, and keep remote RPC error text out of application traceback logs. Tool-outcome classification and no-replay behavior are unchanged.
+- **Streamable HTTP MCP diagnostics:** suppress SDK/HTTP wire traces that can
+  include session headers or endpoint URLs, and keep remote RPC error text out
+  of application traceback logs. Tool-outcome classification and no-replay
+  behavior are unchanged.
 - **Whisper idle finalization:** finalize buffered speech after per-session silence without requiring another audio frame, while preserving newer speech that arrives during a slow decode or backend-lock wait. Repeated words in distinct speech segments remain separate turns; duplicate finalization of one segment stays suppressed.
 - **DTMF log privacy:** omit raw ARI/AudioSocket digits and payload-bearing exception bodies from structured logs while preserving native digit delivery to attended-transfer and AudioSocket handlers. Nested DTMF fields are fully redacted rather than retaining a prefix.
-
-- **Whisper idle finalization:** Faster-Whisper and Whisper.cpp now finalize a
-  sufficiently long buffered utterance when its per-session silence deadline
-  expires, even if no later audio frame arrives. Idle-promoted LLM and full
-  turns use the normal session-owned response-task path, and segment-aware
-  deduplication preserves two distinct utterances that contain identical words
-  while suppressing duplicate finals from one segment.
-
-- **Maintained Ava runtime corrections:** distinct Whisper speech segments that
-  happen to contain identical words are no longer suppressed as duplicates;
-  repeated finals from one segment remain deduplicated. YAML environment
-  expansion uses a bounded parser for malformed references. Streamable HTTP
-  MCP preserves authentication references until client resolution, suppresses
-  SDK payload/session logging, rejects mismatched SSE response IDs, and reports
-  a tool outcome as unknown only after an actual `tools/call` HTTP attempt.
-
 - **Local AI provider test environment expansion:** shared YAML and Admin test paths now parse braced environment references in linear time, including empty `:-` and `:=` defaults, without stalling on malformed operator-supplied values. Existing authenticated WebSocket test ordering and modular capability checks remain unchanged.
+
 - **Google Developer long-response playback (opt-in):** prevents the original source queue from dropping small audio chunks when generation runs ahead of telephony playback. Enabled calls wait for playback drain, cancel queued speech on interruption, and reject stale farewell completion. Abnormal disconnects allow accepted audio up to eight seconds to drain before cleanup, respecting caller teardown and transfer ownership. Disconnect drain runs in a cleanup-cancelled call task, with a bounded transfer wait, so provider event dispatch remains responsive; completion backlog overflow immediately rejects new tool work. This cannot prevent upstream Google errors or recover audio that was never received.
 - **Google AudioSocket interruption detection:** silence-gated Google calls inspect normalized caller audio before upstream silence substitution, so local barge-in can detect speech during playback. This correction applies to Developer API and Vertex independently of the long-response option; native Gemini 3.8 full-duplex interruption keeps its provider-driven path. Other providers' detector inputs are unchanged.
 
