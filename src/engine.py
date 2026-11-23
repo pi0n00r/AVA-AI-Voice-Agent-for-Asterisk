@@ -120,7 +120,7 @@ from .core.outbound_schedule import normalize_outbound_daily_window
 from .core.outbound_store import get_outbound_store, outbound_flag_enabled
 from .utils.audio_capture import AudioCaptureManager
 from .utils.diagnostic_paths import DEFAULT_DIAGNOSTIC_CAPTURE_DIR
-from .utils.voice_catalog import known_voice_map
+from .utils.voice_catalog import GROK_FOREIGN_VOICE_IDS, known_voice_map
 from src.pipelines.base import LLMResponse
 from .pipelines.google import GoogleGenerationIncompleteError
 from src.tools.telephony.hangup_policy import (
@@ -149,6 +149,7 @@ def _apply_provider_context_voice(
     context_config: Any,
     *,
     call_id: Optional[str] = None,
+    context_provider_kind: Optional[str] = None,
 ) -> str:
     """Reconcile the Agent voice using the target provider's contract.
 
@@ -170,6 +171,11 @@ def _apply_provider_context_voice(
         call_id=call_id,
         allowed_voices=known_voice_map(voice_kind),
         voice_unsupported=isinstance(provider, (ElevenLabsAgentProvider, LocalProvider)),
+        foreign_agent_voices=(
+            GROK_FOREIGN_VOICE_IDS
+            if isinstance(provider, GrokProvider) and context_provider_kind != "grok"
+            else frozenset()
+        ),
     )
 
 
@@ -23705,6 +23711,7 @@ class Engine:
                             overrides,
                             context_config,
                             call_id=call_id,
+                            context_provider_kind=self._get_provider_kind(getattr(context_config, "provider", None)),
                         )
                         session.session_voice = provider_context.get("voice")
                         session.voice_source = voice_source
