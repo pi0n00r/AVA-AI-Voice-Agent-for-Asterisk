@@ -22,3 +22,21 @@ it('keeps the right edge inside the scrolling pane, including its scrollbar gutt
     const right = 700 + parseFloat(tooltip.style.left) + tooltip.offsetWidth;
     expect(right).toBe(300 + pane.clientWidth - 8);
 });
+
+it('closes from the focused link on Escape without closing an enclosing dialog', () => {
+    const onParentKeyDown = vi.fn();
+    render(
+        <div onKeyDown={onParentKeyDown}>
+            <HelpTooltip content="Voice settings" link="https://example.com/help" />
+        </div>
+    );
+    const trigger = screen.getByRole('button');
+    fireEvent.focus(trigger);
+    fireEvent.keyDown(screen.getByRole('link'), { key: 'Escape' });
+
+    expect(screen.queryByRole('tooltip')).toBeNull();
+    expect(onParentKeyDown).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(trigger, { key: 'Escape' });
+    expect(onParentKeyDown).toHaveBeenCalledTimes(1);
+});

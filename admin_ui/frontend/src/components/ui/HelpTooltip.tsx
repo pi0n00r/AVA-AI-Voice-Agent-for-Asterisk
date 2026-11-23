@@ -97,6 +97,12 @@ const HelpTooltip: React.FC<HelpTooltipProps> = ({
             className="relative inline-block"
             onMouseEnter={() => setIsOpen(true)}
             onMouseLeave={() => setIsOpen(false)}
+            onKeyDown={event => {
+                if (event.key === 'Escape' && isOpen) {
+                    event.stopPropagation();
+                    setIsOpen(false);
+                }
+            }}
         >
             <button
                 ref={buttonRef}
@@ -114,12 +120,6 @@ const HelpTooltip: React.FC<HelpTooltipProps> = ({
                 onClick={e => {
                     e.preventDefault();
                     setIsOpen(true);
-                }}
-                onKeyDown={event => {
-                    if (event.key === 'Escape' && isOpen) {
-                        event.stopPropagation();
-                        setIsOpen(false);
-                    }
                 }}
             >
                 <HelpCircle className="w-4 h-4" />
