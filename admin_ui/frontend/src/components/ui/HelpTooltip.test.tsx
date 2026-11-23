@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
 import HelpTooltip from './HelpTooltip';
+import { Modal } from './Modal';
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -23,20 +24,24 @@ it('keeps the right edge inside the scrolling pane, including its scrollbar gutt
     expect(right).toBe(300 + pane.clientWidth - 8);
 });
 
-it('closes from the focused link on Escape without closing an enclosing dialog', () => {
-    const onParentKeyDown = vi.fn();
+it('restores trigger focus on Escape from the link without closing the dialog', () => {
+    const onClose = vi.fn();
     render(
-        <div onKeyDown={onParentKeyDown}>
+        <Modal isOpen onClose={onClose} title="Provider settings">
             <HelpTooltip content="Voice settings" link="https://example.com/help" />
-        </div>
+        </Modal>
     );
-    const trigger = screen.getByRole('button');
-    fireEvent.focus(trigger);
-    fireEvent.keyDown(screen.getByRole('link'), { key: 'Escape' });
+    const trigger = screen.getByRole('button', { name: 'Show help' });
+    act(() => trigger.focus());
+    const link = screen.getByRole('link');
+    act(() => link.focus());
+    expect(document.activeElement).toBe(link);
+    fireEvent.keyDown(link, { key: 'Escape' });
 
     expect(screen.queryByRole('tooltip')).toBeNull();
-    expect(onParentKeyDown).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(trigger);
+    expect(onClose).not.toHaveBeenCalled();
 
     fireEvent.keyDown(trigger, { key: 'Escape' });
-    expect(onParentKeyDown).toHaveBeenCalledTimes(1);
+    expect(onClose).toHaveBeenCalledTimes(1);
 });

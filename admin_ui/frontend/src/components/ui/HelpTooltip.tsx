@@ -100,6 +100,9 @@ const HelpTooltip: React.FC<HelpTooltipProps> = ({
             onKeyDown={event => {
                 if (event.key === 'Escape' && isOpen) {
                     event.stopPropagation();
+                    if (popoverRef.current?.contains(document.activeElement)) {
+                        buttonRef.current?.focus();
+                    }
                     setIsOpen(false);
                 }
             }}
