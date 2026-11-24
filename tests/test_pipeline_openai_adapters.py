@@ -372,7 +372,8 @@ def _extra_body_with_reserved_collisions():
         "reasoning_effort": "none", "keep_alive": -1,
         "model": "replacement", "messages": [], "tools": [{"unsafe": True}],
         "tool_choice": "required", "stream": False, "temperature": 99,
-        "max_tokens": 999, "functions": [{"unsafe": True}],
+        "max_tokens": 999, "max_completion_tokens": 999,
+        "functions": [{"unsafe": True}],
         "function_call": "unsafe", "parallel_tool_calls": True, "n": 99,
     }
 
@@ -408,6 +409,7 @@ async def test_openai_llm_adapter_extra_body_preserves_owned_fields_and_tools():
     assert "stream" not in payload
     assert payload["temperature"] == 0.25
     assert payload["max_tokens"] == 80
+    assert "max_completion_tokens" not in payload
     for key in ("functions", "function_call", "parallel_tool_calls", "n"):
         assert key not in payload
 
@@ -441,12 +443,13 @@ async def test_openai_llm_stream_extra_body_preserves_stream_and_real_tools():
     assert payload["stream"] is True
     assert payload["temperature"] == 0.25
     assert payload["max_tokens"] == 80
+    assert "max_completion_tokens" not in payload
     for key in ("functions", "function_call", "parallel_tool_calls", "n"):
         assert key not in payload
 
 
 @pytest.mark.asyncio
-async def test_openai_llm_adapter_without_extra_body_is_unchanged(monkeypatch):
+async def test_openai_llm_adapter_without_extra_body_uses_configured_token_limit(monkeypatch):
     app_config = _build_app_config()
     provider_config = OpenAIProviderConfig(**app_config.providers["openai"])
     body = json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
@@ -469,6 +472,7 @@ async def test_openai_llm_adapter_without_extra_body_is_unchanged(monkeypatch):
             {"role": "user", "content": "hello"},
         ],
         "temperature": 0.7,
+        "max_tokens": 200,
     }
 
 

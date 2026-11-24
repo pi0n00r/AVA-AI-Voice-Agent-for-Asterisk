@@ -47,6 +47,7 @@ from pydantic import ValidationError
 from .config import (
     AppConfig,
     load_config,
+    validate_provider_settings,
     LocalProviderConfig,
     DeepgramProviderConfig,
     GoogleProviderConfig,
@@ -54,6 +55,7 @@ from .config import (
     GrokProviderConfig,
 )
 from .config_apply import classify_config_change
+from .config.normalization import ConfigValidationError
 from .config.provider_instances import (
     FULL_AGENT_KINDS,
     provider_kind,
@@ -210,6 +212,49 @@ logger = get_logger(__name__)
 
 class _PipelinePlaybackInterrupted(RuntimeError):
     """The caller interrupted a pipeline stream while its producer was backpressured."""
+
+
+class _PipelineUtteranceBuffer:
+    """Bound speech uploads using canonical PCM16 frames, retaining short preroll."""
+
+    def __init__(self, options):
+        self.threshold = int(options.get("segment_energy_threshold", 600))
+        self.silence_ms = int(options.get("segment_silence_ms", 600))
+        self.pending = bytearray()
+        self.preroll = bytearray()
+        self.audio = bytearray()
+        self.speech_ms = self.quiet_ms = 0
+
+    def feed(self, audio):
+        self.pending.extend(audio)
+        ready = []
+        # 20 ms, PCM16 mono at 16 kHz. Frame-sized energy avoids averaging
+        # short speech away when the transport batches several frames.
+        while len(self.pending) >= 640:
+            frame = bytes(self.pending[:640])
+            del self.pending[:640]
+            speech = audioop.rms(frame, 2) >= self.threshold
+            if not self.audio and not speech:
+                self.preroll.extend(frame)
+                del self.preroll[:-6400]  # 200 ms
+                continue
+            if not self.audio:
+                self.audio.extend(self.preroll)
+                self.preroll.clear()
+            self.audio.extend(frame)
+            self.speech_ms += 20 if speech else 0
+            self.quiet_ms = 0 if speech else self.quiet_ms + 20
+            if self.quiet_ms >= self.silence_ms or len(self.audio) >= 480000:  # 15 s
+                utterance = self.flush()
+                if utterance:
+                    ready.append(utterance)
+        return ready
+
+    def flush(self):
+        audio = bytes(self.audio) if self.speech_ms >= 120 else b""
+        self.audio.clear()
+        self.speech_ms = self.quiet_ms = 0
+        return audio
 
 # Modular STT uses one canonical, headerless audio bus. Transport-specific
 # audio is converted to this format before it enters the pipeline queue.
@@ -4570,6 +4615,7 @@ class Engine:
                 continue
             self.provider_kinds[name] = kind
             try:
+                validate_provider_settings(self.config.providers, provider_names={name})
                 issues = self._audit_provider_config(name, provider_config_data)
                 if issues:
                     self.provider_alignment_issues[name] = issues
@@ -18493,6 +18539,25 @@ class Engine:
             )
         return allowed
 
+    async def _pipeline_greeting_chunks(self, call_id, pipeline, greeting):
+        """Bound stalled greeting synthesis and close its generator on cancellation."""
+        timeout = max(0.01, float(getattr(
+            self, "_connection_audio_handoff_timeout_seconds", CONNECTION_AUDIO_HANDOFF_TIMEOUT_SECONDS
+        )))
+        iterator = pipeline.tts_adapter.synthesize(call_id, greeting, pipeline.tts_options).__aiter__()
+        try:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(iterator.__anext__(), timeout=timeout)
+                except StopAsyncIteration:
+                    return
+                if chunk:
+                    yield chunk
+        finally:
+            close = getattr(iterator, "aclose", None)
+            if close:
+                await close()
+
     async def _pipeline_runner(self, call_id: str) -> None:
         """Minimal adapter-driven loop: STT -> LLM -> TTS -> file playback.
 
@@ -18817,8 +18882,13 @@ class Engine:
             self._schedule_connection_audio_handoff_timeout(session)
             
             if greeting:
+                greeting_failed = False
                 max_attempts = 2
                 for attempt in range(1, max_attempts + 1):
+                    greeting_stream_id = None
+                    greeting_queue = None
+                    greeting_complete = False
+                    greeting_iterator = None
                     try:
                         # Resolve effective downstream mode: TTS adapter can override global setting.
                         # getattr fallback keeps this generic — works for any adapter, not just Azure.
@@ -18843,21 +18913,18 @@ class Engine:
 
                         if use_streaming_playback:
                             q: asyncio.Queue = asyncio.Queue(maxsize=256)
-                            stream_id = await self.streaming_playback_manager.start_streaming_playback(
-                                call_id,
-                                q,
-                                playback_type="pipeline-tts-greeting",
-                                source_encoding=tts_encoding,
-                                source_sample_rate=tts_rate,
-                            )
-                            if not stream_id:
-                                raise RuntimeError("start_streaming_playback returned no stream_id")
+                            stream_id = None
                             any_audio = False
-                            async for chunk in pipeline.tts_adapter.synthesize(call_id, greeting, pipeline.tts_options):
+                            greeting_iterator = self._pipeline_greeting_chunks(call_id, pipeline, greeting)
+                            async for chunk in greeting_iterator:
                                 if not chunk:
                                     continue
                                 if not any_audio:
+                                    if not self._pipeline_output_allowed(call_id, session, stage="greeting-first-audio"):
+                                        raise _PipelinePlaybackInterrupted("Call ended before greeting audio")
                                     media_ready = await self._wait_for_initial_media(call_id, session)
+                                    if not self._pipeline_output_allowed(call_id, session, stage="greeting-media-ready"):
+                                        raise _PipelinePlaybackInterrupted("Call ended before greeting playback")
                                     delay_ms = int(
                                         getattr(
                                             getattr(self.config, "streaming", None),
@@ -18867,11 +18934,20 @@ class Engine:
                                         or 0
                                     )
                                     if delay_ms > 0:
-                                        await q.put(
+                                        q.put_nowait(
                                             self._encoded_silence(
                                                 tts_encoding, tts_rate, delay_ms
                                             )
                                         )
+                                    q.put_nowait(chunk)
+                                    greeting_stream_id, greeting_queue = "starting", q
+                                    stream_id = await self.streaming_playback_manager.start_streaming_playback(
+                                        call_id, q, playback_type="pipeline-tts-greeting",
+                                        source_encoding=tts_encoding, source_sample_rate=tts_rate,
+                                    )
+                                    if not stream_id:
+                                        raise RuntimeError("start_streaming_playback returned no stream_id")
+                                    greeting_stream_id = stream_id
                                     logger.info(
                                         "Pipeline greeting media pre-roll queued",
                                         call_id=call_id,
@@ -18881,19 +18957,14 @@ class Engine:
                                     await self._stop_connection_audio(
                                         session, reason="first-pipeline-greeting-audio"
                                     )
+                                    any_audio = True
+                                    continue
                                 any_audio = True
-                                await q.put(chunk)
-                            try:
-                                q.put_nowait(None)
-                            except asyncio.QueueFull:
-                                asyncio.create_task(q.put(None))
+                                await self._put_pipeline_stream_chunk(call_id, stream_id, q, chunk)
                             if not any_audio:
-                                logger.warning(
-                                    "Pipeline greeting produced no audio",
-                                    call_id=call_id,
-                                    attempt=attempt,
-                                )
+                                raise RuntimeError("Pipeline greeting produced no audio")
                             else:
+                                await self._put_pipeline_stream_chunk(call_id, stream_id, q, None)
                                 # AAVA-85: Persist greeting to session history so it appears in email summary
                                 try:
                                     session.conversation_history.append(_ts_msg("assistant", greeting))
@@ -18903,15 +18974,12 @@ class Engine:
                                     logger.warning("Failed to persist greeting history", call_id=call_id, error=str(e))
                         else:
                             tts_bytes = bytearray()
-                            async for chunk in pipeline.tts_adapter.synthesize(call_id, greeting, pipeline.tts_options):
+                            greeting_iterator = self._pipeline_greeting_chunks(call_id, pipeline, greeting)
+                            async for chunk in greeting_iterator:
                                 if chunk:
                                     tts_bytes.extend(chunk)
                             if not tts_bytes:
-                                logger.warning(
-                                    "Pipeline greeting produced no audio",
-                                    call_id=call_id,
-                                    attempt=attempt,
-                                )
+                                raise RuntimeError("Pipeline greeting produced no audio")
                             else:
                                 await self._stop_connection_audio(
                                     session, reason="pipeline-greeting-file-ready"
@@ -18926,6 +18994,10 @@ class Engine:
                                 except Exception as e:
                                     logger.warning("Failed to persist greeting history", call_id=call_id, error=str(e))
 
+                        greeting_complete = True
+                        break
+                    except _PipelinePlaybackInterrupted:
+                        # Caller barge-in is a valid transition to listening.
                         break
                     except RuntimeError as exc:
                         error_text = str(exc).lower()
@@ -18953,6 +19025,7 @@ class Engine:
                             error=str(exc),
                             exc_info=True,
                         )
+                        greeting_failed = True
                         break
                     except Exception:
                         logger.error(
@@ -18961,7 +19034,33 @@ class Engine:
                             attempt=attempt,
                             exc_info=True,
                         )
+                        greeting_failed = True
                         break
+                    finally:
+                        if greeting_iterator is not None:
+                            await greeting_iterator.aclose()
+                        if greeting_stream_id and not greeting_complete:
+                            # Never orphan an EOF put on a full/abandoned queue.
+                            if greeting_queue.full():
+                                greeting_queue.get_nowait()
+                            greeting_queue.put_nowait(None)
+                            try:
+                                await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                            except Exception:
+                                logger.warning("Failed aborting pipeline greeting playback", call_id=call_id, exc_info=True)
+
+                if greeting_failed:
+                    if not self._pipeline_output_allowed(call_id, session, stage="greeting-failure"):
+                        return
+                    # The adapters opened successfully. With leave_open the call
+                    # can still handle speech, unless the external dialer owns it.
+                    if (
+                        self.config.on_provider_failure != "leave_open"
+                        or session.external_platform == "vicidial"
+                    ):
+                        await self._handle_provider_start_failure(session)
+                        return
+                    logger.warning("Continuing pipeline without greeting", call_id=call_id)
 
             # No greeting (or a TTS failure that produced no frames) must not
             # leave an indefinite tone playing after the pipeline is ready.
@@ -19048,6 +19147,15 @@ class Engine:
                     pass
 
             if not use_streaming:
+                utterance_buffering = bool(stt_options.get(
+                    "utterance_buffering",
+                    getattr(pipeline.stt_adapter, "requires_utterance_buffer", False) and not chunk_ms_explicit,
+                ))
+                if utterance_buffering:
+                    logger.info("Buffered STT utterance segmentation enabled", call_id=call_id,
+                                component=getattr(pipeline.stt_adapter, "component_key", "unknown"),
+                                energy_threshold=stt_options.get("segment_energy_threshold", 600),
+                                silence_ms=stt_options.get("segment_silence_ms", 600), max_utterance_ms=15000)
 
                 async def process_audio(audio_chunk: bytes) -> None:
                     transcript = ""
@@ -19087,14 +19195,23 @@ class Engine:
 
                 async def stt_worker() -> None:
                     local_buf = bytearray()
+                    utterances = _PipelineUtteranceBuffer(stt_options) if utterance_buffering else None
                     try:
                         while True:
                             frame = await buffer_queue.get()
                             if frame is None:
+                                if utterances:
+                                    final = utterances.flush()
+                                    if final:
+                                        await process_audio(final)
                                 if local_buf:
                                     await process_audio(bytes(local_buf))
                                 await transcript_queue.put(None)
                                 break
+                            if utterances:
+                                for utterance in utterances.feed(frame):
+                                    await process_audio(utterance)
+                                continue
                             local_buf.extend(frame)
                             if len(local_buf) < commit_bytes:
                                 continue
@@ -21415,29 +21532,16 @@ class Engine:
         explicit_channel_provider = str(
             channel_vars.get("AI_PROVIDER") or ""
         ).strip()
-        channel_pipeline = (
-            explicit_channel_provider
-            if explicit_channel_provider in configured_pipelines
-            else ""
-        )
-        effective_pipeline = channel_pipeline or context_pipeline
-        pipeline_profile_only = bool(
-            effective_pipeline
-            and (
-                channel_pipeline
-                or (
-                    not explicit_channel_provider
-                    and not str(
-                        getattr(no_input_context, "provider", None) or ""
-                    ).strip()
-                )
+        # Match call admission: a channel override wins. Without one, the
+        # Agent's pipeline takes precedence over its full-provider setting.
+        if explicit_channel_provider:
+            effective_pipeline = (
+                explicit_channel_provider if explicit_channel_provider in configured_pipelines else ""
             )
-        )
-        # Pipeline-only Agents and an explicit AI_PROVIDER=<pipeline> dialplan
-        # selection have no monolithic provider by design. Do not let
-        # CallSession's compatibility default accidentally select one; use the
-        # pipeline identity and the Agent/profile preferences directly.
-        if pipeline_profile_only:
+        else:
+            effective_pipeline = context_pipeline
+
+        if effective_pipeline:
             provider_name = effective_pipeline
             provider = None
         else:
@@ -21446,6 +21550,19 @@ class Engine:
                 or self.providers.get(provider_name)
             )
         if not provider and not effective_pipeline:
+            try:
+                validate_provider_settings(
+                    getattr(self.config, "providers", None), provider_names={provider_name}
+                )
+            except ConfigValidationError as exc:
+                session.context_resolution_error = f"context_resolution_failed: {exc}"
+                session.error_message = session.context_resolution_error
+                await self._save_session(session)
+                logger.error(
+                    "Selected provider has invalid settings",
+                    call_id=session.call_id, provider=provider_name, error=str(exc),
+                )
+                return
             logger.warning(
                 "Provider not found for audio profile resolution",
                 call_id=session.call_id,
@@ -23496,6 +23613,9 @@ class Engine:
             factory = self.provider_factories.get(provider_name)
 
             if not factory:
+                # A deliberately selected invalid configuration must not send
+                # caller audio or Agent instructions to the default provider.
+                validate_provider_settings(getattr(self.config, "providers", None), provider_names={provider_name})
                 fallback_name = self.config.default_provider
                 fallback_factory = self.provider_factories.get(fallback_name)
                 if fallback_factory:

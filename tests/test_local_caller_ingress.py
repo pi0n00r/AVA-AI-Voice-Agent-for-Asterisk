@@ -479,10 +479,10 @@ async def test_real_local_caller_initializer_reaches_existing_350_preroll_once(m
         engine.ari_client.answer_channel.assert_awaited_once_with(LOCAL_ID)
         engine.ari_client.add_channel_to_bridge.assert_any_await("fixture-bridge", LOCAL_ID)
         await asyncio.wait_for(waiting.wait(), timeout=1)
-        queue = playback.queues[LOCAL_ID]
-        assert queue.empty(), "Speech/pre-roll cannot be queued before initial-media wait finishes"
+        assert LOCAL_ID not in playback.queues, "Playback cannot start before initial-media wait finishes"
         session.media_rx_confirmed = True
         await asyncio.wait_for(ready.wait(), timeout=1)
+        queue = playback.queues[LOCAL_ID]
         chunks = []
         while not queue.empty():
             chunks.append(queue.get_nowait())
@@ -535,12 +535,11 @@ async def test_hangup_during_initial_media_wait_cancels_greeting_and_leaves_next
     engine, pipeline, playback, waiting, ready = timing_engine(monkeypatch, tmp_path)
     await engine._handle_stasis_start(local_event())
     await asyncio.wait_for(waiting.wait(), timeout=1)
-    old_queue = playback.queues[LOCAL_ID]
     old_task = engine._pipeline_tasks[LOCAL_ID]
-    assert old_queue.empty()
+    assert LOCAL_ID not in playback.queues
     await engine._cleanup_call(LOCAL_ID)
     assert old_task.done()
-    assert old_queue.empty()
+    assert LOCAL_ID not in playback.queues
     assert LOCAL_ID not in engine._seen_caller_stasis_channels
     assert LOCAL_ID not in playback.active_streams
     assert not ready.is_set()
@@ -556,7 +555,7 @@ async def test_hangup_during_initial_media_wait_cancels_greeting_and_leaves_next
         await asyncio.wait_for(next_ready.wait(), timeout=1)
         assert next_playback.starts[0][0] == next_id
         assert next_playback.queues[next_id].get_nowait() == b"\xff" * 2800
-        assert old_queue.empty()
+        assert LOCAL_ID not in playback.queues
         assert old_task.done()
     finally:
         await next_engine._cleanup_call(next_id)
@@ -880,10 +879,10 @@ async def test_both_ai_agent_selectors_reach_original_initializer_and_unchanged_
             assert session.transport_profile.wire_sample_rate == 8000
         assert session.call_id == session.caller_channel_id == LOCAL_ID
         await asyncio.wait_for(waiting.wait(), timeout=1)
-        queue = playback.queues[LOCAL_ID]
-        assert queue.empty()
+        assert LOCAL_ID not in playback.queues
         session.media_rx_confirmed = True
         await asyncio.wait_for(ready.wait(), timeout=1)
+        queue = playback.queues[LOCAL_ID]
         assert queue.get_nowait() == b"\xff" * 2800
         assert engine.config.streaming.greeting_min_start_ms == 350
         assert engine.config.streaming.greeting_media_ready_delay_ms == 350
