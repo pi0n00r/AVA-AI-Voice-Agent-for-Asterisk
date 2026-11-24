@@ -9,18 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Shared provider model and voice catalogs with generated Admin UI data and
+  a drift check for runtime defaults and model compatibility.
+- Opt-in OpenAI modular Realtime TTS, Deepgram Flux TTS and multilingual Flux
+  STT, model-aware Groq Arabic voices, Google Live Extended Thinking with
+  tool restrictions, and the full Kokoro voice/language catalog.
 - Merge upstream Grok voice fallback, the shared built-in voice catalog, and configurable Grok speech-session settings in YAML and Admin.
 - Require patched Debian Trixie glibc in both stages of the CPU Local AI image build.
 - **SenseVoice STT in Sherpa offline mode** ([#407](https://github.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/issues/407)): `stt_backend=sherpa` with `sherpa_model_type=offline` now auto-detects SenseVoice model directories (`model*.onnx` + `tokens.txt`) and loads them through the bundled `sherpa-onnx`, with no new dependencies. New `SHERPA_SENSE_VOICE_LANGUAGE` (`auto|zh|en|ja|ko|yue`) and `SHERPA_SENSE_VOICE_USE_ITN` settings are available in the Models page, Environment page and Health widget (the Local Provider editor links to these global controls), are persisted to `.env`/YAML, are verified after a switch even when the model path is unchanged, and roll back on failure. Runtime status reports the model family and effective settings. Models without SenseVoice metadata are rejected with a diagnostic before native loading instead of terminating the server. Emotion and audio-event tags are kept out of transcripts. Catalog adds the int8 SenseVoiceSmall export (zh/en/ja/ko/yue); applying it from the Models page selects offline mode unless an operator chose a mode.
 
 ### Changed
 
+- Refresh new-provider defaults while preserving explicit operator pins;
+  synchronize provider forms and options with the runtime catalog. See
+  [provider migration and call acceptance](docs/Provider-Catalog-Updates.md).
+- Explicit modular speech provider instances own their settings and credentials;
+  invalid role blocks cannot inherit a shared full-provider adapter.
 - **Local AI dependency security:** update Torch, TorchAudio, Transformers, and Hugging Face Hub together. Constrain optional backend installs to the shared pins and keep MeloTTS synthesis and T-one builds compatible with the patched dependency set. Faster-Whisper can load a cached model when a proxy connection fails.
 - Run branch-based CI on `main` and validate release candidates at an exact
   commit on `main` as part of retiring the legacy development branches.
 
 ### Fixed
 
+- Check OpenAI Realtime TTS model access during pipeline readiness. Buffer
+  caller utterances for OpenAI REST transcription and clean up playback
+  when a pipeline greeting fails before or during audio.
+- Handle Deepgram Flux v2 final turn messages and reasoning-model Think
+  settings. Complete queued Google Extended Thinking audio at interaction
+  IDLE without ending an interaction on an intermediate utterance.
 - **SenseVoice final review:** overlapping Admin model switches are rejected for the entire apply/verify/rollback lifecycle, failed switches restore absent environment overrides, dry-run changes retain their pending reload across concurrent requests and degraded model loads, invalid native metadata values (including float32 overflow and unsupported numeric syntax) are rejected, failed UI applies retain pending settings, normalization-vector dimensions are checked before native decoding, displayed settings match model-switch payloads, and SenseVoice selects have accessible labels (#879).
 
 - **SenseVoice Environment apply:** language and ITN changes now request Local AI container recreation, including when removing an override. The Environment page retains the pending action after refresh until the running container matches the saved environment (#879).
