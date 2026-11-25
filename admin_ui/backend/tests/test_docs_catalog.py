@@ -17,12 +17,14 @@ RELEASE_GUIDES = {
 @pytest.mark.asyncio
 async def test_documentation_catalog_is_unique_and_serves_release_guides(monkeypatch):
     monkeypatch.setattr(docs, "get_docs_path", lambda: ROOT / "docs")
-    files = [doc["file"] for cat in docs.DOC_CATEGORIES.values() for doc in cat["docs"]]
+    categories = await docs.get_categories()
+    files = [doc.file for category in categories for doc in category.docs]
     assert len(files) == len(set(files))
-    assert RELEASE_GUIDES.issubset(files)
+    assert (RELEASE_GUIDES - {"AGENTS.md", "MIGRATION.md"}).issubset(files)
+    assert "AGENTS.md" not in files and "MIGRATION.md" not in files
     for relative in files:
         assert (ROOT / "docs" / relative).is_file(), relative
-    for relative in RELEASE_GUIDES:
+    for relative in RELEASE_GUIDES - {"AGENTS.md", "MIGRATION.md"}:
         result = await docs.get_doc_content(relative)
         assert result.content == (ROOT / "docs" / relative).read_text()
         assert result.title and result.category

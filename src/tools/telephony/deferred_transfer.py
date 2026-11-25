@@ -55,7 +55,7 @@ async def store_pending_deferred_transfer(
     action: Dict[str, Any],
     *,
     session=None,
-) -> None:
+) -> tuple[str, Optional[Dict[str, Any]]]:
     session = session if session is not None else await context.get_session()
     from src.tools.handoff_config import resolve_handoff, normalize_local_handoff_providers
     from src.config.provider_instances import provider_kind
@@ -82,8 +82,9 @@ async def store_pending_deferred_transfer(
         handoff["owner"] = ("engine" if local and kind in local and not session.pipeline_name
                             and action.get("source_tool") != "leave_voicemail" else "provider")
         action["handoff"] = handoff
-    session.pending_deferred_transfer = dict(action)
-    await context.session_store.upsert_call(session)
+    status, pending = await context.session_store.arm_deferred_transfer(session, action)
+    if status != "armed":
+        return status, pending
     logger.info(
         "Deferred transfer armed",
         call_id=context.call_id,
@@ -94,6 +95,7 @@ async def store_pending_deferred_transfer(
         target=action.get("target"),
         dialplan_context=action.get("dialplan_context"),
     )
+    return status, pending
 
 
 def build_deferred_transfer_result(

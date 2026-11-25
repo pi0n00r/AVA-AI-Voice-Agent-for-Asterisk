@@ -11,6 +11,9 @@ from __future__ import annotations
 import os
 import socket
 
+from services.login_throttle import trusted_proxy_setting
+
+
 def create_listener(host: str, port: int) -> socket.socket:
     if host != "::":
         raise ValueError("UVICORN_HOST must be :: for the packaged dual-stack listener")
@@ -42,6 +45,8 @@ def main() -> None:
     listener = create_listener(host, port)
     config = uvicorn.Config(
         "main:app",
+        http="services.proxy_peer:PeerAwareHTTPProtocol",
+        forwarded_allow_ips=trusted_proxy_setting(),
         log_config="/app/uvicorn_log_config.yaml",
     )
     uvicorn.Server(config).run(sockets=[listener])

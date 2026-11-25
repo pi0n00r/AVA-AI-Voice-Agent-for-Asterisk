@@ -313,6 +313,31 @@ async def test_final_cleanup_retires_call_state_even_if_cleanup_is_interrupted(m
         await engine._cleanup_call(session.call_id)  # Paired/late terminal event.
 
 
+async def test_stasis_end_dialplan_proof_reaches_post_call_outcome(monkeypatch, tmp_path):
+    monkeypatch.setenv("CALL_HISTORY_DB_PATH", str(tmp_path / "history.db"))
+    monkeypatch.setenv("AGENTS_DB_PATH", str(tmp_path / "agents.db"))
+    monkeypatch.setenv("CALL_HISTORY_ENABLED", "false")
+    engine = _build_engine()
+    engine._persist_call_history = AsyncMock()
+    engine.ari_client.hangup_channel = AsyncMock(return_value=True)
+    engine.ari_client.destroy_bridge = AsyncMock(return_value=True)
+    session = CallSession(call_id="no-input-handoff", caller_channel_id="no-input-handoff")
+    session.transfer_active = True
+    session.transfer_state = "no_input_fallback"
+    session.transfer_target = "Reception"
+    session.no_input_state.update({"action_result": "pending", "fallback_destination": "reception",
+                                   "handoff_context": "ext-queues", "handoff_extension": "600"})
+    await engine.session_store.upsert_call(session)
+    await engine._cleanup_call(session.call_id, stasis_end_channel={
+        "id": session.caller_channel_id,
+        "dialplan": {"context": "ext-queues", "exten": "600", "app_name": "Queue"},
+    })
+    assert session.no_input_state["action_result"] == "confirmed_by_stasis_end"
+    assert session.call_outcome == "transferred"
+    assert session.transfer_destination == "Reception"
+    engine._persist_call_history.assert_awaited_once()
+
+
 async def test_cancelled_endpoint_probe_is_not_cached_and_retry_still_probes(endpoint_engine):
     engine, _ = endpoint_engine
     engine._outbound_channel_tech = "pjsip"

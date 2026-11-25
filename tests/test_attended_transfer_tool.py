@@ -32,6 +32,12 @@ class _FakeSessionStore:
     async def upsert_call(self, session: CallSession) -> None:
         self.sessions[session.call_id] = session
 
+    async def arm_deferred_transfer(self, session: CallSession, action: dict):
+        if self.sessions.get(session.call_id) is not session:
+            return "owned", None
+        session.pending_deferred_transfer = dict(action)
+        return "armed", session.pending_deferred_transfer
+
     async def get_by_call_id(self, call_id):
         return self.sessions.get(call_id)
 
@@ -43,6 +49,7 @@ class _FakeContext:
         self.caller_channel_id = caller_channel_id
         self.ari_client = ari_client
         self.session_store = _FakeSessionStore()
+        self.session_store.sessions[session.call_id] = session
         self._session = session
 
     def get_config_value(self, key: str, default=None):
