@@ -42,6 +42,11 @@ def main() -> None:
     listener = create_listener(host, port)
     config = uvicorn.Config(
         "main:app",
+        http="services.proxy_peer:PeerAwareHTTPProtocol",
+        forwarded_allow_ips=os.getenv(
+            "AAVA_TRUSTED_PROXIES",
+            os.getenv("FORWARDED_ALLOW_IPS", "127.0.0.1"),
+        ),
         log_config="/app/uvicorn_log_config.yaml",
     )
     uvicorn.Server(config).run(sockets=[listener])

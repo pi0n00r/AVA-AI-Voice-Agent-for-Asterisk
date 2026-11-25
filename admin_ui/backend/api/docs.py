@@ -125,17 +125,25 @@ def get_docs_path() -> Path:
     return Path("/app/project/docs")
 
 
+def _available_docs(category: dict, docs_path: Path) -> list[dict]:
+    return [
+        doc for doc in category["docs"]
+        if (docs_path / doc["file"]).is_file()
+    ]
+
+
 @router.get("/categories", response_model=List[CategoryInfo])
 async def get_categories():
     """Get all documentation categories with their docs."""
     categories = []
+    docs_path = get_docs_path()
     for cat_id, cat_data in DOC_CATEGORIES.items():
         categories.append(CategoryInfo(
             id=cat_id,
             title=cat_data["title"],
             icon=cat_data["icon"],
             description=cat_data["description"],
-            docs=[DocInfo(**doc) for doc in cat_data["docs"]]
+            docs=[DocInfo(**doc) for doc in _available_docs(cat_data, docs_path)]
         ))
     return categories
 
@@ -146,7 +154,7 @@ async def get_doc_content(file_path: str):
     requested = (file_path or "").strip()
     docs_path = get_docs_path()
     for cat_id, cat_data in DOC_CATEGORIES.items():
-        docs = cat_data.get("docs", [])
+        docs = _available_docs(cat_data, docs_path)
         for index, doc in enumerate(docs):
             canonical_file = str(doc.get("file", ""))
             if canonical_file != requested:

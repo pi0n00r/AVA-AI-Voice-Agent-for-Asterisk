@@ -20,7 +20,8 @@ import os
 import time
 import uuid
 import audioop
-from typing import Any, Dict, Optional, List
+from functools import partial
+from typing import Any, Dict, Optional, List, Literal
 
 import websockets
 from .connection_recovery import connect_with_recovery
@@ -100,6 +101,9 @@ class GrokProvider(AIProviderInterface):
     4. stop_session() -> closes the WebSocket and cancels background tasks.
     """
 
+    _GREETING_QUIET_SECONDS = 1.0
+    _GREETING_RECOVERY_SECONDS = 6.0
+
     def __init__(
         self,
         config: GrokProviderConfig,
@@ -133,7 +137,11 @@ class GrokProvider(AIProviderInterface):
         # until xAI creates the replacement response.
         self._drop_output_until_next_response: bool = False
         self._greeting_response_id: Optional[str] = None  # Track greeting to protect from barge-in
-        self._greeting_completed: bool = False  # Track if greeting has finished
+        self._greeting_completed = True  # False only while an explicit greeting is outstanding.
+        self._greeting_retry_task: Optional[asyncio.Task] = None  # One attempt per call.
+        self._caller_speaking = False
+        self._last_created_response_id = None
+        self._last_greeting_vad_edge = 0.0
         # Debounce engine-level barge-in signals (prevents flush storms).
         self._last_barge_in_emit_ts: float = 0.0
         self._farewell_response_id: Optional[str] = None  # Track farewell response for hangup
@@ -437,6 +445,14 @@ class GrokProvider(AIProviderInterface):
 
         await self.stop_session()
         self._call_id = call_id
+        self._greeting_completed = True
+        self._greeting_response_id = None
+        self._greeting_retry_task = None
+        self._caller_speaking = False
+        self._last_created_response_id = None
+        self._last_greeting_vad_edge = 0.0
+        self._last_final_user_text = ""
+        self._current_response_id = None
         self._pending_response = False
         self._in_audio_burst = False
         self._first_output_chunk_logged = False
@@ -860,6 +876,15 @@ class GrokProvider(AIProviderInterface):
             # _await_parent_response_done for the full rationale).
             await self.prepare_handoff_result(result, self._call_id, handoff_origin)
             context["handoff_result_sent"] = self.handoff_result_sent
+            action = result.get("deferred_transfer")
+            parent_id = event_data.get("response_id")
+            if (
+                parent_id and tool_registry.canonicalize_tool_name(function_name) == "blind_transfer"
+                and result.get("status") == "success" and isinstance(action, dict)
+                and action.get("source_tool") == "blind_transfer" and action.get("id")
+                and result.get("message") and result.get("ai_should_speak", True)
+            ):
+                context["handoff_result_sent"] = partial(self.handoff_result_sent, origin_id=parent_id)
 
             await self._await_parent_response_done(event_data, function_name=function_name)
 
@@ -1256,10 +1281,13 @@ class GrokProvider(AIProviderInterface):
         self._provider_reported_output_rate = None
         await self._send_json(payload)
 
-    async def _send_explicit_greeting(self):
+    async def _send_explicit_greeting(
+        self, *, after_cancelled_id: Optional[str] = None, retry_deadline: Optional[float] = None
+    ) -> Literal["sent", "wait_for_quiet", "suppressed"]:
         greeting = (self.config.greeting or "").strip()
-        if not greeting or not self.websocket or self.websocket.state.name != "OPEN":
-            return
+        websocket = self.websocket
+        if not greeting or not websocket or websocket.state.name != "OPEN":
+            return "suppressed"
 
         # Per Grok Voice Agent docs: Disable turn_detection during greeting
         # to prevent user speech from interrupting the greeting
@@ -1279,8 +1307,8 @@ class GrokProvider(AIProviderInterface):
             }
             await self._send_json(disable_vad_payload)
         
-        # Small delay to ensure VAD disable is processed
-        await asyncio.sleep(0.1)
+            # Give the beta VAD update time to apply before requesting audio.
+            await asyncio.sleep(0.1)
 
         # Build response.create payload
         if self._is_ga:
@@ -1304,15 +1332,33 @@ class GrokProvider(AIProviderInterface):
                 },
             }
         
-        logger.info(
-            "🎤 Sending greeting response.create",
-            call_id=self._call_id,
-            greeting_preview=greeting[:50] + "..." if len(greeting) > 50 else greeting,
-        )
+        async with self._send_lock:
+            # Input events continue while other writes hold the lock. Claim the
+            # next response only when we can send on the same live connection.
+            if websocket is not self.websocket or websocket.state.name != "OPEN" or self._closing or self._closed:
+                return "suppressed"
+            if self._is_ga and (
+                self._last_created_response_id != after_cancelled_id or self._last_final_user_text
+            ):
+                return "suppressed"
+            if retry_deadline is not None:
+                now = asyncio.get_running_loop().time()
+                if now >= retry_deadline or self._pending_response or self._current_response_id:
+                    return "suppressed"
+                if self._caller_speaking or now - self._last_greeting_vad_edge < self._GREETING_QUIET_SECONDS:
+                    return "wait_for_quiet"
+                logger.info("Retrying silent Grok greeting after pickup", call_id=self._call_id)
 
-        await self._send_json(response_payload)
-        self._pending_response = True
-        
+            logger.info(
+                "🎤 Sending greeting response.create",
+                call_id=self._call_id,
+                greeting_preview=greeting[:50] + "..." if len(greeting) > 50 else greeting,
+            )
+            self._greeting_response_id = None
+            self._greeting_completed = False
+            await websocket.send(json.dumps(response_payload))
+            self._pending_response = True
+
         logger.info(
             "🛡️  Greeting sent - will re-enable VAD after completion",
             call_id=self._call_id
@@ -1326,6 +1372,31 @@ class GrokProvider(AIProviderInterface):
         self._greeting_vad_task.add_done_callback(_log_provider_task_exception)
         self._background_tasks.add(self._greeting_vad_task)
         self._greeting_vad_task.add_done_callback(self._background_tasks.discard)
+        return "sent"
+
+    def _cancel_greeting_retry(self):
+        task = self._greeting_retry_task
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _retry_silent_greeting(self):
+        # A VAD start can be line noise or the caller's first words. Wait for a
+        # stop and a full quiet interval; give up if the caller keeps talking.
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        deadline = start + self._GREETING_RECOVERY_SECONDS
+        while loop.time() < deadline:
+            quiet_until = max(start, self._last_greeting_vad_edge) + self._GREETING_QUIET_SECONDS
+            remaining = quiet_until - loop.time()
+            if not self._caller_speaking and remaining <= 0:
+                outcome = await self._send_explicit_greeting(
+                    after_cancelled_id=self._greeting_response_id, retry_deadline=deadline
+                )
+                if outcome == "wait_for_quiet":
+                    continue  # A VAD edge arrived while waiting for the send lock.
+                return
+            delay = self._GREETING_QUIET_SECONDS if self._caller_speaking else remaining
+            await asyncio.sleep(min(delay, deadline - loop.time()))
 
     async def _greeting_vad_fallback(self):
         """Fallback to re-enable VAD if greeting completion detection fails."""
@@ -1579,6 +1650,9 @@ class GrokProvider(AIProviderInterface):
     async def handle_local_barge_in(self) -> int:
         """Flush provider-side egress after AVA's local VAD interrupts playback."""
         dropped = 0
+        response_id = self._current_response_id or self._assistant_audio_response_id
+        if response_id:
+            self._handoff_evidence.turn(self._call_id, response_id)["interrupted"] = True
         self._drop_output_until_next_response = True
         try:
             async with self._pacer_lock:
@@ -1617,6 +1691,7 @@ class GrokProvider(AIProviderInterface):
             await self.on_event(
                 {
                     "type": "ProviderBargeIn",
+                    "audio_response_id": self._current_response_id or self._assistant_audio_response_id,
                     "call_id": self._call_id,
                     "provider": self.provider_event_name(),
                     "event": event_type,
@@ -1881,6 +1956,11 @@ class GrokProvider(AIProviderInterface):
             response = event.get("response", {})
             response_id = response.get("id")
             if response_id:
+                self._last_created_response_id = response_id
+                if self._greeting_response_id and self._greeting_response_id != response_id:
+                    # A subsequent turn wins even if it finishes during the quiet interval.
+                    self._cancel_greeting_retry()
+                    self._greeting_completed = True
                 if self._drop_output_until_next_response:
                     logger.info(
                         "Releasing Grok output quarantine for replacement response",
@@ -1895,7 +1975,7 @@ class GrokProvider(AIProviderInterface):
                 except Exception:
                     pass
                 
-                # Mark first response as greeting response (protected from barge-in)
+                # Protect only a response created after an explicit greeting request.
                 if not self._greeting_completed and self._greeting_response_id is None:
                     self._greeting_response_id = response_id
                     logger.info(
@@ -2036,24 +2116,13 @@ class GrokProvider(AIProviderInterface):
             return
 
         if event_type in ("response.completed", "response.error", "response.cancelled", "response.done"):
-            response_status = (event.get("response") or {}).get("status")
+            response = event.get("response") or {}
+            response_status = response.get("status")
+            done_resp_id = response.get("id") or event.get("response_id") or self._current_response_id
+            retry_greeting = False
+            origin = self._handoff_evidence.turn(self._call_id, done_resp_id)
             if event_type in {"response.error", "response.cancelled"} or response_status in {"cancelled", "failed", "incomplete"}:
-                self.interrupt_handoff(self._call_id)
-            # Signal any function_call handler waiting on this response. The server
-            # commits output items to the conversation on response finalization, so
-            # this is the earliest point a function_call_output can be safely submitted.
-            # Cleanup happens here (not in the waiter) so a single response with
-            # multiple function_call items doesn't have one handler pop the sentinel
-            # before its siblings observe it.
-            try:
-                ev_resp = event.get("response") or {}
-                done_resp_id = ev_resp.get("id") or self._current_response_id
-                if done_resp_id:
-                    done_evt = self._response_done_events.pop(done_resp_id, None)
-                    if done_evt:
-                        done_evt.set()
-            except Exception:
-                logger.debug("Failed to signal response.done event", exc_info=True)
+                origin["interrupted"] = True
 
             # Track whether ANY audio was emitted during this response (not just "currently emitting").
             current_response_id = self._current_response_id
@@ -2067,11 +2136,24 @@ class GrokProvider(AIProviderInterface):
             # Note: Turn latency timer now starts on input_audio_buffer.speech_stopped
             # (moved from here for standardized measurement across providers)
             
-            handoff_flushed = await self.flush_handoff_pacer()
-            await self._emit_audio_done()
-            if had_audio_for_response and handoff_flushed:
-                await self.complete_handoff_audio(self._call_id, current_response_id)
-            
+            # Complete speech evidence before releasing the parent-result gate.
+            # A tool can finish while the last paced bytes or transcript are being emitted.
+            try:
+                transfer_parent = bool(origin.get("blind_transfer_parent") and done_resp_id == current_response_id)
+                if transfer_parent and origin["interrupted"]:
+                    async with self._pacer_lock:
+                        self._outbuf.clear()
+                handoff_flushed = await self.flush_handoff_pacer(transfer_parent=transfer_parent)
+                await self._emit_audio_done()
+                if (had_audio_for_response and current_response_id == done_resp_id
+                        and handoff_flushed and not self._outbuf):
+                    await self.complete_handoff_audio(self._call_id, current_response_id)
+                await self._emit_assistant_transcript(event, "", is_final=True)
+            finally:
+                done_evt = self._response_done_events.pop(done_resp_id, None)
+                if done_evt:
+                    done_evt.set()
+
             # Only emit additional audio_done if this response actually had audio output
             # This prevents premature hangup when tool responses complete (no audio yet)
             # The farewell response will emit audio_done when IT completes with audio
@@ -2099,10 +2181,18 @@ class GrokProvider(AIProviderInterface):
             # Re-enable VAD when greeting response completes
             # response.done fires when entire response is generated (not per-segment)
             # This is the correct event to wait for, not response.audio.done (which fires per-segment)
-            if (self._current_response_id == self._greeting_response_id and 
-                not self._greeting_completed and 
-                event_type in ("response.completed", "response.done")):
+            if (
+                self._greeting_response_id
+                and done_resp_id == self._current_response_id == self._greeting_response_id
+                and not self._greeting_completed
+                and event_type in ("response.completed", "response.done", "response.cancelled")
+            ):
                 self._greeting_completed = True
+                retry_greeting = (
+                    self._is_ga and (response_status == "cancelled" or event_type == "response.cancelled")
+                    and not had_audio_for_response and self._greeting_retry_task is None
+                    and not self._last_final_user_text
+                )
                 logger.info(
                     "✅ Greeting response completed - re-enabling turn_detection",
                     call_id=self._call_id,
@@ -2184,14 +2274,19 @@ class GrokProvider(AIProviderInterface):
                 pass
 
             self._pending_response = False
-            await self._emit_assistant_transcript(event, "", is_final=True)
             self._current_response_id = None  # Clear response ID after completion
+            if retry_greeting:
+                self._greeting_retry_task = asyncio.create_task(self._retry_silent_greeting())
+                self._background_tasks.add(self._greeting_retry_task)
+                self._greeting_retry_task.add_done_callback(self._background_tasks.discard)
+                self._greeting_retry_task.add_done_callback(_log_provider_task_exception)
             return
 
         if event_type == "conversation.item.input_audio_transcription.completed":
             # User speech transcription completed - works with server_vad
             transcript = event.get("transcript", "")
             if transcript:
+                self._cancel_greeting_retry()
                 logger.info(
                     "📝 User transcript received",
                     call_id=self._call_id,
@@ -2237,6 +2332,8 @@ class GrokProvider(AIProviderInterface):
         # Optional acks/telemetry for audio buffer operations
         if event_type and event_type.startswith("input_audio_buffer"):
             if event_type in ("input_audio_buffer.speech_started", "input_audio_buffer.speech_stopped"):
+                self._caller_speaking = event_type.endswith("speech_started")
+                self._last_greeting_vad_edge = asyncio.get_running_loop().time()
                 # Both VAD edges, so the engine can hold a deferred transfer's
                 # silent-reply timer while the caller is talking.
                 await self.emit_caller_speech(
@@ -2427,6 +2524,8 @@ class GrokProvider(AIProviderInterface):
                 # conversation on the server side. Without this, fast tools race ahead of
                 # response.done and Grok rejects the output with invalid_tool_call_id.
                 resp_id = event.get("response_id") or self._current_response_id
+                if resp_id and tool_registry.canonicalize_tool_name(function_name) == "blind_transfer":
+                    self._handoff_evidence.turn(self._call_id, resp_id)["blind_transfer_parent"] = True
                 if resp_id and resp_id not in self._response_done_events:
                     self._response_done_events[resp_id] = asyncio.Event()
                 # Track the call_id so the error handler can correlate a later
@@ -2441,7 +2540,7 @@ class GrokProvider(AIProviderInterface):
                     response_id=resp_id,
                 )
                 # Handle function call via tool adapter
-                task = asyncio.create_task(self._handle_function_call(event))
+                task = asyncio.create_task(self._handle_function_call({**event, "response_id": resp_id}))
                 task.add_done_callback(_log_provider_task_exception)
                 self._background_tasks.add(task)
                 task.add_done_callback(self._background_tasks.discard)
@@ -2611,6 +2710,7 @@ class GrokProvider(AIProviderInterface):
                     {
                         "type": "AgentAudioDone",
                         "streaming_done": True, "_handoff_complete": False,
+                        "audio_response_id": self._current_response_id,
                         "call_id": self._call_id,
                     }
                 )
@@ -2860,6 +2960,8 @@ class GrokProvider(AIProviderInterface):
         call_id = self._call_id
         if not call_id:
             return
+        self._cancel_greeting_retry()
+        self._greeting_completed = True
         # Any in-flight _handle_function_call tasks were waiting on response.done
         # sentinels for the OLD connection. Signal them now so they unblock and
         # exit cleanly instead of later trying to submit a stale

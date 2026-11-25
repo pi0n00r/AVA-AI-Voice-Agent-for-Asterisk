@@ -190,14 +190,12 @@ def test_runtime_data_and_secrets_are_excluded_from_root_build_context():
 
 
 def test_admin_image_packages_shared_config_apply_policy():
-    compose = (PROJECT_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     dockerfile = (PROJECT_ROOT / "admin_ui" / "Dockerfile").read_text(
         encoding="utf-8"
     )
 
-    assert "context: ." in compose
-    assert "dockerfile: admin_ui/Dockerfile" in compose
-    assert "COPY src/config_apply.py ./config_apply.py" in dockerfile
+    assert "COPY src/ ./src/" in dockerfile
+    assert (PROJECT_ROOT / "src" / "config_apply.py").is_file()
 
 
 def test_recovery_uses_previous_gpu_topology(tmp_path):
