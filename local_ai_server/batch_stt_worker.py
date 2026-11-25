@@ -14,26 +14,43 @@ import sys
 
 MAX_PCM_BYTES = 120 * 16000 * 2
 MAX_TRANSCRIPT_CHARS = 10000
+CPU_FALLBACK_MODELS = frozenset({"tiny", "base", "small"})
 
 
-def _transcribe(args: argparse.Namespace, pcm16: bytes) -> str:
-    if args.backend == "faster_whisper":
-        from stt_backends import FasterWhisperSTTBackend
+def _transcribe_faster_whisper(args: argparse.Namespace, pcm16: bytes) -> str:
+    """Keep bounded batch STT available when the container loses CUDA access."""
+    from stt_backends import FasterWhisperSTTBackend
 
+    def attempt(device: str, compute_type: str) -> str | None:
         backend = FasterWhisperSTTBackend(
             model_size=args.model,
-            device=args.device,
-            compute_type=args.compute_type,
+            device=device,
+            compute_type=compute_type,
             language=args.configured_language,
         )
-        if not backend.initialize():
-            raise RuntimeError("stt_unavailable")
         try:
+            if not backend.initialize():
+                return None
             return backend.transcribe_pcm16(
                 pcm16, language=args.language or None, raise_on_error=True
             )
         finally:
             backend.shutdown()
+
+    result = attempt(args.device, args.compute_type)
+    if result is not None:
+        return result
+    if args.device == "cuda" and args.model in CPU_FALLBACK_MODELS:
+        logging.warning("Batch STT CUDA initialization failed; trying CPU int8")
+        result = attempt("cpu", "int8")
+        if result is not None:
+            return result
+    raise RuntimeError("stt_unavailable")
+
+
+def _transcribe(args: argparse.Namespace, pcm16: bytes) -> str:
+    if args.backend == "faster_whisper":
+        return _transcribe_faster_whisper(args, pcm16)
 
     if args.backend == "whisper_cpp":
         from stt_backends import WhisperCppSTTBackend
