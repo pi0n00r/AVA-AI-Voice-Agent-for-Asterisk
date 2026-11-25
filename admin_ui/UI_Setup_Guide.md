@@ -1,6 +1,6 @@
 # Admin UI Setup Guide
 
-**Applies to**: v7.7.5 (Admin UI introduced in v4.4.1)
+**Applies to**: v7.7.5.2 (Admin UI introduced in v4.4.1)
 
 **Last reviewed**: October 2026
 **Quick Start**: 5 minutes to get running
@@ -30,7 +30,7 @@ their immediate behavior. Tool hot reload affects new calls; process changes
 still need an explicit restart.
 See the [Admin UI guide](../docs/ADMIN_UI_GUIDE.md),
 [Tools guide](Tools_Setup_Guide.md), [Agents rollout](../docs/AGENTS_EXPERIENCE_ROLLOUT.md)
-and [upgrade instructions](../docs/INSTALLATION.md#upgrade-to-v770-existing-checkout).
+and [upgrade instructions](../docs/INSTALLATION.md#upgrade-to-v7752-existing-checkout).
 
 ## 🚀 Quick Start (Docker)
 
@@ -38,7 +38,7 @@ and [upgrade instructions](../docs/INSTALLATION.md#upgrade-to-v770-existing-chec
 
 ### 1. Start the Admin UI
 
-For source checkouts containing the unreleased #802 fixes:
+From the maintained fork release v7.7.5.2 or later:
 
 ```bash
 # From the project root, capture and review the non-blocking and blocking findings.

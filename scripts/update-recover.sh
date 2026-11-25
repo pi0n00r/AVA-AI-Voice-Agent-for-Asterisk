@@ -41,11 +41,11 @@ usage() {
 Usage:
   sudo bash scripts/update-recover.sh [options]
 
-Recommended for a stuck release upgrade (only after v7.7.4 is published):
-  AAVA_RECOVERY_REF=v7.7.4
+Recommended for a stuck release upgrade (only after v7.7.5.2 is published):
+  AAVA_RECOVERY_REF=v7.7.5.2
   AAVA_RECOVERY_STATUS=0
   AAVA_RECOVERY_SCRIPT="$(mktemp)" &&
-    curl -fsSL "https://raw.githubusercontent.com/hkjarral/AVA-AI-Voice-Agent-for-Asterisk/${AAVA_RECOVERY_REF}/scripts/update-recover.sh" -o "${AAVA_RECOVERY_SCRIPT}" &&
+    curl -fsSL "https://raw.githubusercontent.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk/${AAVA_RECOVERY_REF}/scripts/update-recover.sh" -o "${AAVA_RECOVERY_SCRIPT}" &&
     sudo bash "${AAVA_RECOVERY_SCRIPT}" --repo /opt/Asterisk-AI-Voice-Agent --ref "${AAVA_RECOVERY_REF}" --include-ui
   AAVA_RECOVERY_STATUS=$?
   rm -f "${AAVA_RECOVERY_SCRIPT:-}"
@@ -110,12 +110,12 @@ need_python3() {
 }
 
 is_release_ref() {
-  [[ "$1" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]
+  [[ "$1" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]
 }
 
 normalize_release_ref() {
   local ref="$1"
-  if [[ "$ref" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+  if [[ "$ref" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?)$ ]]; then
     printf 'v%s\n' "${BASH_REMATCH[1]}"
     return 0
   fi

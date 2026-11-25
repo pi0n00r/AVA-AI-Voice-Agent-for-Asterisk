@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
   "project": "Ava",
-  "release": "7.7.5",
+  "release": "7.7.5.2",
   "sourceCommit": "b1dfd0e188c5bdce715098cac7442b7db02f2fcd",
   "sourceTree": "8f46a01aafd326842d5762ce4010087d8aa17e6e",
   "reconstructionBoundaryCommit": "7dcb5b1",
-  "upstreamBaseCommit": "5ad4514f5291fbaf217c72a3c59ab36dcccd6133",
+  "upstreamBaseCommit": "05cf7d623e2a82ecac244258d9955130c75d35d6",
   "provenanceBridgeCommit": "4546da569ff13e07976a0cb34c1953a1b71a89dc",
   "upstreamLicense": "MIT",
   "fleetAdditionsLicense": "AGPL-3.0-or-later",
