@@ -150,8 +150,20 @@ class UnifiedTransferTool(Tool):
         if transfer_deferral_enabled(context):
             if source_tool == "blind_transfer" and context.tool_response_id:
                 action["_tool_response_id"] = context.tool_response_id
-            await self._maybe_start_predial_transfer(context, action)
-            await store_pending_deferred_transfer(context, action)
+            if not await self._maybe_start_predial_transfer(context, action):
+                return {"status": "failed", "ownership_lost": True}
+            status, pending = await store_pending_deferred_transfer(context, action)
+            if status == "duplicate" and pending is not None:
+                return build_deferred_transfer_result(
+                    action=pending,
+                    message=f"Transferring you to {pending.get('description') or description} now.",
+                    extra={"destination": pending.get("target") or target,
+                           "type": pending.get("transfer_type") or transfer_type,
+                           "duplicate_suppressed": True},
+                )
+            if status != "armed":
+                return {"status": "failed", "ownership_lost": status == "owned",
+                        "message": "A transfer is already in progress."}
             return build_deferred_transfer_result(
                 action=action,
                 message=f"Transferring you to {description} now.",
@@ -191,14 +203,14 @@ class UnifiedTransferTool(Tool):
         self,
         context: ToolExecutionContext,
         action: Dict[str, Any],
-    ) -> None:
+    ) -> bool:
         if self._deferred_strategy(context) != "predial_then_bridge":
-            return
+            return True
 
         endpoint = self._predial_endpoint_for_action(action)
         if not endpoint:
             logger.warning("Predial transfer skipped - endpoint unavailable", call_id=context.call_id, action=action)
-            return
+            return True
 
         app = str(context.get_config_value("asterisk.app_name", "asterisk-ai-voice-agent") or "asterisk-ai-voice-agent")
         transfer_config = context.get_config_value("tools.transfer") or {}
@@ -210,7 +222,7 @@ class UnifiedTransferTool(Tool):
         destination_key = str(action.get("destination_key") or action.get("target") or "").strip()
         try:
             session = await context.get_session()
-            session.current_action = {
+            predial_action = {
                 "type": "predial_transfer",
                 "deferred_action_id": action.get("id"),
                 "destination_key": destination_key,
@@ -223,9 +235,11 @@ class UnifiedTransferTool(Tool):
                 "ready_to_bridge": False,
                 "bridged": False,
             }
-            await context.session_store.upsert_call(session)
+            if not await context.session_store.claim_predial_transfer(session, predial_action):
+                return False
         except Exception:
             logger.debug("Failed to persist predial transfer action state", call_id=context.call_id, exc_info=True)
+            return False
 
         try:
             result = await context.ari_client.send_command(
@@ -249,11 +263,11 @@ class UnifiedTransferTool(Tool):
             )
         except Exception:
             logger.warning("Predial transfer originate failed", call_id=context.call_id, endpoint=endpoint, exc_info=True)
-            return
+            return True
 
         if not isinstance(result, dict) or not result.get("id"):
             logger.warning("Predial transfer originate returned no channel", call_id=context.call_id, endpoint=endpoint, response=result)
-            return
+            return True
 
         predial_channel_id = str(result["id"])
         action["payload"] = {
@@ -283,6 +297,7 @@ class UnifiedTransferTool(Tool):
             predial_channel_id=predial_channel_id,
             destination_key=destination_key,
         )
+        return True
 
     async def prepare_or_execute_extension_transfer(
         self,
@@ -765,7 +780,8 @@ class UnifiedTransferTool(Tool):
             if not await claim_ownership(changes):
                 return {"status": "failed", "ownership_lost": True}
         else:
-            await context.update_session(**changes)
+            if not await context.session_store.claim_model_transfer(session, changes):
+                return {"status": "failed", "ownership_lost": True}
 
         try:
             handed_off = await context.ari_client.continue_in_dialplan(
@@ -812,7 +828,9 @@ class UnifiedTransferTool(Tool):
                     if not await release_ownership(previous_transfer_state):
                         return {"status": "failed", "ownership_lost": True}
                 else:
-                    await context.update_session(**previous_transfer_state)
+                    if not await context.session_store.restore_model_transfer(
+                            session, transfer_state, previous_transfer_state):
+                        return {"status": "failed", "ownership_lost": True}
             except Exception:
                 logger.error(
                     "Failed to restore transfer ownership after unconfirmed handoff",

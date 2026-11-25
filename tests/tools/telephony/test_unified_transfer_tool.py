@@ -10,6 +10,36 @@ from src.tools.telephony.deferred_transfer import DEFERRED_TRANSFER_RESULT_KEY
 from src.tools.telephony.unified_transfer import UnifiedTransferTool
 
 
+@pytest.fixture(autouse=True)
+def atomic_transfer_store_mock(mock_session_store):
+    async def arm(session, action):
+        session.pending_deferred_transfer = dict(action)
+        await mock_session_store.upsert_call(session)
+        return "armed", session.pending_deferred_transfer
+
+    async def claim(session, changes):
+        for name, value in changes.items():
+            setattr(session, name, value)
+        await mock_session_store.upsert_call(session)
+        return True
+
+    async def restore(session, _expected_state, previous):
+        for name, value in previous.items():
+            setattr(session, name, value)
+        await mock_session_store.upsert_call(session)
+        return True
+
+    async def predial(session, action):
+        session.current_action = dict(action)
+        await mock_session_store.upsert_call(session)
+        return True
+
+    mock_session_store.arm_deferred_transfer.side_effect = arm
+    mock_session_store.claim_model_transfer.side_effect = claim
+    mock_session_store.restore_model_transfer.side_effect = restore
+    mock_session_store.claim_predial_transfer.side_effect = predial
+
+
 class TestUnifiedTransferTool:
     @pytest.fixture
     def tool(self, mock_ari_client):

@@ -2052,7 +2052,9 @@ class Engine:
         session = await self.session_store.get_by_call_id(call_id)
         if not session or bool(getattr(session, "cleanup_in_progress", False)):
             return True
-        if self._session_was_transferred(session) or self._session_has_pending_attended_transfer(session):
+        if (self._session_was_transferred(session)
+                or self._session_has_pending_attended_transfer(session)
+                or isinstance(getattr(session, "pending_deferred_transfer", None), dict)):
             return True
         action = getattr(session, "current_action", None) or {}
         action_type = str(action.get("type") or "").strip().lower() if isinstance(action, dict) else ""
@@ -12083,6 +12085,7 @@ class Engine:
                 )
             if getattr(session, "caller_stasis_ended", False):
                 await self._refresh_fax_handoff(session)
+            await self._settle_no_input_handoff_for_cleanup(session, stasis_end_channel)
             
             # Calculate call duration early (keep _call_start_times entry until after post-call tools)
             call_duration_seconds = 0
@@ -18557,10 +18560,16 @@ class Engine:
         except Exception:
             result = {"status": "failed", "handoff_indeterminate": bool(getattr(session, "transfer_active", False))}
         current = await self.session_store.get_by_call_id(session.call_id)
-        if current is not session or session.cleanup_in_progress:
-            return True  # Never act on a replacement or a cleanup-owned caller.
+        if current is not session:
+            return True  # Never act on a replacement caller.
+        if state.get("action_result") == "confirmed_by_stasis_end":
+            session.transfer_active = True
+            session.transfer_state = "no_input_fallback"
+            session.transfer_destination = str(session.transfer_target or destination.get("description") or key)
+            return True
         if result.get("status") == "success":
             state["action_result"] = "handed_off"
+            session.transfer_destination = str(session.transfer_target or destination.get("description") or key)
             if not session.cleanup_in_progress:
                 session.call_outcome = "transferred"
             return True
@@ -18571,12 +18580,43 @@ class Engine:
             state["action_result"] = "indeterminate"
             session.call_outcome = "error"
             logger.warning("Inactivity handoff indeterminate; retaining caller ownership guard", call_id=session.call_id)
-            self._fire_and_forget_for_call(
-                session.call_id, self._reconcile_no_input_handoff(session), name=f"no-input-reconcile-{session.call_id}",
-            )
+            if not session.cleanup_in_progress:
+                self._fire_and_forget_for_call(
+                    session.call_id, self._reconcile_no_input_handoff(session), name=f"no-input-reconcile-{session.call_id}",
+                )
             return True
         state["action_result"] = "rejected"
+        if session.cleanup_in_progress:
+            return True  # Never hang up a cleanup-owned caller.
         return False
+
+    async def _settle_no_input_handoff_for_cleanup(
+        self, session: CallSession, stasis_end_channel: Optional[dict], *, timeout: float = 10.1,
+    ) -> None:
+        """Resolve the in-flight fallback before post-call tools freeze its outcome."""
+        state = session.no_input_state
+        if (state.get("action_result") != "pending"
+                or session.transfer_state != "no_input_fallback"
+                or not session.transfer_active):
+            return
+        channel = stasis_end_channel if isinstance(stasis_end_channel, dict) else {}
+        dialplan = channel.get("dialplan") or {}
+        if (channel.get("id") == session.caller_channel_id
+                and isinstance(dialplan, dict)
+                and dialplan.get("context") == state.get("handoff_context")
+                and dialplan.get("exten") == state.get("handoff_extension")
+                and str(dialplan.get("app_name") or "").lower() not in {"", "stasis"}):
+            state["action_result"] = "confirmed_by_stasis_end"
+            session.transfer_destination = str(session.transfer_target or state.get("fallback_destination") or "")
+            session.call_outcome = "transferred"
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout)
+        while state.get("action_result") == "pending" and loop.time() < deadline:
+            await asyncio.sleep(min(0.05, max(0.0, deadline - loop.time())))
+        if state.get("action_result") == "pending":
+            state["action_result"] = "indeterminate"
+            session.call_outcome = "error"
 
     async def _reconcile_no_input_handoff(self, session: CallSession) -> None:
         """Observe an uncertain request without replaying it or deleting the caller."""
@@ -18606,6 +18646,7 @@ class Engine:
                     and dp.get("exten") == state.get("handoff_extension")
                     and str(dp.get("app_name") or "").lower() not in {"", "stasis"}):
                 state["action_result"] = "confirmed_by_lookup"
+                session.transfer_destination = str(session.transfer_target or state.get("fallback_destination") or "")
                 session.call_outcome = "transferred"
                 await self._cleanup_call(session.call_id)
                 return

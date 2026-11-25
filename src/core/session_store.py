@@ -90,6 +90,7 @@ class SessionStore:
                     or getattr(session, "transfer_active", False)
                     or getattr(session, "transfer_state", None)
                     or session.transfer_destination
+                    or isinstance(getattr(session, "pending_deferred_transfer", None), dict)
                     or (isinstance(action, dict) and action.get("type") in {
                         "attended_transfer", "predial_transfer", "blind_transfer",
                         "queue_transfer", "ring_group_transfer", "voicemail",
@@ -97,6 +98,66 @@ class SessionStore:
                 return False
             for name in ("transfer_active", "transfer_state", "transfer_target"):
                 setattr(session, name, changes[name])
+            return True
+
+    async def arm_deferred_transfer(self, session: CallSession, action: dict) -> tuple[str, Optional[dict]]:
+        """Arbitrate a model handoff against the inactivity fallback under one lock."""
+        async with self._lock:
+            if (self._sessions_by_call_id.get(session.call_id) is not session
+                    or session.cleanup_in_progress or session.cleanup_completed
+                    or (session.no_input_state or {}).get("terminal_action_started")
+                    or getattr(session, "transfer_active", False)
+                    or getattr(session, "transfer_destination", None)
+                    or getattr(session, "transfer_state", None) == "no_input_fallback"):
+                return "owned", None
+            pending = getattr(session, "pending_deferred_transfer", None)
+            if isinstance(pending, dict):
+                same = all(str(pending.get(key) or "") == str(action.get(key) or "")
+                           for key in ("transfer_type", "target", "dialplan_context"))
+                return ("duplicate" if same else "conflict"), pending
+            current = getattr(session, "current_action", None) or {}
+            if (isinstance(current, dict) and current.get("type") == "predial_transfer"
+                    and current.get("deferred_action_id") != action.get("id")):
+                return "conflict", None
+            session.pending_deferred_transfer = dict(action)
+            return "armed", session.pending_deferred_transfer
+
+    async def claim_model_transfer(self, session: CallSession, changes: dict) -> bool:
+        """Keep a direct model handoff from superseding a claimed timeout action."""
+        async with self._lock:
+            if (self._sessions_by_call_id.get(session.call_id) is not session
+                    or session.cleanup_in_progress or session.cleanup_completed
+                    or (session.no_input_state or {}).get("terminal_action_started")
+                    or getattr(session, "transfer_active", False)
+                    or getattr(session, "transfer_destination", None)
+                    or getattr(session, "transfer_state", None) == "no_input_fallback"):
+                return False
+            for name in ("transfer_active", "transfer_state", "transfer_target"):
+                setattr(session, name, changes[name])
+            return True
+
+    async def restore_model_transfer(self, session: CallSession, expected_state: str, previous: dict) -> bool:
+        async with self._lock:
+            if (self._sessions_by_call_id.get(session.call_id) is not session
+                    or getattr(session, "transfer_state", None) != expected_state):
+                return False
+            for name in ("transfer_active", "transfer_state", "transfer_target"):
+                setattr(session, name, previous[name])
+            return True
+
+    async def claim_predial_transfer(self, session: CallSession, action: dict) -> bool:
+        async with self._lock:
+            if (self._sessions_by_call_id.get(session.call_id) is not session
+                    or session.cleanup_in_progress or session.cleanup_completed
+                    or (session.no_input_state or {}).get("terminal_action_started")
+                    or getattr(session, "transfer_active", False)
+                    or getattr(session, "transfer_destination", None)
+                    or getattr(session, "transfer_state", None) == "no_input_fallback"
+                    or isinstance(getattr(session, "pending_deferred_transfer", None), dict)
+                    or (isinstance(getattr(session, "current_action", None), dict)
+                        and getattr(session, "current_action", {}).get("type") == "predial_transfer")):
+                return False
+            session.current_action = dict(action)
             return True
 
     async def restore_no_input_transfer(self, session: CallSession, previous: dict) -> bool:

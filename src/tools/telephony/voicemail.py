@@ -148,7 +148,9 @@ class VoicemailTool(Tool):
             transfer_type="voicemail", target=extension, description="voicemail",
             dialplan_context="ext-local", payload={"mailbox_key": _mailbox_key},
         )
-        await store_pending_deferred_transfer(context, action, session=session)
+        status, _ = await store_pending_deferred_transfer(context, action, session=session)
+        if status != "armed":
+            return {"status": "failed", "message": "The call is no longer available for voicemail."}
         return build_deferred_transfer_result(
             action=action, message=action["handoff"]["message"],
             extra={"action": "voicemail_initiated"},

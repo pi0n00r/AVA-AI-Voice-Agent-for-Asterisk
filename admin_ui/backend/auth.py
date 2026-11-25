@@ -14,7 +14,7 @@ from passlib.context import CryptContext
 from jose import JWTError, jwt
 from services.fs import atomic_write_text
 from services.proxy_peer import raw_http_peer
-from services.login_throttle import LoginThrottle, client_address, login_label, known_login_origin, remember_login_origin
+from services.login_throttle import LoginThrottle, client_address, login_label, known_login_origin, remember_login_origin, trusted_proxy_setting
 from settings import USERS_PATH
 
 # Paths exempt from the must_change_password 403 gate (router mounted at prefix="/api/auth" in main.py)
@@ -280,7 +280,7 @@ async def verify_export_password(request: Request, user: UserInDB, password: str
 async def login_for_access_token(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
     username = form_data.username.lower()
     address = client_address(raw_http_peer(request), ", ".join(request.headers.getlist("x-forwarded-for")),
-                             os.getenv("AAVA_TRUSTED_PROXIES", ""))
+                             trusted_proxy_setting())
     account_key = login_label(username)
     address_key = login_label(address)
     pair = (account_key, address_key)

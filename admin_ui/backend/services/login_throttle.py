@@ -18,6 +18,15 @@ from pathlib import Path
 _LABEL_KEY = os.urandom(32)
 
 
+def trusted_proxy_setting() -> str:
+    """Use the same proxy trust list for HTTP forwarding and login origins."""
+    for name in ("AAVA_TRUSTED_PROXIES", "FORWARDED_ALLOW_IPS"):
+        value = os.getenv(name)
+        if value and value.strip():
+            return value
+    return "127.0.0.1,::1"
+
+
 def login_label(value: str) -> bytes:
     """Keep untrusted login names and addresses out of the bounded counter table."""
     return hmac.digest(_LABEL_KEY, value.encode(), "sha256")
@@ -102,22 +111,34 @@ def _trusted_networks(setting):
     return tuple(networks)
 
 
+def _canonical_address(address):
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        return address.ipv4_mapped
+    return address
+
+
 def client_address(peer: str, forwarded: str, trusted: str) -> str:
     """Walk from the socket peer towards the first untrusted forwarding hop."""
-    if not trusted.strip() or not forwarded:
+    try:
+        socket_peer = ipaddress.ip_address(peer)
+    except ValueError:
         return peer
+    canonical_peer = str(_canonical_address(socket_peer))
+    if not trusted.strip() or not forwarded:
+        return canonical_peer
     try:
         networks = _trusted_networks(trusted)
         if not networks:
-            return peer
-        address = ipaddress.ip_address(peer)
+            return canonical_peer
+        address = socket_peer
         for hop in reversed(forwarded.split(",")):
-            if not any(address in network for network in networks):
+            canonical = _canonical_address(address)
+            if not any(address in network or canonical in network for network in networks):
                 break
             address = ipaddress.ip_address(hop.strip())
-        return str(address)
+        return str(_canonical_address(address))
     except ValueError:
-        return peer
+        return canonical_peer
 
 
 _ORIGIN_TTL = 30 * 86400

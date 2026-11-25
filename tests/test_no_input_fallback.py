@@ -57,6 +57,7 @@ async def test_inbound_timeout_transfers_once_without_enabling_a_model_tool():
     engine._terminate_call_after_audio.assert_not_awaited()
     assert session.no_input_state["action_result"] == "handed_off"
     assert session.call_outcome == "transferred"
+    assert session.transfer_destination == "reception"
     assert session.allowed_tools == ["hangup_call"]
 
 
@@ -76,6 +77,7 @@ async def test_definite_failure_falls_back_to_hangup_without_fuzzy_routing(failu
     await engine._hangup_for_no_input(session.call_id)
     engine._terminate_call_after_audio.assert_awaited_once()
     assert not getattr(session, "transfer_active", False)
+    assert not session.transfer_destination
     if failure != "rejected":
         engine.ari_client.continue_in_dialplan.assert_not_awaited()
 
@@ -88,7 +90,23 @@ async def test_indeterminate_response_keeps_guard_and_does_not_repeat_or_hang_up
     assert session.transfer_active is True
     assert session.no_input_state["action_result"] == "indeterminate"
     assert session.call_outcome == "error"
+    assert not session.transfer_destination
     engine.ari_client.continue_in_dialplan.assert_awaited_once()
+    engine._terminate_call_after_audio.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirmed_handoff_retains_destination_when_cleanup_started_during_request():
+    engine, session = await setup_call()
+
+    async def handoff(*args, **kwargs):
+        session.cleanup_in_progress = True
+        return True
+
+    engine.ari_client.continue_in_dialplan.side_effect = handoff
+    await engine._transfer_for_no_input(session)
+    assert session.no_input_state["action_result"] == "handed_off"
+    assert session.transfer_destination == "reception"
     engine._terminate_call_after_audio.assert_not_awaited()
 
 
@@ -111,6 +129,85 @@ async def test_validation_cannot_claim_ownership_after_another_lifecycle_wins(wi
     await engine._hangup_for_no_input(session.call_id)
     engine.ari_client.continue_in_dialplan.assert_not_awaited()
     engine._terminate_call_after_audio.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pending_model_handoff_suppresses_inactivity_transfer():
+    engine, session = await setup_call()
+    action = {"id": "model-1", "kind": "transfer", "transfer_type": "queue",
+              "target": "601", "dialplan_context": "ext-queues"}
+    assert (await engine.session_store.arm_deferred_transfer(session, action))[0] == "armed"
+    assert await engine._no_input_should_pause(session.call_id)
+    await engine._hangup_for_no_input(session.call_id)
+    engine.ari_client.continue_in_dialplan.assert_not_awaited()
+    engine._terminate_call_after_audio.assert_not_awaited()
+    assert session.pending_deferred_transfer["id"] == "model-1"
+
+
+@pytest.mark.asyncio
+async def test_model_handoff_cannot_arm_after_timeout_action_starts():
+    engine, session = await setup_call()
+    action = {"id": "model-2", "kind": "transfer", "transfer_type": "queue",
+              "target": "601", "dialplan_context": "ext-queues"}
+    attempted = []
+
+    async def arm_model(*args, **kwargs):
+        attempted.append((await engine.session_store.arm_deferred_transfer(session, action))[0])
+        return True
+
+    engine.ari_client.dialplan_target_exists.side_effect = arm_model
+    await engine._hangup_for_no_input(session.call_id)
+    assert attempted == ["owned"]
+    engine.ari_client.continue_in_dialplan.assert_awaited_once()
+    engine._terminate_call_after_audio.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fallback_claim_blocks_later_model_and_predial_handoffs():
+    engine, session = await setup_call()
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def blocked_handoff(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return True
+
+    engine.ari_client.continue_in_dialplan.side_effect = blocked_handoff
+    fallback = asyncio.create_task(engine._hangup_for_no_input(session.call_id))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    action = {"id": "model-3", "kind": "transfer", "transfer_type": "queue",
+              "target": "601", "dialplan_context": "ext-queues"}
+    assert (await engine.session_store.arm_deferred_transfer(session, action))[0] == "owned"
+    assert not await engine.session_store.claim_model_transfer(
+        session, {"transfer_active": True, "transfer_state": "model", "transfer_target": "601"})
+    assert not await engine.session_store.claim_predial_transfer(
+        session, {"type": "predial_transfer", "deferred_action_id": "model-3"})
+    release.set()
+    await fallback
+    assert session.no_input_state["action_result"] == "handed_off"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_waits_for_inflight_handoff_without_inventing_confirmation():
+    engine, session = await setup_call()
+    session.transfer_active = True
+    session.transfer_state = "no_input_fallback"
+    session.no_input_state.update({"action_result": "pending", "fallback_destination": "reception",
+                                   "handoff_context": "ext-queues", "handoff_extension": "600"})
+
+    async def complete():
+        await asyncio.sleep(0.01)
+        session.no_input_state["action_result"] = "handed_off"
+
+    task = asyncio.create_task(complete())
+    await engine._settle_no_input_handoff_for_cleanup(session, None, timeout=0.2)
+    await task
+    assert session.no_input_state["action_result"] == "handed_off"
+
+    session.no_input_state["action_result"] = "pending"
+    await engine._settle_no_input_handoff_for_cleanup(session, {"id": "other"}, timeout=0.01)
+    assert session.no_input_state["action_result"] == "indeterminate"
+    assert session.call_outcome == "error"
 
 
 @pytest.mark.asyncio
@@ -145,6 +242,7 @@ async def test_reconciliation_observes_target_without_reissuing_transfer():
     }
     await engine._reconcile_no_input_handoff(session)
     assert session.no_input_state["action_result"] == "confirmed_by_lookup"
+    assert session.transfer_destination == "reception"
     engine._cleanup_call.assert_awaited_once_with(session.call_id)
     engine.ari_client.continue_in_dialplan.assert_awaited_once()
     engine._terminate_call_after_audio.assert_not_awaited()

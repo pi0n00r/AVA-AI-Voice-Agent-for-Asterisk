@@ -1,11 +1,13 @@
 import importlib.util
 import socket
+import sys
 from pathlib import Path
 
 
 def _load_launcher():
     root = Path(__file__).resolve().parents[1]
     path = root / "admin_ui" / "backend" / "dual_stack_server.py"
+    sys.path.insert(0, str(path.parent))
     spec = importlib.util.spec_from_file_location("uvicorn_dual_stack", path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -20,6 +22,7 @@ def test_admin_listener_is_one_socket_accepting_ipv4_and_ipv6():
     assert listener.family == socket.AF_INET6
     assert listener.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) == 0
     accepted_listener_fds = []
+    peers = []
     try:
         for host, family in (("127.0.0.1", socket.AF_INET), ("::1", socket.AF_INET6)):
             with socket.socket(family, socket.SOCK_STREAM) as client:
@@ -27,10 +30,12 @@ def test_admin_listener_is_one_socket_accepting_ipv4_and_ipv6():
                 client.connect((host, port))
                 server, _ = listener.accept()
                 accepted_listener_fds.append(listener.fileno())
+                peers.append(server.getpeername()[0])
                 server.close()
     finally:
         listener.close()
     assert len(set(accepted_listener_fds)) == 1
+    assert peers == ["::ffff:127.0.0.1", "::1"]
 
 
 def test_launcher_preserves_socket_peer_and_limits_forwarded_headers(monkeypatch):
@@ -64,6 +69,14 @@ def test_launcher_preserves_socket_peer_and_limits_forwarded_headers(monkeypatch
     assert captured["sockets"] == [listener]
     assert captured["config"].http == "services.proxy_peer:PeerAwareHTTPProtocol"
     assert captured["config"].forwarded_allow_ips == "127.0.0.1,::1"
+
+
+def test_mapped_peer_is_canonicalized_for_login_origin():
+    _load_launcher()
+    from services.login_throttle import client_address
+
+    assert client_address("::ffff:127.0.0.1", "192.0.2.8", "127.0.0.1,::1") == "192.0.2.8"
+    assert client_address("::ffff:192.0.2.9", "192.0.2.8", "127.0.0.1,::1") == "192.0.2.9"
 
 
 def test_compose_keeps_stock_entrypoint_and_appuser_drop():

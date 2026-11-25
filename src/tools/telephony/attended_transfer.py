@@ -232,7 +232,9 @@ class AttendedTransferTool(Tool):
             action["_briefing"] = briefing
 
         if transfer_deferral_enabled(context):
-            await store_pending_deferred_transfer(context, action)
+            status, _ = await store_pending_deferred_transfer(context, action)
+            if status != "armed":
+                return {"status": "failed", "message": "A transfer is already in progress."}
             return build_deferred_transfer_result(
                 action=action,
                 message=message,

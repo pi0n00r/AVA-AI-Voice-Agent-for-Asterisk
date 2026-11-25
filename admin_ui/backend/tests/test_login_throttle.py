@@ -210,6 +210,16 @@ def test_forwarded_chain_uses_only_explicitly_trusted_hops():
     assert client_address(proxy, "invalid", proxy) == proxy
 
 
+def test_ipv4_mapped_peer_uses_the_same_trust_and_login_origin():
+    from services.login_throttle import client_address
+    trusted = "127.0.0.1,192.0.2.20"
+    peer = "::ffff:127.0.0.1"
+    assert client_address(peer, "192.0.2.10, 192.0.2.20", trusted) == "192.0.2.10"
+    assert client_address(peer, "invalid", trusted) == "127.0.0.1"
+    assert client_address(peer, "", "") == "127.0.0.1"
+    assert client_address("::ffff:198.51.100.1", "192.0.2.10", trusted) == "198.51.100.1"
+
+
 @pytest.mark.asyncio
 async def test_account_protection_recognizes_existing_origin_for_full_window(login, monkeypatch):
     post, username, password = login
