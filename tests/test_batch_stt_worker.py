@@ -94,3 +94,39 @@ def test_healthy_gpu_batch_does_not_start_a_second_model(monkeypatch):
     monkeypatch.setitem(sys.modules, "stt_backends", SimpleNamespace(FasterWhisperSTTBackend=Backend))
     assert worker._transcribe(_args(), b"\x00\x00") == "Ready"
     assert attempts == ["cuda"]
+
+
+@pytest.mark.parametrize("message,should_fallback", [
+    ("CUDA failed with error no CUDA-capable device is detected", True),
+    ("audio decode failed", False),
+])
+def test_cuda_failure_during_transcription_is_bounded(monkeypatch, message, should_fallback):
+    attempts = []
+
+    class Backend:
+        def __init__(self, **kwargs):
+            self.device = kwargs["device"]
+            attempts.append(("create", self.device))
+
+        def initialize(self):
+            return True
+
+        def transcribe_pcm16(self, *_args, **_kwargs):
+            if self.device == "cuda":
+                raise RuntimeError(message)
+            return "Message received"
+
+        def shutdown(self):
+            attempts.append(("shutdown", self.device))
+
+    monkeypatch.setitem(sys.modules, "stt_backends", SimpleNamespace(FasterWhisperSTTBackend=Backend))
+    if should_fallback:
+        assert worker._transcribe(_args(), b"\x00\x00") == "Message received"
+        assert attempts == [
+            ("create", "cuda"), ("shutdown", "cuda"),
+            ("create", "cpu"), ("shutdown", "cpu"),
+        ]
+    else:
+        with pytest.raises(RuntimeError, match="audio decode failed"):
+            worker._transcribe(_args(), b"\x00\x00")
+        assert attempts == [("create", "cuda"), ("shutdown", "cuda")]

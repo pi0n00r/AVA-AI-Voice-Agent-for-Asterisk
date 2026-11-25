@@ -17,6 +17,13 @@ MAX_TRANSCRIPT_CHARS = 10000
 CPU_FALLBACK_MODELS = frozenset({"tiny", "base", "small"})
 
 
+def _cuda_device_unavailable(exc: Exception) -> bool:
+    detail = str(exc).lower()
+    return any(marker in detail for marker in (
+        "no cuda-capable device", "cuda driver not found", "cuda driver version is insufficient",
+    ))
+
+
 def _transcribe_faster_whisper(args: argparse.Namespace, pcm16: bytes) -> str:
     """Keep bounded batch STT available when the container loses CUDA access."""
     from stt_backends import FasterWhisperSTTBackend
@@ -37,11 +44,16 @@ def _transcribe_faster_whisper(args: argparse.Namespace, pcm16: bytes) -> str:
         finally:
             backend.shutdown()
 
-    result = attempt(args.device, args.compute_type)
+    try:
+        result = attempt(args.device, args.compute_type)
+    except Exception as exc:
+        if args.device != "cuda" or args.model not in CPU_FALLBACK_MODELS or not _cuda_device_unavailable(exc):
+            raise
+        result = None
     if result is not None:
         return result
     if args.device == "cuda" and args.model in CPU_FALLBACK_MODELS:
-        logging.warning("Batch STT CUDA initialization failed; trying CPU int8")
+        logging.warning("Batch STT GPU attempt unavailable; trying CPU int8")
         result = attempt("cpu", "int8")
         if result is not None:
             return result
