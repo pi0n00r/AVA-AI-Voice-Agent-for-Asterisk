@@ -4,6 +4,7 @@ import importlib.util
 import os
 import shutil
 import subprocess
+import sys
 import tarfile
 
 import yaml
@@ -47,11 +48,16 @@ def test_admin_image_contains_shared_runtime_package():
 
 
 def test_admin_dual_stack_listener_accepts_ipv4_and_ipv6():
-    module_path = ROOT / "admin_ui" / "backend" / "dual_stack_server.py"
-    spec = importlib.util.spec_from_file_location("dual_stack_server", module_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
+    backend = ROOT / "admin_ui" / "backend"
+    module_path = backend / "dual_stack_server.py"
+    sys.path.insert(0, str(backend))
+    try:
+        spec = importlib.util.spec_from_file_location("dual_stack_server", module_path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(str(backend))
 
     listener = module.create_listener("::", 0)
     try:
@@ -72,6 +78,16 @@ def test_starter_smoke_checks_live_ipv6_transport_endpoint():
     assert "pjsip show transport transport-udp" in workflow
     assert "grep -F '[::]:5060'" in workflow
     assert "Bind:.*::.*5060" not in workflow
+
+
+def test_release_workflow_can_build_an_exact_source_sha():
+    workflow = (ROOT / ".github" / "workflows" / "publish-containers.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "AVA_SOURCE_SHA:" in workflow
+    assert "ref: ${{ env.AVA_SOURCE_SHA }}" in workflow
+    assert "type=raw,value=sha-${{ env.AVA_SOURCE_SHA }}" in workflow
+    assert "org.opencontainers.image.revision=${{ env.AVA_SOURCE_SHA }}" in workflow
 
 
 def test_starter_dialplan_enters_stasis_without_audiosocket_duplication():
