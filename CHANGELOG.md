@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.7.5.2] - 2026-11-25
+
+Merge upstream's published v7.7.5 baseline through `05cf7d62`, covering nine
+upstream pull requests after v7.7.4: #892, #893, #896, #897, #898, #899, #900,
+#901 and #903. Retain the maintained fork's security, deployment, documentation,
+dual-stack, transfer-ownership, and release boundaries.
+Thanks to `hkjarral` for implementation/integration, `Andrew-Engelbrecht` for the
+inactivity-fallback proposal, and `MVECoder` for the fax patch/reproduction and
+Grok/noise reports. See [verified contributor roles](CONTRIBUTORS.md).
+
 ### Security
+
+- Require the Debian fix for CVE-2026-124851 in both stages of the Local AI CPU image. Builds stop if the installed `libzstd1` is older than `1.5.7+dfsg-1+deb13u1`.
 
 - Mask numeric credential echoes in HTTP tool tests, short Bearer credentials in templates, and embedded credentials shared through YAML aliases. MCP password rotation can retain other credentials for the same command.
 
@@ -84,6 +96,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Remove the unused external-media prototype, retired configuration components, HealthWidget and three superseded Local AI backend classes.
 
 ### Fixed
+
+- Docker Services cleanup runs as a background job with progress, bounded execution and partial results. Reloading the page reconnects to the job, concurrent clicks share one cleanup, and disk usage refreshes after terminal outcomes.
 
 - Grok sends the blind-transfer result once and skips the extra spoken turn when the parent response has already completed the handoff sentence. Transfer still waits for caller-facing playback to drain.
 - Grok can retry a greeting once after pickup noise cancels it before any audio. A caller who starts a conversation takes priority.

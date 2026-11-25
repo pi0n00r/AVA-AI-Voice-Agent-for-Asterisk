@@ -5,6 +5,8 @@ import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "update-recover.sh"
@@ -1090,6 +1092,30 @@ def test_update_recover_uses_checkout_home_for_updates() -> None:
     assert 'update_home="$(owner_execution_home)"' in run_as_owner
     assert 'TARGET_HOME="/tmp"' not in script
     assert 'if ! is_release_ref "${REF}"' not in run_as_owner
+
+
+@pytest.mark.parametrize(
+    ("release_ref", "expected"),
+    [
+        ("7.7.5", "v7.7.5"),
+        ("v7.7.5", "v7.7.5"),
+        ("7.7.5.2", "v7.7.5.2"),
+        ("v7.7.5.2", "v7.7.5.2"),
+    ],
+)
+def test_update_recover_normalizes_fork_release_refs(
+    release_ref: str, expected: str, tmp_path: Path
+) -> None:
+    harness = f'''
+set -euo pipefail
+source "$SOURCE"
+is_release_ref "{release_ref}"
+normalize_release_ref "{release_ref}"
+'''
+
+    result = _run_bash_harness(harness, tmp_path)
+
+    assert result.stdout.strip() == expected
 
 
 def test_update_recover_uses_private_home_when_owner_home_is_missing() -> None:

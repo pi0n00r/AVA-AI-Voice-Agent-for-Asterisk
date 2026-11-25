@@ -1,7 +1,7 @@
 # Asterisk AI Voice Agent - Installation and Upgrade Guide (v7.7)
 
 This guide covers fresh installations and the supported upgrade path to the
-maintained fork release v7.7.5. Release-pinned commands require that exact tag
+maintained fork release v7.7.5.2. Release-pinned commands require that exact tag
 and its artifacts. Never silently fall back from a missing release tag.
 For release-specific behavior changes, also read the
 [v7.7.1 migration notes](MIGRATION.md#v770-to-v771). Operators upgrading from
@@ -39,8 +39,9 @@ Choose the path that best fits your experience level:
 <a id="upgrade-to-v764-existing-checkout"></a>
 
 <a id="upgrade-to-v770-existing-checkout"></a>
+<a id="upgrade-to-v7752-existing-checkout"></a>
 
-## Upgrade to v7.7.5 (Existing Checkout)
+## Upgrade to v7.7.5.2 (Existing Checkout)
 
 This section is for operators upgrading an existing repo checkout (not a fresh install).
 
@@ -51,7 +52,13 @@ and keep intentionally stopped optional services stopped. Hard-refresh the brows
 Earlier installations must follow intervening migration notes. Read the
 [v7.7.1 migration notes](MIGRATION.md#v770-to-v771) before rollout.
 
-This release adds an internal Call History erasure flag and preserves Calendly's
+This release adds asynchronous, bounded Docker cleanup with durable progress and
+requires the patched Debian `libzstd1` package in both Local AI CPU image stages.
+Rebuild Admin UI to obtain the cleanup fix. Rebuild Local AI only when the CPU
+image is installed or selected; the GPU image is unchanged by this dependency
+repair.
+
+It also retains the internal Call History erasure flag and preserves Calendly's
 `calendly.db.configured` privacy marker. Back up the actual Agent/Call History
 paths, journal/marker when present, all managed `secrets/`, configuration and local
 overlays. Use coherent SQLite snapshots, not live main-file copies. Follow [integration backup and
@@ -91,13 +98,13 @@ Run these commands from your actual checkout path. Do not assume it is `/root/..
 ```bash
 cd /path/to/AVA-AI-Voice-Agent-for-Asterisk
 git status --short
-git diff --binary > ../aava-pre-v7745-working-tree.patch
-git diff --binary --cached > ../aava-pre-v7745-staged.patch
+git diff --binary > ../aava-pre-v7752-working-tree.patch
+git diff --binary --cached > ../aava-pre-v7752-staged.patch
 "${AAVA_COMPOSE[@]}" config --quiet
 if ! "${AAVA_COMPOSE[@]}" -p asterisk-ai-voice-agent ps --services --status running \
-  > ../aava-pre-v7745-running-services.txt; then
+  > ../aava-pre-v7752-running-services.txt; then
   "${AAVA_COMPOSE[@]}" -p asterisk-ai-voice-agent ps --services \
-    > ../aava-pre-v7745-running-services.txt || exit 1
+    > ../aava-pre-v7752-running-services.txt || exit 1
 fi
 ```
 
@@ -141,7 +148,7 @@ Preferred CLI path:
 
 ```bash
 git fetch origin --prune --tags
-agent update --ref v7.7.5 --include-ui --local-changes=retain
+agent update --ref v7.7.5.2 --include-ui --local-changes=retain
 ```
 
 Replace `retain` with your explicit `overwrite` or `abort` decision. In an interactive
@@ -172,7 +179,7 @@ Run the host recovery script from an SSH shell on the AAVA server. This path doe
 depend on the failing Admin UI planner container:
 
 ```bash
-AAVA_RECOVERY_REF=v7.7.5
+AAVA_RECOVERY_REF=v7.7.5.2
 AAVA_REPO=/path/to/AVA-AI-Voice-Agent-for-Asterisk
 AAVA_RECOVERY_STATUS=0
 AAVA_RECOVERY_SCRIPT="$(mktemp)" &&
@@ -208,7 +215,7 @@ terminal:
 For non-interactive recovery, pass the decision explicitly:
 
 ```bash
-AAVA_RECOVERY_REF=v7.7.5
+AAVA_RECOVERY_REF=v7.7.5.2
 AAVA_REPO=/path/to/AVA-AI-Voice-Agent-for-Asterisk
 AAVA_RECOVERY_STATUS=0
 AAVA_RECOVERY_SCRIPT="$(mktemp)" &&
@@ -223,7 +230,7 @@ Use `overwrite` only when the operator accepts that tracked local code changes w
 discarded:
 
 ```bash
-AAVA_RECOVERY_REF=v7.7.5
+AAVA_RECOVERY_REF=v7.7.5.2
 AAVA_REPO=/path/to/AVA-AI-Voice-Agent-for-Asterisk
 AAVA_RECOVERY_STATUS=0
 AAVA_RECOVERY_SCRIPT="$(mktemp)" &&
@@ -317,12 +324,12 @@ explicit policy. Never use `git reset --hard` as generic upgrade advice.
 
 Do not treat a second update run as proof that the containers were updated. If the first
 job reached **Fast-forwarding code** and then failed during Docker Compose, the checkout may
-already be at v7.7.5 while the old containers are still running. Save the failed
+already be at v7.7.5.2 while the old containers are still running. Save the failed
 job log and original pre-update backup. After fixing the reported Compose/build
 error, retry the same ref with the target CLI or fixed updater first:
 
 ```bash
-agent update --ref v7.7.5 --rebuild=auto --include-ui=true --local-changes=retain
+agent update --ref v7.7.5.2 --rebuild=auto --include-ui=true --local-changes=retain
 ```
 
 The updater replays saved actions from `.agent/updates/pending-docker.json`, even
@@ -344,7 +351,7 @@ only the services that were running before the update:
 ```bash
 cd /path/to/AVA-AI-Voice-Agent-for-Asterisk
 "${AAVA_COMPOSE[@]}" config --quiet
-AAVA_RUNNING_SERVICES_FILE=../aava-pre-v7745-running-services.txt
+AAVA_RUNNING_SERVICES_FILE=../aava-pre-v7752-running-services.txt
 test -f "${AAVA_RUNNING_SERVICES_FILE}" || exit 1
 AAVA_RECOVERY_SERVICES=()
 for AAVA_SERVICE in ai_engine admin_ui local_ai_server; do
@@ -525,7 +532,7 @@ older checkout, use the [legacy recovery procedure](CLI_TOOLS_GUIDE.md#standalon
 `install.sh --ui` is not present in those releases.
 
 ```bash
-git clone --branch v7.7.5 https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk.git
+git clone --branch v7.7.5.2 https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk.git
 cd AVA-AI-Voice-Agent-for-Asterisk
 ./preflight.sh
 # Review the complete findings before authorizing changes.
@@ -591,7 +598,7 @@ or SSH-forward port 3003 over the tunnel. Keep 3003 firewalled on all other inte
 **Command-line wizard** for terminal-based setup:
 
 ```bash
-git clone --branch v7.7.5 https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk.git
+git clone --branch v7.7.5.2 https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk.git
 cd AVA-AI-Voice-Agent-for-Asterisk
 
 ./install.sh
@@ -600,7 +607,7 @@ agent setup
 
 **Best for:** Headless servers, scripted deployments, CLI preference
 
-> Note: `agent quickstart` and `agent init` are still available for backward compatibility, but `agent setup` is the recommended CLI wizard for v7.7.5.
+> Note: `agent quickstart` and `agent init` are still available for backward compatibility, but `agent setup` is the recommended CLI wizard for v7.7.5.2.
 
 ---
 
@@ -609,7 +616,7 @@ agent setup
 **Traditional installer** with manual configuration:
 
 ```bash
-git clone --branch v7.7.5 https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk.git
+git clone --branch v7.7.5.2 https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk.git
 cd AVA-AI-Voice-Agent-for-Asterisk
 ./install.sh
 ```
@@ -742,7 +749,7 @@ The installation is handled by an interactive script that will guide you through
 First, clone the project repository to a directory on your server.
 
 ```bash
-git clone --branch v7.7.5 https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk.git
+git clone --branch v7.7.5.2 https://github.com/pi0n00r/AVA-AI-Voice-Agent-for-Asterisk.git
 cd AVA-AI-Voice-Agent-for-Asterisk
 ```
 
